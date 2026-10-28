@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by PaperLean.
 source ../common.sh
 
 ./clean.sh
@@ -27,7 +28,7 @@ test_eq '["C","B"]' query +A:transImports --json
 
 # Test querying a module's setup JSON
 $LAKE query +A:setup --json | $LAKE env lean --run pretty.lean |
-  diff -u --strip-trailing-cr .lake/build/ir/A.setup.json -
+  diff -u --strip-trailing-cr <($LAKE env lean --run pretty.lean < .lake/build/ir/A.setup.json) -
 
 # Test querying a module's dependency hash
 match_text $($LAKE query +A:depHash) .lake/build/lib/lean/A.trace

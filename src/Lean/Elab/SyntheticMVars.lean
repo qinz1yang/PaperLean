@@ -12,6 +12,7 @@ public import Lean.Elab.Tactic.Basic
 public import Lean.Meta.AbstractNestedProofs
 public import Init.Data.List.Sort.Basic
 import all Lean.Elab.ErrorUtils
+import Lean.PaperLean.Base
 
 public section
 
@@ -472,6 +473,8 @@ mutual
   If `report := false`, then `runTactic` will not capture exceptions nor will report unsolved goals. Unsolved goals become exceptions.
   -/
   partial def runTactic (mvarId : MVarId) (tacticCode : Syntax) (kind : TacticMVarKind) (report := true) : TermElabM Unit := withoutAutoBoundImplicit do
+    -- PaperLean: tactics are not recorded (`Lean.PaperLean.EnvDeps`)
+    if PaperLean.envRecording mvarId then PaperLean.envMarkUnusableIO "a tactic"
     let wasExporting := (← getEnv).isExporting
     -- exit exporting context if entering proof
     let isNoLongerExporting ← pure (wasExporting && !(← backward.proofsInPublic.getM)) <&&> do
@@ -714,3 +717,4 @@ builtin_initialize
   registerTraceClass `Elab.resume
 
 end Lean.Elab.Term
+-- Modified by PaperLean.

@@ -10,6 +10,7 @@ public import Lean.Modifiers
 public import Lean.Exception
 public import Lean.Namespace
 public import Lean.Log
+import Lean.PaperLean.Base
 
 public section
 
@@ -184,14 +185,8 @@ private def resolveOpenDecls (env : Environment) (opts : Options) (id : Name) : 
         resolvedIds
     resolveOpenDecls env opts id openDecls resolvedIds
 
-/--
-Primitive global name resolution procedure. It does not trigger actions associated with reserved names.
-Recall that Lean has reserved names. For example, a definition `foo` has a reserved name `foo.def` for theorem
-containing stating that `foo` is equal to its definition. The action associated with `foo.def`
-automatically proves the theorem. At the macro level, the name is resolved, but the action is not
-executed.
--/
-def resolveGlobalName (env : Environment) (opts : Options) (ns : Name) (openDecls : List OpenDecl) (id : Name) : List (Name × List String) :=
+/-- `resolveGlobalName` without recording. -/
+private def resolveGlobalNameCore (env : Environment) (opts : Options) (ns : Name) (openDecls : List OpenDecl) (id : Name) : List (Name × List String) :=
   -- decode macro scopes from name before recursion
   let extractionResult := extractMacroScopes id
   let rec loop (id : Name) (projs : List String) : List (Name × List String) :=
@@ -214,6 +209,37 @@ def resolveGlobalName (env : Environment) (opts : Options) (ns : Name) (openDecl
           | []     => loop p (s::projs)
     | _ => []
   loop extractionResult.name []
+
+private unsafe def recordResolveUnsafe (opts : @& Options) (id : @& Name)
+    (r : List (Name × List String)) : List (Name × List String) :=
+  PaperLean.envRecord (.resolve id) (unsafeCast
+    fun (env' : Environment) (ns' : Name) (openDecls' : List OpenDecl) =>
+      resolveGlobalNameCore env' opts ns' openDecls' id == r) r
+
+-- (the parameters are borrowed, so that the callers' inferred calling conventions stay upstream's)
+@[implemented_by recordResolveUnsafe, noinline]
+private def recordResolve (_opts : @& Options) (_id : @& Name) (r : List (Name × List String)) :
+    List (Name × List String) := r
+
+@[noinline] private def resolveWithoutRecording (env : Environment) (opts : @& Options) (ns : Name)
+    (openDecls : List OpenDecl) (id : Name) : List (Name × List String) :=
+  PaperLean.envWithoutRecording fun _ => resolveGlobalNameCore env opts ns openDecls id
+
+/--
+Primitive global name resolution procedure. It does not trigger actions associated with reserved names.
+Recall that Lean has reserved names. For example, a definition `foo` has a reserved name `foo.def` for theorem
+containing stating that `foo` is equal to its definition. The action associated with `foo.def`
+automatically proves the theorem. At the macro level, the name is resolved, but the action is not
+executed.
+-/
+def resolveGlobalName (env : Environment) (opts : Options) (ns : Name) (openDecls : List OpenDecl) (id : Name) : List (Name × List String) :=
+  -- PaperLean: the result, which depends on the current namespace and open declarations, is
+  -- recorded for the reuse of section variables (`Lean.PaperLean.EnvDeps`) instead of the accesses
+  -- made for it
+  if PaperLean.envRecording id then
+    recordResolve opts id <| resolveWithoutRecording env opts ns openDecls id
+  else
+    resolveGlobalNameCore env opts ns openDecls id
 
 /-! # Namespace resolution -/
 
@@ -249,10 +275,26 @@ Given a name `id` try to find namespaces it may refer to. The resolution procedu
 
 3- Finally, for each command `open N`, include in the result `N ++ n` if it is the name of an existing namespace.
    We only consider simple `open` commands. -/
-def resolveNamespace (env : Environment) (ns : Name) (openDecls : List OpenDecl) (id : Name) : List Name :=
+private def resolveNamespaceCore (env : Environment) (ns : Name) (openDecls : List OpenDecl) (id : Name) : List Name :=
   match resolveNamespaceUsingScope? env id ns with
   | some ns => ns :: resolveNamespaceUsingOpenDecls env id openDecls
   | none => resolveNamespaceUsingOpenDecls env id openDecls
+
+private unsafe def recordResolveNamespaceUnsafe (id : @& Name) (r : List Name) : List Name :=
+  PaperLean.envRecord (.resolveNamespace id) (unsafeCast
+    fun (env' : Environment) (ns' : Name) (openDecls' : List OpenDecl) =>
+      resolveNamespaceCore env' ns' openDecls' id == r) r
+
+@[implemented_by recordResolveNamespaceUnsafe, noinline]
+private def recordResolveNamespace (_id : @& Name) (r : List Name) : List Name := r
+
+def resolveNamespace (env : Environment) (ns : Name) (openDecls : List OpenDecl) (id : Name) : List Name :=
+  -- PaperLean: recorded as `resolveGlobalName`
+  if PaperLean.envRecording id then
+    recordResolveNamespace id <|
+      PaperLean.envWithoutRecording fun _ => resolveNamespaceCore env ns openDecls id
+  else
+    resolveNamespaceCore env ns openDecls id
 
 end ResolveName
 
@@ -699,3 +741,4 @@ def unresolveNameGlobalAvoidingLocals [MonadLCtx m] (n₀ : Name) (fullNames := 
   return n?.getD n₀
 
 end Lean
+-- Modified by PaperLean.

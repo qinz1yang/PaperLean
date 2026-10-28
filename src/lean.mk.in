@@ -12,7 +12,7 @@ endif
 
 LEAN = lean
 LEANC = leanc
-LEAN_AR = @CMAKE_AR@
+LEAN_AR = @LEAN_MK_AR@
 OUT = build
 OLEAN_OUT = $(OUT)
 TEMP_OUT = $(OUT)/temp
@@ -169,3 +169,5 @@ ifndef UNSAFE_ASSUME_OLD
 include $(DEPS)
 endif
 endif
+
+# Modified by PaperLean.

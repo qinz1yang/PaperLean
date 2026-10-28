@@ -30,6 +30,7 @@ import LeanExport.Basic
 import Lake.CLI.Actions
 import Lake.CLI.Translate
 import Lake.CLI.Serve
+import Lake.PaperLean.Cli
 public import Lake.CLI.BuiltinLint
 import Init.Data.String.Modify
 
@@ -1272,6 +1273,11 @@ protected def env : CliM PUnit := do
       IO.println s!"{var}={val?.getD ""}"
     exit 0
 
+/-- PaperLean: `lake paperlean`, the `paperlean` command (`Lake.PaperLean.cli`). -/
+protected def paperlean : CliM PUnit := do
+  let config ← mkLoadConfig (← getThe LakeOptions)
+  exit <| ← PaperLean.cli config (← takeArgs)
+
 protected def exe : CliM PUnit := do
   let exeSpec ← takeArg "executable target"
   let args ← takeArgs
@@ -1398,6 +1404,7 @@ def lakeCli : (cmd : String) → CliM PUnit
 | "comparator"          => lake.comparator
 | "check"               => lake.check
 | "script"              => lake.script
+| "paperlean"           => lake.paperlean
 | "scripts"             => lake.script.list
 | "run"                 => lake.script.run
 | "serve"               => lake.serve
@@ -1422,7 +1429,9 @@ def lake : CliM PUnit := do
   | _ => -- normal CLI
     processLeadingOptions lakeOption -- between `lake` and command
     if let some cmd ← takeArg? then
-      processLeadingOptions lakeOption -- between `lake <cmd>` and args
+      -- PaperLean: `lake paperlean` parses its own arguments
+      unless cmd == "paperlean" do
+        processLeadingOptions lakeOption -- between `lake <cmd>` and args
       if (← getWantsHelp) then
         IO.println <| help cmd
       else
@@ -1435,3 +1444,4 @@ def lake : CliM PUnit := do
 
 public def cli (args : List String) : BaseIO ExitCode :=
   inline <| (lake).run args
+-- Modified by PaperLean.

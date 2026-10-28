@@ -1,3 +1,4 @@
+# Modified by PaperLean.
 if(USE_MIMALLOC)
   # `mimalloc.cpp` #includes all of mimalloc (`static.c`, compiled as C++ like everything else)
   # together with the runtime's fused allocation entry point so mimalloc's fast path inlines into
@@ -8,6 +9,9 @@ if(USE_MIMALLOC)
   # The default value 16 is only necessary for mimalloc to be compatible with the system allocator, which
   # we do not care about.
   set(MIMALLOC_OPTS -DMI_SHARED_LIB -DMI_SHARED_LIB_EXPORT -O3 -DNDEBUG -DMI_WIN_NOREDIRECT -DMI_MAX_ALIGN_SIZE=8 -Wno-unused-function)
+  if(NOT LEAN_MI_ALLOW_THP STREQUAL "")
+    list(APPEND MIMALLOC_OPTS -DMI_DEFAULT_ALLOW_THP=${LEAN_MI_ALLOW_THP})
+  endif()
   if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang")
     list(APPEND MIMALLOC_OPTS -Wno-deprecated)
   endif()
@@ -93,6 +97,8 @@ set(
   uv/system.cpp
   uv/signal.cpp
   openssl.cpp
+  # PaperLean: the recorder of environment accesses (`Lean.PaperLean.EnvDeps`), which tasks report to
+  ../paperlean/env_recorder.cpp
 )
 
 add_library(leanrt_initial-exec STATIC ${RUNTIME_OBJS})

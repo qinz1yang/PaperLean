@@ -1,0 +1,3 @@
+#!/bin/sh
+# PaperLean's `paperlean` command of this toolchain: `lake paperlean`.
+exec "$(dirname "$0")/lake" paperlean "$@"

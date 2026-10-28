@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
+# Modified by PaperLean.
 source ../common.sh
 
 ./clean.sh
+
+# Prints the artifact paths in a module's setup file, which may store them compactly.
+setup_arts() { $LAKE env lean --run setupArts.lean ".lake/build/ir/$1.setup.json"; }
 
 # ---
 # This test covers Lake's interactions with the Lean module system.
@@ -30,59 +34,59 @@ test_run build Test.CrossPackageImportAll
 # Tests importing of a module's private segment
 # should not not be imported by a plain `import` in a module
 test_run build Test.Module.Import
-test_cmd_fails grep -F "TModule.olean.private" .lake/build/ir/Test/Module/Import.setup.json
+test_cmd_fails grep -F "TModule.olean.private" <(setup_arts Test/Module/Import)
 test_run build Test.Module.PublicImport
-test_cmd_fails grep -F "Module.olean.private" .lake/build/ir/Test/Module/PublicImport.setup.json
+test_cmd_fails grep -F "Module.olean.private" <(setup_arts Test/Module/PublicImport)
 # should be imported by an `import all` in a module
 test_run build Test.Module.ImportAll
-test_cmd grep -F "Module.olean.private" .lake/build/ir/Test/Module/ImportAll.setup.json
+test_cmd grep -F "Module.olean.private" <(setup_arts Test/Module/ImportAll)
 # including promoted imports
 test_run build Test.Module.PromoteImport
-test_cmd grep -F "Module.olean.private" .lake/build/ir/Test/Module/PromoteImport.setup.json
+test_cmd grep -F "Module.olean.private" <(setup_arts Test/Module/PromoteImport)
 test_run build Test.Module.PromoteTransImport
-test_cmd grep -F "Module.olean.private" .lake/build/ir/Test/Module/PromoteTransImport.setup.json
+test_cmd grep -F "Module.olean.private" <(setup_arts Test/Module/PromoteTransImport)
 # an `import all` should not be demoted by a `meta import`
 # and `meta import` should still propagate through transitive imports
 test_run build Test.Module.PromoteMetaImport
-test_cmd grep -F "ImportImport.olean.private" .lake/build/ir/Test/Module/PromoteMetaImport.setup.json
-test_cmd grep -F "Module.ir" .lake/build/ir/Test/Module/PromoteMetaImport.setup.json
+test_cmd grep -F "ImportImport.olean.private" <(setup_arts Test/Module/PromoteMetaImport)
+test_cmd grep -F "Module.ir" <(setup_arts Test/Module/PromoteMetaImport)
 # an `import all` of a module should not block a later transitive `meta import` of it
 # from propagating meta reachability to that module's own non-exported imports
 test_run build Test.Module.MetaRevisitAll
-test_cmd grep -F "ImportImport.olean.private" .lake/build/ir/Test/Module/MetaRevisitAll.setup.json
-test_cmd grep -F "Module.olean" .lake/build/ir/Test/Module/MetaRevisitAll.setup.json
+test_cmd grep -F "ImportImport.olean.private" <(setup_arts Test/Module/MetaRevisitAll)
+test_cmd grep -F "Module.olean" <(setup_arts Test/Module/MetaRevisitAll)
 # and likewise when the `import all` is itself transitive
 test_run build Test.Module.MetaRevisitTransAll
-test_cmd grep -F "Module.olean" .lake/build/ir/Test/Module/MetaRevisitTransAll.setup.json
+test_cmd grep -F "Module.olean" <(setup_arts Test/Module/MetaRevisitTransAll)
 # should be imported by a non-module
 test_run build Test.NonModule.Import
-test_cmd grep -F "Module.olean.private" .lake/build/ir/Test/NonModule/Import.setup.json
+test_cmd grep -F "Module.olean.private" <(setup_arts Test/NonModule/Import)
 # should not be imported by a module transitive import of a private `import all`
 test_run build Test.Module.ImportImportAll
-test_cmd_fails grep -F "Module.olean.private" .lake/build/ir/Test/Module/ImportImportAll.setup.json
+test_cmd_fails grep -F "Module.olean.private" <(setup_arts Test/Module/ImportImportAll)
 # should not be imported by an `import all` of a private module `import`
 test_run build Test.Module.ImportAllImport
-test_cmd_fails grep -F "Module.olean.private" .lake/build/ir/Test/Module/ImportAllImport.setup.json
+test_cmd_fails grep -F "Module.olean.private" <(setup_arts Test/Module/ImportAllImport)
 
 # Tests that the transitive module import of a private import does not include its artifacts
 test_run build Test.Module.ImportImport
-test_cmd_fails grep -F "Module.olean" .lake/build/ir/Test/Module/ImportImport.setup.json
+test_cmd_fails grep -F "Module.olean" <(setup_arts Test/Module/ImportImport)
 
 # Tests that `meta import` properly includes transitive import artifacts
 # IR should be included for a transitive `public meta import`
 test_run build Test.Module.ImportPublicMetaImport
-test_cmd grep -F "Module.ir" .lake/build/ir/Test/Module/ImportPublicMetaImport.setup.json
+test_cmd grep -F "Module.ir" <(setup_arts Test/Module/ImportPublicMetaImport)
 # IR should be included for private imports of a `meta import`ed module
 # https://github.com/leanprover/lean4/issues/13419
 test_run build Test.Module.MetaImportImport
-test_cmd grep -F "Module.ir" .lake/build/ir/Test/Module/MetaImportImport.setup.json
+test_cmd grep -F "Module.ir" <(setup_arts Test/Module/MetaImportImport)
 # IR should be included when a module is re-visited with `needsMeta`
 # (reached via both a non-meta and a meta path)
 test_run build Test.Module.MetaRevisit
-test_cmd grep -F "Module.ir" .lake/build/ir/Test/Module/MetaRevisit.setup.json
+test_cmd grep -F "Module.ir" <(setup_arts Test/Module/MetaRevisit)
 # IR should not be included for a transitive private `meta import`
 test_run build Test.Module.ImportMetaImport
-test_cmd_fails grep -F "Module.ir" .lake/build/ir/Test/Module/ImportMetaImport.setup.json
+test_cmd_fails grep -F "Module.ir" <(setup_arts Test/Module/ImportMetaImport)
 
 # Build all tests before making an edit
 test_run build

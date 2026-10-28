@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.Util.ReplaceExpr
+import Lean.PaperLean.Base
 
 public section
 
@@ -28,12 +29,28 @@ private def getParamSubst : List Name → List Level → Name → Option Level
   | p::ps, u::us, p' => if p == p' then some u else getParamSubst ps us p'
   | _,     _,     _  => none
 
+/-- The `const` and `sort` case of `instantiateLevelParamsCore.replaceFn`, for
+`instantiateLevelParamsNative`. -/
+@[export lean_paperlean_inst_lparams_leaf]
+private def instantiateLevelParamsLeaf (e : Expr) (paramNames : List Name) (lvls : List Level) : Expr :=
+  (instantiateLevelParamsCore.replaceFn (getParamSubst paramNames lvls) e).getD e
+
+/-- `instantiateLevelParamsCore (getParamSubst paramNames lvls) e`, computed by the same traversal
+in native code, which calls back `instantiateLevelParamsLeaf` only for `const` and `sort` nodes with
+level parameters. -/
+@[extern "lean_paperlean_instantiate_level_params"]
+private opaque instantiateLevelParamsNative (e : @& Expr) (paramNames : List Name)
+    (lvls : List Level) : Expr
+
 /--
 Instantiate universe level parameters names `paramNames` with `lvls` in `e`.
 If the two lists have different length, the smallest one is used.
 -/
-def instantiateLevelParams (e : Expr) (paramNames : List Name) (lvls : List Level) : Expr :=
+-- PaperLean: (not inlined, so that compiled callers in other packages call it as upstream's)
+@[noinline] def instantiateLevelParams (e : Expr) (paramNames : List Name) (lvls : List Level) : Expr :=
   if paramNames.isEmpty || lvls.isEmpty then e else
+  -- PaperLean: in native code (`src/paperlean/inst_lparams.cpp`)
+  if PaperLean.nativeAvailable e then instantiateLevelParamsNative e paramNames lvls else
     instantiateLevelParamsCore (getParamSubst paramNames lvls) e
 
 /--
@@ -62,3 +79,4 @@ def instantiateLevelParamsArray (e : Expr) (paramNames : Array Name) (lvls : Arr
   if paramNames.isEmpty || lvls.isEmpty then e else
     e.instantiateLevelParamsCore fun p =>
       getParamSubstArray paramNames lvls p 0
+-- Modified by PaperLean.

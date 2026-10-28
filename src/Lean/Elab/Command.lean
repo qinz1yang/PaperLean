@@ -11,6 +11,7 @@ public import Lean.Elab.Binders
 public import Lean.Elab.Command.Scope
 public import Lean.Elab.SetOption
 import Lean.Elab.DeprecatedSyntax
+import Lean.PaperLean.SectionVars
 public import Lean.Linter.PersistentLintLog
 public meta import Lean.Parser.Command
 
@@ -1023,6 +1024,22 @@ variable (n : Nat)
 def runTermElabM (elabFn : Array Expr → TermElabM α) : CommandElabM α := do
   let scope ← getScope
   liftTermElabM <|
+    -- PaperLean: the section variables as elaborated for an earlier command of the scope are reused
+    -- when that elaboration would give the same (`Lean.PaperLean.SectionVars`)
+    PaperLean.SectionVars.withSectionVars (scope.varDecls.map (·.raw)) scope.varUIds scope.opts
+      (elabVars scope) fun xs sectionFVars =>
+        withReader ({ · with sectionFVars := sectionFVars }) do
+          if xs.all (·.isFVar) then
+            Term.withoutAutoBoundImplicit <| elabFn xs
+          else
+            -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
+            -- and then rebuild the local context from scratch.
+            -- Resetting prevents the local context from including the original fvars from `xs`.
+            let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
+            Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
+              Term.withoutAutoBoundImplicit <| elabFn xs
+where
+  elabVars {β} (scope : Scope) (k : Array Expr → NameMap Expr → TermElabM β) : TermElabM β :=
     Term.withAutoBoundImplicit <|
       Term.elabBinders scope.varDecls fun xs => do
         -- We need to synthesize postponed terms because this is a checkpoint for the auto-bound implicit feature
@@ -1036,15 +1053,7 @@ def runTermElabM (elabFn : Array Expr → TermElabM α) : CommandElabM α := do
           -- So, we use `Core.resetMessageLog`.
           Core.resetMessageLog
           let xs ← Term.addAutoBoundImplicits xs none
-          if xs.all (·.isFVar) then
-            Term.withoutAutoBoundImplicit <| elabFn xs
-          else
-            -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
-            -- and then rebuild the local context from scratch.
-            -- Resetting prevents the local context from including the original fvars from `xs`.
-            let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
-            Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
-              Term.withoutAutoBoundImplicit <| elabFn xs
+          k xs sectionFVars
 
 private def liftAttrM {α} (x : AttrM α) : CommandElabM α := do
   liftCoreM x
@@ -1171,3 +1180,4 @@ def visibility.ofAttrKind (attrKind : TSyntax ``Term.attrKind) : TSyntax ``visib
 end Parser.Command
 
 end Lean
+-- Modified by PaperLean.

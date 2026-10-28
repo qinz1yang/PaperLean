@@ -3,6 +3,7 @@ Copyright (c) 2019 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
 Author: Sebastian Ullrich
+Modified by PaperLean.
 
 A simple interpreter for evaluating λRC IR code.
 
@@ -36,6 +37,9 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <dlfcn.h>
 #endif
 #include "library/ir_interpreter.h"
+#include "paperlean/fast_import.h"
+#include "paperlean/interp_cache.h"
+#include "paperlean/native_libs.h"
 #include "runtime/flet.h"
 #include "runtime/apply.h"
 #include "runtime/interrupt.h"
@@ -364,6 +368,12 @@ void * lookup_symbol_in_cur_exe(char const * sym) {
 
 class interpreter;
 LEAN_THREAD_PTR(interpreter, g_interpreter);
+struct import_interpreter_scope;
+LEAN_THREAD_PTR(import_interpreter_scope, g_import_interpreter_scope);
+// The interpreter of the current import scope if it is for `env` and `opts` and not running, now marked
+// as running; `exit_import_scope_interpreter` clears its evaluations and ends the run.
+interpreter * enter_import_scope_interpreter(elab_environment const & env, options const & opts);
+void exit_import_scope_interpreter();
 
 struct native_symbol_cache_entry {
     // symbol address; `nullptr` if function does not have native code
@@ -427,10 +437,28 @@ class interpreter {
     }
 
 public:
+    // Makes the interpreter like a new one, except for the symbol cache, which depends only on the
+    // environment.
+    void clear_evaluations() {
+        for (auto & it : m_constant_cache)
+            if (!it.second.m_is_scalar) dec(it.second.m_val.m_obj);
+        m_constant_cache.clear();
+        m_arg_stack.clear();
+        m_jp_stack.clear();
+        m_call_stack.clear();
+    }
+
     template<class T>
     static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f) {
         if (g_interpreter && is_eqp(g_interpreter->m_env, env) && is_eqp(g_interpreter->m_opts, opts)) {
             return f(*g_interpreter);
+        } else if (interpreter * scoped = enter_import_scope_interpreter(env, opts)) {
+            time_task t("interpretation", opts, fn);
+            scope_trace_env scope_trace(env, opts);
+            // releases the constants at the end like a new interpreter
+            struct end_run { ~end_run() { exit_import_scope_interpreter(); } } end;
+            flet<interpreter *> fl(g_interpreter, scoped);
+            return f(*scoped);
         } else {
             // We changed threads or the closure was stored and called in a different context.
             time_task t("interpretation", opts, fn);
@@ -824,24 +852,47 @@ private:
     }
 
     /** \brief Return cached lookup result for given unmangled function name in the current binary. */
+    // PaperLean: native code in a package's native library only for the declarations it was verified
+    // for (`paperlean/native_libs.h`)
+    native_symbol_cache_entry filter(name const & fn, native_symbol_cache_entry e) {
+        if (void * p = filter_native_symbol(m_env.raw(), fn.raw(), e.m_addr)) return { p, e.m_boxed };
+        return { nullptr, false };
+    }
+
+    // PaperLean: an entry for an imported declaration found by another interpreter
+    // (`paperlean/interp_cache.h`), which is what this one would find
+    void share(name const & fn, symbol_cache_entry const & e) {
+        share_symbol(m_env.raw(), fn.raw(), shared_symbol { e.m_decl.raw(), e.m_native.m_addr, e.m_native.m_boxed });
+    }
+
     symbol_cache_entry lookup_symbol(name const & fn) {
         auto e = m_symbol_cache.find(fn);
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
+        shared_symbol sh;
+        if (find_shared_symbol(m_env.raw(), fn.raw(), sh)) {
+            symbol_cache_entry e_new { decl(sh.decl, true), { sh.addr, sh.boxed } };
+            m_symbol_cache.insert({ fn, e_new });
+            return e_new;
+        }
         std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
         auto ne = g_native_symbol_cache->find(fn);
         if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), ne->second };
+            symbol_cache_entry e_new { get_decl(fn), filter(fn, ne->second) };
             m_symbol_cache.insert({ fn, e_new });
+            lock.unlock();
+            share(fn, e_new);
             return e_new;
         }
         lock.unlock();
         std::unique_lock<std::shared_mutex> unique_lock(*g_native_symbol_cache_mutex);
         ne = g_native_symbol_cache->find(fn);
         if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), ne->second };
+            symbol_cache_entry e_new { get_decl(fn), filter(fn, ne->second) };
             m_symbol_cache.insert({ fn, e_new });
+            unique_lock.unlock();
+            share(fn, e_new);
             return e_new;
         }
         symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
@@ -864,7 +915,10 @@ private:
             }
         }
         g_native_symbol_cache->insert({ fn, e_new.m_native });
+        e_new.m_native = filter(fn, e_new.m_native);
         m_symbol_cache.insert({ fn, e_new });
+        unique_lock.unlock();
+        share(fn, e_new);
         return e_new;
     }
 
@@ -1169,6 +1223,41 @@ uint32 run_main(elab_environment const & env, options const & opts, list_ref<str
     return interpreter::with_interpreter<uint32>(env, opts, "main", [&](interpreter & interp) { return interp.run_main(args); });
 }
 
+/* The interpreter of the outermost evaluations during one extension's `addImportedFn`
+   (`withImportInterpreter`): the environment does not change meanwhile, so the symbol cache of one
+   interpreter stays valid for all of them, while each starts like a new interpreter otherwise. */
+struct import_interpreter_scope {
+    elab_environment m_env;
+    options m_opts;
+    interpreter m_interp;
+    bool m_running = false;
+    import_interpreter_scope(elab_environment const & env, options const & opts) :
+        m_env(env), m_opts(opts), m_interp(m_env, m_opts) {}
+};
+
+interpreter * enter_import_scope_interpreter(elab_environment const & env, options const & opts) {
+    import_interpreter_scope * s = g_import_interpreter_scope;
+    if (!s || s->m_running || !is_eqp(s->m_env, env) || !is_eqp(s->m_opts, opts))
+        return nullptr;
+    s->m_running = true;
+    return &s->m_interp;
+}
+
+void exit_import_scope_interpreter() {
+    import_interpreter_scope * s = g_import_interpreter_scope;
+    s->m_interp.clear_evaluations();
+    s->m_running = false;
+}
+
+/* withImportInterpreter {α : Type} (env : @& Environment) (opts : @& Options) (act : BaseIO α) : BaseIO α */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_with_import_interpreter(b_obj_arg env, b_obj_arg opts, obj_arg act) {
+    if (g_import_interpreter_scope || import_legacy_mode())
+        return apply_1(act, io_mk_world());
+    import_interpreter_scope scope(TO_REF(elab_environment, env), TO_REF(options, opts));
+    flet<import_interpreter_scope *> fl(g_import_interpreter_scope, &scope);
+    return apply_1(act, io_mk_world());
+}
+
 /* runMain (env : Environment) (opts : Options) (args : List String) : BaseIO UInt32 */
 extern "C" LEAN_EXPORT uint32_t lean_eval_main(b_obj_arg env, b_obj_arg opts, b_obj_arg args) {
     uint32 ret = run_main(TO_REF(elab_environment, env), TO_REF(options, opts), TO_REF(list_ref<string_ref>, args));
@@ -1185,7 +1274,7 @@ extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, obj
 
 /* runModInitCore (sym : @& String) : IO Bool */
 extern "C" LEAN_EXPORT obj_res lean_run_mod_init_core(b_obj_arg  sym) {
-    if (void * init = lookup_symbol_in_cur_exe(string_cstr(sym))) {
+    if (void * init = filter_native_initializer(string_cstr(sym), lookup_symbol_in_cur_exe(string_cstr(sym)))) {
         auto init_fn = reinterpret_cast<object *(*)(uint8_t)>(init);
         uint8_t builtin = 0;
         object * r = init_fn(builtin);

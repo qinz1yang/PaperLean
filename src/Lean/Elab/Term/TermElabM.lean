@@ -16,6 +16,7 @@ public import Lean.Elab.PreDefinition.TerminationHint
 public import Lean.Elab.DeclarationRange
 public import Lean.Elab.WhereFinally
 public import Lean.Elab.InfoTree.InlayHints
+import Lean.PaperLean.Base
 public meta import Lean.Parser.Term
 
 
@@ -1637,6 +1638,19 @@ def postponeElabTerm (stx : Syntax) (expectedType? : Option Expr) : TermElabM Ex
   withTermInfoContext' .anonymous stx (expectedType? := expectedType?) do
     postponeElabTermCore stx expectedType?
 
+/-- PaperLean: with `PAPERLEAN_REUSE_USER_ELABS=0`, a recording of environment accesses
+(`Lean.PaperLean.EnvDeps`) is unusable if it runs an elaborator that is not Lean's own. Lean's own
+are those of its modules and the builtin ones, which are not declarations of the environment if
+those modules are not imported. -/
+private def noteElaborator (declName : Name) : TermElabM Unit := do
+  let env ← getEnv
+  let isLean := match env.getModuleIdxFor? declName with
+    | some idx =>
+      [`Init, `Std, `Lean, `Lake].contains (env.header.moduleNames[idx]?.getD .anonymous).getRoot
+    | none => !env.contains declName
+  unless isLean || (← IO.getEnv "PAPERLEAN_REUSE_USER_ELABS") != some "0" do
+    PaperLean.envMarkUnusableIO s!"the elaborator {declName}"
+
 /--
   Helper function for `elabTerm` that tries the registered elaboration functions for `stxNode` kind until it finds one that supports the syntax or
   an error is found. -/
@@ -1648,6 +1662,7 @@ private def elabUsingElabFnsAux (s : SavedState) (stx : Syntax) (expectedType? :
       -- record elaborator in info tree, but only when not backtracking to other elaborators (outer `try`)
       withTermInfoContext' elabFn.declName stx (expectedType? := expectedType?)
         (try
+          if PaperLean.envRecording elabFn then noteElaborator elabFn.declName
           elabFn.value stx expectedType?
         catch ex => match ex with
           | .error .. =>
@@ -2295,3 +2310,4 @@ end Term
 open Term in
 def withoutModifyingStateWithInfoAndMessages [MonadControlT TermElabM m] [Monad m] (x : m α) : m α := do
   controlAt TermElabM fun runInBase => withoutModifyingStateWithInfoAndMessagesImpl <| runInBase x
+-- Modified by PaperLean.

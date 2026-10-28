@@ -37,7 +37,10 @@ partial def LeanLib.recCollectLocalModules
   (self : LeanLib) : FetchM (Job (Array Module))
 := ensureJob do
   let mut col : ModuleCollection := {}
-  for mod in (← self.getModuleArray) do
+  let roots ← self.getModuleArray
+  -- PaperLean: start reading the roots' headers before walking into the first of them
+  for mod in roots do discard <| mod.imports.fetch
+  for mod in roots do
     col ← go mod col (viaImport := false)
   if col.hasErrors then
     -- This is not considered a fatal error because we want the modules
@@ -54,6 +57,8 @@ where
       let some imps ← (← root.imports.fetch).waitUnlessCanceled?
         | let col' := {col with hasErrors := true}
           return if viaImport then col' else {col' with mods := col'.mods.push root}
+      -- PaperLean: start reading the imports' headers before walking into the first of them
+      for mod in imps do if mod.lib.name = self.name then discard <| mod.imports.fetch
       for mod in imps do
         if mod.lib.name = self.name then
           col ← go mod col (viaImport := true)
@@ -200,3 +205,4 @@ public def LeanLib.initFacetConfigs : DNameMap LeanLibFacetConfig :=
 @[inherit_doc LeanLib.initFacetConfigs]
 public abbrev initLibraryFacetConfigs : DNameMap LibraryFacetConfig :=
   LeanLib.initFacetConfigs
+-- Modified by PaperLean.

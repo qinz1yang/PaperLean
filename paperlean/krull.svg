@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="298" viewBox="0 0 400 298" font-family="Helvetica, Arial, sans-serif" font-size="13">
+<style>.t{fill:#111111}.m{fill:#6b6b6b}.l{fill:#8c8c8c}.p{fill:#1f6feb}.ax{stroke:#d0d0d0}@media (prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.l{fill:#6b6b6b}.p{fill:#4493f8}.ax{stroke:#3a3a3a}}</style>
+<rect class="l" x="66.0" y="14" width="10" height="10"/><text class="m" x="82.0" y="23">Lean v4.35.0-rc3</text>
+<rect class="p" x="214.0" y="14" width="10" height="10"/><text class="p" x="230.0" y="23">PaperLean v0.1.0</text>
+<path class="l" d="M80.0 206v-147.0a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v147.0z"/>
+<text class="m" x="102.0" y="48.0" text-anchor="middle" font-size="12">1.69</text>
+<path class="p" d="M126.0 206v-21.0a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v21.0z"/>
+<text class="p" x="148.0" y="174.03550295857988" text-anchor="middle" font-size="12">0.27</text>
+<text class="m" x="125.0" y="228" text-anchor="middle">Wall time (s)</text>
+<text class="p" x="125.0" y="248" text-anchor="middle" font-weight="bold">−84%</text>
+<path class="l" d="M230.0 206v-147.0a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v147.0z"/>
+<text class="m" x="252.0" y="48.0" text-anchor="middle" font-size="12">1,020</text>
+<path class="p" d="M276.0 206v-109.6a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v109.6z"/>
+<text class="p" x="298.0" y="85.3529411764706" text-anchor="middle" font-size="12">766</text>
+<text class="m" x="275.0" y="228" text-anchor="middle">Peak memory (MiB)</text>
+<text class="p" x="275.0" y="248" text-anchor="middle" font-weight="bold">−25%</text>
+<line class="ax" x1="50.0" y1="206.5" x2="350.0" y2="206.5"/>
+<text class="t" x="200.0" y="284" text-anchor="middle" font-size="14">Compiling Mathlib.RingTheory.KrullDimension.Field</text>
+</svg>

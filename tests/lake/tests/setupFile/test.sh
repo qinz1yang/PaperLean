@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by PaperLean.
 source ../common.sh
 
 ./clean.sh
@@ -20,8 +21,10 @@ test_out '"plugins":[]' setup-file ImportFoo.lean
 # Test that, by default, no dynlibs are used.
 test_out '"dynlibs":[]' setup-file ImportFoo.lean
 
-# Test that local imports are pre-resolved.
-test_out '"importArts":{"Test":[[' setup-file ImportTest.lean
+# Test that local imports are pre-resolved (at their default location, as a root index and part
+# counts).
+test_out '"importArts":{"":["' setup-file ImportTest.lean
+test_out '"Test":[0,1' setup-file ImportTest.lean
 
 # Test that external imports are left unhandled.
 test_out '"importArts":{}' setup-file ImportFoo.lean

@@ -14,6 +14,9 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.PaperLean.Speculation
+import Lean.PaperLean.SectionVars
+import Lean.PaperLean.TCCache
 
 public section
 
@@ -332,13 +335,25 @@ def runFrontend
       -- imports) calls `importModules`, which in turn requires the flag to be set. Restore it.
       unsafe enableInitializersExecution
     return snap
+  -- PaperLean: elaboration may speculate, checked in the background; the messages are then held
+  -- back until the checks pass (`Lean.PaperLean.Speculation`)
+  let speculate ←
+    if incrSaveFileName?.isNone && incrLoadFileName?.isNone && fileName != "<stdin>" then
+      PaperLean.Speculation.enable
+    else pure false
   let processor := Language.Lean.process
   let snap ← processor setup old? ctx
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
 
   -- reporting should be done before any early exit from the function
-  let hasErrors ← snaps.runAndReport opts jsonOutput severityOverrides
+  let hasErrors ← PaperLean.Speculation.withChecks speculate fileName <|
+    snaps.runAndReport opts jsonOutput severityOverrides
+  -- PaperLean: (to measure the reuse of section variables and typeclass results of a build)
+  if let some log ← IO.getEnv "PAPERLEAN_REUSE_STATS" then
+    let (r, n, f) ← PaperLean.SectionVars.stats
+    let (tr, tn, tf) ← PaperLean.TCCache.stats
+    IO.FS.withFile log .append (·.putStrLn s!"{fileName}\t{r}\t{n}\t{f}\t{tr}\t{tn}\t{tf}")
 
   let some cmdState := Language.Lean.waitForFinalCmdState? snap
     | return none
@@ -415,3 +430,4 @@ def runFrontend
   return some env
 
 end Lean.Elab
+-- Modified by PaperLean.

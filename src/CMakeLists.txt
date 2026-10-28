@@ -1,3 +1,4 @@
+# Modified by PaperLean.
 cmake_minimum_required(VERSION 3.21)
 if(NOT CMAKE_GENERATOR MATCHES "Unix Makefiles")
   message(FATAL_ERROR "The only supported CMake generator at the moment is 'Unix Makefiles'")
@@ -84,6 +85,11 @@ option(STRIP_BINARIES "Strip produced binaries" ON)
 
 # When ON we include githash in the version string
 option(USE_GITHASH "GIT_HASH" ON)
+# The commit of the upstream release this source tree is compatible with. It is used as the githash
+# instead of the checked-out commit, so that `Lean.githash`, which Lake uses to decide whether build
+# artifacts can be reused, and the `.olean` headers are those of the official release.
+set(LEAN_UPSTREAM_GITHASH "470d5ce1400764999581fd26d5d72b00d990b0f4" CACHE STRING
+  "githash to embed instead of the checked-out commit (empty: the checked-out commit)")
 # When ON we install LICENSE files to CMAKE_INSTALL_PREFIX
 option(INSTALL_LICENSE "INSTALL_LICENSE" ON)
 # When ON we install a copy of cadical
@@ -112,6 +118,10 @@ option(USE_GMP "USE_GMP" ON)
 option(FORCE_GMP "Build against the available GMP even if older than the required 6.3.0" OFF)
 option(USE_MIMALLOC "use mimalloc" ON)
 set(LEAN_MI_SECURE 0 CACHE STRING "Configure mimalloc memory safety mitigations (https://github.com/microsoft/mimalloc/blob/v2.2.7/include/mimalloc/types.h#L56-L60)")
+# With `madvise` THP and defrag settings, mimalloc's `MADV_HUGEPAGE` makes page faults compact
+# memory synchronously, which on hosts with a fragmented page cache costs more than huge pages save.
+# `MIMALLOC_ALLOW_THP` still overrides this at run time.
+set(LEAN_MI_ALLOW_THP "" CACHE STRING "Override the default of mimalloc's `allow_thp` option (0 disables transparent huge pages for the process)")
 
 # development-specific options
 option(CHECK_OLEAN_VERSION "Only load .olean files compiled with the current version of Lean" OFF)
@@ -130,6 +140,16 @@ set(LEANC_CC ${CMAKE_C_COMPILER} CACHE STRING "C compiler to use in `leanc`")
 string(APPEND LEAN_EXTRA_OPTS " -Dinterpreter.prefer_native=false")
 # More useful for devs than users
 string(APPEND LEAN_EXTRA_OPTS " -Dpp.rawOnError=true")
+# PaperLean: the stage0 `lean` that builds stage1 interprets stage1's code, which calls
+# `Lean.PaperLean.envRecording`, whose native code stage0 does not have (`paperlean/stage0_shim.c`).
+# Only the build of the library (`stdlib.make`, `lakefile.toml`) loads the shim, which stays in the
+# build directory; the installed `lean.mk` does not name it.
+set(PAPERLEAN_STAGE0_SHIM_OPTS "")
+if(STAGE EQUAL 1)
+  add_library(paperlean_stage0_shim SHARED paperlean/stage0_shim.c)
+  set_target_properties(paperlean_stage0_shim PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/temp)
+  set(PAPERLEAN_STAGE0_SHIM_OPTS " --load-dynlib=${CMAKE_BINARY_DIR}/lib/temp/${CMAKE_SHARED_LIBRARY_PREFIX}paperlean_stage0_shim${CMAKE_SHARED_LIBRARY_SUFFIX}")
+endif()
 
 # option used by the CI to fail on warnings
 option(WFAIL "Fail build if warnings are emitted by Lean" ON)
@@ -722,7 +742,10 @@ endif()
 file(WRITE "${CMAKE_BINARY_DIR}/lake-githash" "${LAKE_LEAN_GITHASH}")
 
 # Git HASH
-if(USE_GITHASH)
+if(USE_GITHASH AND NOT "${LEAN_UPSTREAM_GITHASH}" STREQUAL "")
+  set(GIT_SHA1 "${LEAN_UPSTREAM_GITHASH}")
+  message(STATUS "git commit sha1 (upstream release): ${GIT_SHA1}")
+elseif(USE_GITHASH)
   include(GetGitRevisionDescription)
   get_git_head_revision(GIT_REFSPEC GIT_SHA1 ALLOW_LOOKING_ABOVE_CMAKE_SOURCE_DIR)
   if(GIT_SHA1 MATCHES "GITDIR-NOTFOUND")
@@ -773,6 +796,13 @@ if(USE_MIMALLOC)
   )
 endif()
 install(DIRECTORY ${LEAN_BINARY_DIR}/include/ DESTINATION include)
+# PaperLean: the installed `lean.mk` names the archiver by its file name if the toolchain ships it in
+# its `bin` (`script/prepare-llvm-*.sh`), where `leanmake` finds it, instead of by its path in the
+# build directory
+get_filename_component(LEAN_MK_AR "${CMAKE_AR}" NAME)
+if(NOT EXISTS "${CMAKE_BINARY_DIR}/bin/${LEAN_MK_AR}")
+  set(LEAN_MK_AR "${CMAKE_AR}")
+endif()
 configure_file(${LEAN_SOURCE_DIR}/lean.mk.in ${LEAN_BINARY_DIR}/share/lean/lean.mk)
 install(DIRECTORY ${LEAN_BINARY_DIR}/share/ DESTINATION share)
 
@@ -864,6 +894,8 @@ else()
   set(LEAN_OBJS ${LEAN_OBJS} $<TARGET_OBJECTS:kernel>)
   add_subdirectory(library)
   set(LEAN_OBJS ${LEAN_OBJS} $<TARGET_OBJECTS:library>)
+  add_subdirectory(paperlean)
+  set(LEAN_OBJS ${LEAN_OBJS} $<TARGET_OBJECTS:paperlean>)
   add_subdirectory(library/constructions)
   set(LEAN_OBJS ${LEAN_OBJS} $<TARGET_OBJECTS:constructions>)
 
@@ -943,6 +975,9 @@ add_custom_target(
   COMMAND $(MAKE) -f ${CMAKE_BINARY_DIR}/stdlib.make ${STDLIBS}
   VERBATIM
 )
+if(STAGE EQUAL 1)
+  add_dependencies(make_stdlib paperlean_stage0_shim)
+endif()
 
 # if we have LLVM enabled, then build `lean.h.bc` which has the LLVM bitcode
 # of Lean runtime to be built.
@@ -1153,6 +1188,8 @@ if(STAGE GREATER 0 AND NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
 endif()
 
 file(COPY ${LEAN_SOURCE_DIR}/bin/leanmake DESTINATION ${CMAKE_BINARY_DIR}/bin)
+# PaperLean: the `paperlean` command
+file(COPY ${LEAN_SOURCE_DIR}/bin/paperlean DESTINATION ${CMAKE_BINARY_DIR}/bin)
 
 install(DIRECTORY "${CMAKE_BINARY_DIR}/bin/" USE_SOURCE_PERMISSIONS DESTINATION bin)
 
@@ -1263,6 +1300,8 @@ string(
   LEANCHECKER_PARANOID_LINKER_FLAGS_MAKE
   "${LEANCHECKER_PARANOID_LINKER_FLAGS}"
 )
+# PaperLean: the build of the library loads the stage0 shim (`PAPERLEAN_STAGE0_SHIM_OPTS`)
+set(LEAN_EXTRA_MAKE_OPTS "${LEAN_EXTRA_MAKE_OPTS}${PAPERLEAN_STAGE0_SHIM_OPTS}")
 configure_file(${LEAN_SOURCE_DIR}/stdlib.make.in ${CMAKE_BINARY_DIR}/stdlib.make)
 
 # hacky
@@ -1276,8 +1315,12 @@ endfunction()
 string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}" LEANC_CC "${LEANC_CC}")
 string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}" LEANC_INTERNAL_FLAGS "${LEANC_INTERNAL_FLAGS}")
 
-toml_escape("${LEAN_EXTRA_OPTS}" LEAN_EXTRA_OPTS_TOML)
-toml_escape("${LEANC_EXTRA_CC_FLAGS}" LEAN_MORE_LEANC_ARGS_TOML)
+toml_escape("${LEAN_EXTRA_OPTS}${PAPERLEAN_STAGE0_SHIM_OPTS}" LEAN_EXTRA_OPTS_TOML)
+# PaperLean: `PAPERLEAN_STDLIB_CC_FLAGS` (e.g. for profile-guided optimization) are used for the C code
+# of Lean's own libraries only; unlike `LEANC_EXTRA_CC_FLAGS`, they are not passed to the C compiler
+# for packages' code (`Lean.Compiler.FFI.getCFlags`, `leanc`)
+set(PAPERLEAN_STDLIB_CC_FLAGS "" CACHE STRING "Additional flags for the C code of Lean's own libraries")
+toml_escape("${LEANC_EXTRA_CC_FLAGS} ${PAPERLEAN_STDLIB_CC_FLAGS}" LEAN_MORE_LEANC_ARGS_TOML)
 # These are passed as untraced arguments because they include the sysroot path.
 # However, as they are untraced, Lake will not invalidate build artifacts if the sysroot changes.
 # As such, care must be taken when changing sysroots. Locally, artifacts can be manually cleaned via

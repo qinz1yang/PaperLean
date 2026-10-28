@@ -3,6 +3,7 @@ Copyright (c) 2018 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
 Author: Leonardo de Moura
+Modified by PaperLean.
 */
 #include <atomic>
 #include <string>
@@ -564,13 +565,34 @@ static obj_res mark_persistent_fn(obj_arg o) {
 #endif
 #endif
 
+// Whether `o` may be a heap object with a reference count. Every such object is allocated by
+// mimalloc, so anything outside its heap (mainly objects in memory-mapped compacted regions) is
+// already persistent; checking the page map avoids reading the object and faulting its page in.
+static inline bool may_have_rc(object * o) {
+#ifdef LEAN_MIMALLOC
+    return mi_is_in_heap_region(o);
+#else
+    return true;
+#endif
+}
+
 extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
-    buffer<object*> todo;
+    // Only objects that may have a reference count are pushed. The traversal of a large imported
+    // environment is bound by cache misses on object headers, so the object that will be popped a
+    // few iterations later is prefetched.
+    struct todo_buffer : buffer<object*> {
+        void push_back(object * o) {
+            if (!lean_is_scalar(o) && may_have_rc(o)) buffer<object*>::push_back(o);
+        }
+    } todo;
     todo.push_back(o);
     while (!todo.empty()) {
         object * o = todo.back();
         todo.pop_back();
-        if (!lean_is_scalar(o) && lean_has_rc(o)) {
+#if defined(__GNUC__)
+        if (todo.size() >= 8) __builtin_prefetch(todo[todo.size() - 8], 1);
+#endif
+        if (lean_has_rc(o)) {
             lean_internal_set_rc(o, 0);
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
@@ -662,7 +684,7 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
     while (!todo.empty()) {
         object * o = todo.back();
         todo.pop_back();
-        if (!lean_is_scalar(o) && is_unshared(o)) {
+        if (!lean_is_scalar(o) && may_have_rc(o) && is_unshared(o)) {
             // A count that overflowed, or is too large for the live thread-shared range, freezes at
             // `LEAN_RC_STICKY`, where no later `lean_mark_mt` takes it for an unshared one.
             // sync with tests/elab/rc_model.lean (`markMtRc`)
@@ -922,7 +944,8 @@ class task_manager {
     void resolve_core(unique_lock<mutex> & lock, lean_task_object * t, object * v) {
         mark_mt(v);
         t->m_value = v;
-        lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_relaxed);
+        // (release: `deactivate_task` frees a task whose `m_imp` it sees cleared without the lock)
+        lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_acq_rel);
         handle_finished(lock, t, imp);
         /* After the task has been finished and we propagated
            dependencies, we can release `imp` and keep just the value */
@@ -1145,7 +1168,10 @@ scoped_task_manager::~scoped_task_manager() {
 }
 
 void deactivate_task(lean_task_object * t) {
-    if (g_task_manager) {
+    // PaperLean: a finished task, whose `m_imp` `resolve_core` cleared after setting its value and
+    // after which the task manager does not touch it, and a task made by `Task.pure`, which never
+    // had one, are freed without the task manager's lock
+    if (g_task_manager && t->m_imp.load(std::memory_order_acquire) != nullptr) {
         g_task_manager->deactivate_task(t);
     } else {
         lean_assert(t->m_value != nullptr);
@@ -1181,10 +1207,17 @@ static lean_task_object * alloc_task(obj_arg v) {
 }
 
 
+// PaperLean: a task's work is not seen by a recording of environment accesses on this thread
+// (`src/paperlean/env_recorder.cpp`). `Task.map` and `Task.bind` report also when they run their
+// function at once (`sync` on a finished task), so that whether a recording is usable does not
+// depend on timing.
+extern "C" void lean_paperlean_env_note_task();
+
 extern "C" LEAN_EXPORT obj_res lean_task_spawn_core(obj_arg c, unsigned prio, bool keep_alive) {
     if (!g_task_manager) {
         return lean_task_pure(apply_1(c, box(0)));
     } else {
+        lean_paperlean_env_note_task();
         lean_task_object * new_task = alloc_task(c, prio, keep_alive);
         g_task_manager->enqueue(new_task);
         return (lean_object*)new_task;
@@ -1205,6 +1238,7 @@ static obj_res task_map_fn(obj_arg f, obj_arg t, obj_arg w) {
 
 extern "C" LEAN_EXPORT obj_res lean_task_map_core(obj_arg f, obj_arg t, unsigned prio,
       bool sync, bool keep_alive) {
+    if (g_task_manager) lean_paperlean_env_note_task();
     if (!g_task_manager || (sync && lean_to_task(t)->m_value)) {
         return lean_task_pure(apply_1(f, lean_task_get_own(t)));
     } else {
@@ -1267,6 +1301,7 @@ static obj_res task_bind_fn1(obj_arg x, obj_arg f, obj_arg) {
 
 extern "C" LEAN_EXPORT obj_res lean_task_bind_core(obj_arg x, obj_arg f, unsigned prio,
       bool sync, bool keep_alive) {
+    if (g_task_manager) lean_paperlean_env_note_task();
     if (!g_task_manager || (sync && lean_to_task(x)->m_value)) {
         return apply_1(f, lean_task_get_own(x));
     } else {

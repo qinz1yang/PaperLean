@@ -1,3 +1,4 @@
+# Modified by PaperLean.
 cmake_minimum_required(VERSION 3.21)
 include(ExternalProject)
 include(FetchContent)
@@ -35,6 +36,13 @@ foreach(var ${vars})
     list(APPEND PLATFORM_ARGS "-D${var}=${${var}}")
   endif()
 endforeach()
+# PaperLean: the version description of the upstream release this source tree is compatible with
+# (see `LEAN_UPSTREAM_GITHASH` in src/CMakeLists.txt), passed to all stages like one given on the
+# command line, so that `Lean.versionString` and the `.olean` headers are the release's
+if(NOT DEFINED LEAN_SPECIAL_VERSION_DESC)
+  list(APPEND CL_ARGS "-DLEAN_SPECIAL_VERSION_DESC=rc3")
+  list(APPEND STAGE0_ARGS "-DLEAN_SPECIAL_VERSION_DESC=rc3")
+endif()
 
 project(LEAN CXX C)
 

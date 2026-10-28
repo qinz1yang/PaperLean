@@ -3,6 +3,7 @@ Copyright (c) 2018 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
 Author: Leonardo de Moura
+Modified by PaperLean.
 */
 #pragma once
 #include <functional>
@@ -66,6 +67,7 @@ class LEAN_EXPORT object_compactor {
     // Compacts a not-yet-seen heap object (and, recursively, its children),
     // returning its offset. Dispatches on the object's tag.
     object_offset compact(object * o);
+    void compact_children(object * o);
     void insert_terminator(object * o);
     object * copy_object(object * o, size_t sz = 0);
     object_offset insert_constructor(object * o);
@@ -120,6 +122,9 @@ class LEAN_EXPORT region_reader {
     // Data-relative byte offsets of every closure's `m_fun` field. Used to patch fn
     // pointers on load without scanning the compacted region. Empty if no closures.
     std::vector<size_t> m_closure_offsets;
+    // Saved root pointer, if the caller already read it from the file; lets the fast path in
+    // `read` avoid faulting in the data's first page just for the root slot.
+    object * m_root = nullptr;
     void sort_and_validate_dep_regions();
     void move(size_t d);
     void move(object * o);
@@ -143,6 +148,8 @@ public:
     region_reader(region_reader &&) = delete;
     region_reader operator=(region_reader const &) = delete;
     region_reader operator=(region_reader &&) = delete;
+    /* Supplies the value of the region's root slot as stored in the file. */
+    void set_saved_root(object * root) { m_root = root; }
     object * read();
 };
 }

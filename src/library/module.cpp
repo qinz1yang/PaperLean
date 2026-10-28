@@ -3,17 +3,32 @@ Copyright (c) 2014-2015 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
 Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
+Modified by PaperLean.
 
 .olean serialization and deserialization.
 */
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 #include <string>
 #include <sstream>
 #include <fstream>
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <climits>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <cerrno>
 #include <cstring>
 #include "runtime/thread.h"
@@ -32,6 +47,8 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 #include "library/constants.h"
 #include "library/time_task.h"
 #include "library/util.h"
+#include "paperlean/olean_pack.h"
+#include "paperlean/fast_import.h"
 #include "githash.h"
 
 #ifdef LEAN_WINDOWS
@@ -443,6 +460,32 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
     return r;
 }
 
+// PaperLean: the `.olean` format and regions, for `paperlean/olean_pack.cpp`
+size_t olean_header_size() { return sizeof(olean_header); }
+size_t olean_header_base_addr_offset() { return offsetof(olean_header, base_addr); }
+uint8_t olean_header_flags() { return olean_header().flags; }
+bool olean_header_info(char const * h, uint8_t & version, size_t & base_addr) {
+    olean_header header, expected = {};
+    memcpy(&header, h, sizeof(header));
+    if (memcmp(header.marker, expected.marker, sizeof(header.marker)) != 0 || header.flags != expected.flags) return false;
+    version = header.version;
+    base_addr = header.base_addr;
+    return true;
+}
+bool olean_header_githash_ok(char const * h) {
+#ifdef LEAN_CHECK_OLEAN_VERSION
+    olean_header header;
+    memcpy(&header, h, sizeof(header));
+    return strncmp(header.githash, LEAN_GITHASH, sizeof(header.githash)) == 0;
+#else
+    (void)h;
+    return true;
+#endif
+}
+object * mk_olean_region(b_obj_arg ofname, object * root, char * buffer, size_t base_addr, size_t full_sz, bool is_mmap) {
+    return mk_compacted_region(ofname, root, buffer, base_addr, full_sz, is_mmap);
+}
+
 // Implements `Lean.CompactedRegion.read`. Loads a compacted region from disk. `odep_regions`
 // carries `CompactedRegion`s whose address ranges must be known to resolve cross-region pointers
 // in this file. Returns `(α × CompactedRegion)`, where `α` is the type the Lean caller asks the
@@ -450,9 +493,17 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
 // using a type compatible with what was saved (see `CompactedRegion.read`).
 // Supports both `v2` and `v3` formats.
 extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
+    scoped_import_timer timer(counter_region_read);
     std::string olean_fn(lean_string_cstr(ofname));
     try {
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
+        pack_hit hit;
+        if (find_in_packs(olean_fn, dep_regions, hit)) {
+            object * pair = alloc_cnstr(0, 2, 0);
+            cnstr_set(pair, 0, hit.root);
+            cnstr_set(pair, 1, mk_compacted_region(ofname, hit.root, hit.begin, hit.orig_base, hit.size, true));
+            return io_result_mk_ok(pair);
+        }
 #ifdef LEAN_WINDOWS
         HANDLE h_file = CreateFile(olean_fn.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h_file == INVALID_HANDLE_VALUE) {
@@ -479,11 +530,17 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 
         olean_header default_header = {};
         olean_header header;
-        ssize_t read_size = readn(fd.get(), &header, sizeof(header));
+        // Read the two words following the header as well (v2: root slot; v3: `data_size`, root
+        // slot) so that loading does not fault in the mapping's first page just for them.
+        char prefix[sizeof(olean_header) + 2 * sizeof(size_t)];
+        ssize_t read_size = readn(fd.get(), prefix, sizeof(prefix));
         if (read_size < 0) {
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "': " << strerror(errno)).str());
         }
-        if (read_size != sizeof(header)
+        memcpy(&header, prefix, std::min(sizeof(header), static_cast<size_t>(read_size)));
+        size_t prefix_words = read_size > static_cast<ssize_t>(sizeof(header))
+            ? (read_size - sizeof(header)) / sizeof(size_t) : 0;
+        if (read_size < static_cast<ssize_t>(sizeof(header))
             || memcmp(header.marker, default_header.marker, sizeof(header.marker)) != 0) {
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', invalid header").str());
         }
@@ -579,9 +636,13 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
         std::vector<size_t> closure_offsets;
         size_t data_section_off = sizeof(olean_header);
         size_t data_section_sz = size - sizeof(olean_header);
+        size_t saved_root_word = header.version == 3 ? 1 : 0;
         if (header.version == 3) {
             size_t data_size;
-            memcpy(&data_size, buffer + sizeof(olean_header), sizeof(data_size));
+            if (prefix_words >= 1)
+                memcpy(&data_size, prefix + sizeof(olean_header), sizeof(data_size));
+            else
+                memcpy(&data_size, buffer + sizeof(olean_header), sizeof(data_size));
             data_section_off = sizeof(olean_header) + sizeof(size_t);
             data_section_sz = data_size;
             char const * p = buffer + data_section_off + data_size;
@@ -605,6 +666,11 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             base_addr + data_section_off,
             std::move(dep_regions),
             std::move(lib_relocs), std::move(closure_offsets));
+        if (prefix_words > saved_root_word && data_section_sz >= sizeof(object_offset)) {
+            object * saved_root;
+            memcpy(&saved_root, prefix + sizeof(olean_header) + saved_root_word * sizeof(size_t), sizeof(saved_root));
+            reader.set_saved_root(saved_root);
+        }
         object * mod = reader.read();
         object * pair = alloc_cnstr(0, 2, 0);
         cnstr_set(pair, 0, mod);
@@ -628,7 +694,9 @@ extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object
     // refcount-free buffer object, so it needs no decrement.
     lean_ctor_set(region, 1, lean_box(0));
     lean_dec_ref(region);
-    if (is_mmap) {
+    if (in_packs(buffer)) {
+        // the pack stays mapped
+    } else if (is_mmap) {
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
         __lsan_unregister_root_region(buffer, full_sz);

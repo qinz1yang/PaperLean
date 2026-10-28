@@ -15,6 +15,7 @@ import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
 import Init.Omega
+import Lake.PaperLean.BuildData
 
 /-! # Module Build Definitions -/
 
@@ -998,6 +999,8 @@ def Module.buildLean
   let setup ← mkModuleSetup mod presetup
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
+  -- PaperLean: packs modules compiled by this build for later ones (`Lake.PaperLean.BuildData`)
+  PaperLean.BuildData.compileStarting mod (← getWorkspace).dir (← getLeanInstall).leanLibDir
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
     (← getLeanPath) (← getLean) (← getLeanir)
   mod.clearOutputHashes
@@ -1021,6 +1024,7 @@ def Module.recBuildLean (mod : Module) : FetchM (Job ModuleOutputArtifacts) := d
     let arts ← fetchCore presetup
     let arts ← trackOutputsIfEnabled arts
     let arts ← adjustMTime arts
+    PaperLean.BuildData.moduleDone mod
     return arts
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM (ModuleOutputArtifacts ⊕ SavedTrace) := do
@@ -1570,3 +1574,4 @@ where
     }
     logVerbose (mkCmdLog spawnArgs)
     return spawnArgs
+-- Modified by PaperLean.

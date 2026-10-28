@@ -1,3 +1,4 @@
+# Modified by PaperLean.
 #################
 ## Environment ##
 #################
@@ -330,6 +331,7 @@ add_test_pile(
 add_test_pile(elab_bench *.lean BENCH PART2 ${ELAB_FIXTURES})
 add_test_pile(elab_fail *.lean ${ELAB_FIXTURES})
 add_test_pile(misc *.sh)
+add_test_pile(paperlean *.sh)
 add_test_pile(misc_bench *.sh BENCH PART2)
 add_test_pile(server *.lean)
 add_test_pile(server_interactive *.lean)

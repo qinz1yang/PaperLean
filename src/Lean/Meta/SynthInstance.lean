@@ -13,6 +13,7 @@ public import Lean.Meta.AbstractMVars
 public import Lean.Meta.Check
 import Init.While
 import Lean.Util.CollectFVars
+import Lean.PaperLean.TCCache
 
 public section
 namespace Lean.Meta
@@ -979,31 +980,34 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       return result?
     | none =>
       trace[Meta.synthInstance.cache] "new: {type}"
-      let abstResult? ← withNewMCtxDepth (allowLevelAssignments := true) do
-        match kind with
-        | .noMVars =>
-          /-
-          **Note**: The expensive `preprocessOutParam` step is morally **not** needed here because
-          the output params should be uniquely determined by the input params. During type class
-          resolution, definitional equality only unfolds `[reducible]` and `[instance_reducible]`
-          declarations. This is a contract with our users to ensure performance is reasonable.
-          However, the same `OrderDual` declaration that creates problems for `assignOutParams`
-          also prevents us from using this optimization. As an example, suppose we are trying to
-          synthesize
-          ```
-          FunLike F (OrderDual α) (OrderDual β)
-          ```
-          where the last two arguments of `FunLike` are output parameters. This term has no
-          metavariables, and it seems natural to skip `preprocessOutParam`, which would replace
-          the last two arguments with metavariables. However, if we don't replace them,
-          TC resolution fails because it cannot unfold `OrderDual` since it is semireducible.
+      -- PaperLean: the result of the same search in an earlier command may be reused
+      -- (`Lean.PaperLean.TCCache`)
+      let abstResult? ← (if kind matches .noMVars then PaperLean.TCCache.withCache localInsts type maxResultSize else id) <|
+        withNewMCtxDepth (allowLevelAssignments := true) do
+          match kind with
+          | .noMVars =>
+            /-
+            **Note**: The expensive `preprocessOutParam` step is morally **not** needed here because
+            the output params should be uniquely determined by the input params. During type class
+            resolution, definitional equality only unfolds `[reducible]` and `[instance_reducible]`
+            declarations. This is a contract with our users to ensure performance is reasonable.
+            However, the same `OrderDual` declaration that creates problems for `assignOutParams`
+            also prevents us from using this optimization. As an example, suppose we are trying to
+            synthesize
+            ```
+            FunLike F (OrderDual α) (OrderDual β)
+            ```
+            where the last two arguments of `FunLike` are output parameters. This term has no
+            metavariables, and it seems natural to skip `preprocessOutParam`, which would replace
+            the last two arguments with metavariables. However, if we don't replace them,
+            TC resolution fails because it cannot unfold `OrderDual` since it is semireducible.
 
-          **Note**: We should remove `preprocessOutParam` from the following line as soon as
-          Mathlib refactors `OrderDual`.
-          -/
-          SynthInstance.main (← preprocessOutParam type) maxResultSize
-        | .mvarsNoOutputParams => SynthInstance.main type maxResultSize
-        | .mvarsOutputParams => SynthInstance.main (← preprocessOutParam type) maxResultSize
+            **Note**: We should remove `preprocessOutParam` from the following line as soon as
+            Mathlib refactors `OrderDual`.
+            -/
+            SynthInstance.main (← preprocessOutParam type) maxResultSize
+          | .mvarsNoOutputParams => SynthInstance.main type maxResultSize
+          | .mvarsOutputParams => SynthInstance.main (← preprocessOutParam type) maxResultSize
       let result? ← applyAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?}"
       cacheResult cacheKey kind abstResult? result?
@@ -1081,3 +1085,4 @@ builtin_initialize
   registerTraceClass `Meta.synthInstance.cache
 
 end Lean.Meta
+-- Modified by PaperLean.

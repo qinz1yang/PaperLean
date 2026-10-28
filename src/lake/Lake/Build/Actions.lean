@@ -16,6 +16,7 @@ import Init.Data.String.TakeDrop
 import Init.System.Platform
 import Lean.CoreM
 import Lean.Compiler.Options
+import Lake.PaperLean.BuildEnv
 
 /-! # Common Build Actions
 Low level actions to build common Lean artifacts via the Lean toolchain.
@@ -52,17 +53,21 @@ public def compileLeanModule
     createParentDirs bcFile
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
-  IO.FS.writeFile setupFile (toJson setup).pretty
+  IO.FS.writeFile setupFile (toJson setup).compress
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
-  let out ← rawProc {
+  let spawnArgs : IO.Process.SpawnArgs := {
     args
     cmd := lean.toString
     env := #[
       ("LEAN_PATH", leanPath.toString)
     ]
   }
+  -- PaperLean: with the olean packs written so far during the build (`Lake.PaperLean.BuildData`),
+  -- which the logged command leaves out, so that the log that the trace records is Lake's
+  logVerbose (mkCmdLog spawnArgs)
+  let out ← rawProc (quiet := true) { spawnArgs with env := spawnArgs.env ++ (← PaperLean.BuildEnv.leanEnv) }
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
@@ -210,3 +215,4 @@ public def tar
     -- don't pack `._` files on MacOS
     env := if Platform.isOSX then #[("COPYFILE_DISABLE", "true")] else #[]
   }
+-- Modified by PaperLean.

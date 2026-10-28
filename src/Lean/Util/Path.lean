@@ -55,13 +55,29 @@ abbrev SearchPath := System.SearchPath
 
 namespace SearchPath
 
+/-- Package roots found by `findWithExt` for `.olean` files, per package, with the search path they
+were found in. -/
+private builtin_initialize pkgRootCache : IO.Ref (Array (String × SearchPath × FilePath)) ←
+  IO.mkRef #[]
+
 /-- If the package of `mod` can be found in `sp`, return the path with extension
 `ext` (`lean` or `olean`) corresponding to `mod`. Otherwise, return `none`. Does
 not check whether the returned path exists. -/
 def findWithExt (sp : SearchPath) (ext : String) (mod : Name) : IO (Option FilePath) := do
   let pkg := mod.getRoot.toString (escape := false)
+  -- An import resolves thousands of `.olean` files from a handful of packages; reuse the root found
+  -- for the package instead of probing every earlier search path entry again for each module. This
+  -- assumes no earlier entry gains the package while the process runs. `ext` is only compared here,
+  -- not stored, so that its calling convention stays upstream's (borrowed).
+  if ext == "olean" then
+    if let some (_, _, root) := (← pkgRootCache.get).find? fun (pkg', sp', _) => pkg' == pkg && sp' == sp then
+      if ← (root / pkg).isDir <||> ((root / pkg).addExtension ext).pathExists then
+        return some (modToFilePath root mod ext)
   let root? ← sp.findM? fun p =>
     (p / pkg).isDir <||> ((p / pkg).addExtension ext).pathExists
+  if ext == "olean" then
+    if let some root := root? then
+      pkgRootCache.modify fun c => (c.filter (·.1 != pkg)).push (pkg, sp, root)
   return root?.map (modToFilePath · mod ext)
 
 /-- Like `findWithExt`, but ensures the returned path exists. -/
@@ -187,3 +203,4 @@ def findSysroot (lean := "lean") : IO FilePath := do
   return out.trimAscii.copy
 
 end Lean
+-- Modified by PaperLean.

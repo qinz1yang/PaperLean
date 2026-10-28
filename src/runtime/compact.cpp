@@ -3,6 +3,7 @@ Copyright (c) 2018 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
 Author: Leonardo de Moura
+Modified by PaperLean.
 */
 #include <algorithm>
 #include <string>
@@ -309,8 +310,35 @@ object_offset object_compactor::insert_constructor(object * o) {
     return save_max_sharing(o, new_o, lean_object_byte_size(o));
 }
 
+void object_compactor::compact_children(object * o) {
+    switch (lean_ptr_tag(o)) {
+    case LeanArray:
+        for (size_t i = 0; i < array_size(o); i++)
+            to_offset(array_get(o, i));
+        break;
+    case LeanRef:
+        to_offset(lean_to_ref(o)->m_value);
+        break;
+    default:
+        if (lean_ptr_tag(o) <= LeanMaxCtorTag) {
+            for (unsigned i = 0; i < lean_ctor_num_objs(o); i++)
+                to_offset(cnstr_get(o, i));
+        }
+        break;
+    }
+}
+
 object_offset object_compactor::insert_array(object * o) {
     size_t sz = array_size(o);
+    // Compact all elements' children before the elements themselves so that the elements end up
+    // contiguous: importing iterates arrays such as `ModuleData.constants` and only touches the
+    // elements' headers, which would otherwise be spread across every page of the file.
+    for (size_t i = 0; i < sz; i++) {
+        object * e = array_get(o, i);
+        if (!lean_is_scalar(e) && (m_dep_regions.empty() || lean_has_rc(e))
+            && m_obj_table.find(e) == m_obj_table.end())
+            compact_children(e);
+    }
     size_t base = m_tmp.size();
     m_tmp.resize(base + sz);
     for (size_t i = 0; i < sz; i++) {
@@ -650,7 +678,7 @@ object * region_reader::read() {
             // pointer needs no fixup and the structural walk can be skipped entirely. This also
             // lets us avoid sorting and validating `m_dep_regions` (the dominant cost when chaining
             // many dep oleans into a single `region_reader`).
-            object * root = *static_cast<object_offset *>(m_next);
+            object * root = m_root ? m_root : *static_cast<object_offset *>(m_next);
             m_end = m_next;
             return root;
         }

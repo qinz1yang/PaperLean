@@ -11,6 +11,7 @@ import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
 import Init.Omega
+import Lake.PaperLean.BuildData
 
 /-! # Build Runner
 
@@ -462,9 +463,12 @@ public def Workspace.runBuild
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
+  -- PaperLean: the packs written during the build are not needed after it (`Lake.PaperLean.BuildData`)
+  PaperLean.BuildData.finish
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/
 @[inline] public def runBuild
   (build : FetchM (Job α)) (cfg : BuildConfig := {})
 : LakeT IO α := do (← getWorkspace).runBuild build cfg
+-- Modified by PaperLean.
