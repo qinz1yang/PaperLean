@@ -1,0 +1,34 @@
+name = "test"
+testDriver = "b"
+lintDriver = "b"
+defaultTargets = ["A"]
+
+[leanOptions]
+pp.unicode.fun = true
+
+[[require]]
+name = "baz"
+scope = "foo"
+rev = "abcdef"
+
+[[require]]
+name = "foo"
+path = "dir"
+options = {foo = "bar"}
+
+[[require]]
+name = "bar"
+git = "https://example.com"
+rev = "abc"
+subDir = "sub/dir"
+
+[[require]]
+name = "qux"
+path = "qux"
+copy = true
+
+[[lean_lib]]
+name = "A"
+
+[[lean_exe]]
+name = "b"
