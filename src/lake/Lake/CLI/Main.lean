@@ -985,6 +985,29 @@ protected def build : CliM PUnit := do
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
   ws.runBuild (buildSpecs specs) buildConfig
 
+/-- PaperLean: `lake build` once the workspace `ws` is loaded. -/
+def buildLoaded (ws : Workspace) : CliM PUnit := do
+  let opts ← getThe LakeOptions
+  let targetSpecs ← takeArgs
+  let specs ← parseTargetSpecs ws targetSpecs
+  if specs.isEmpty && !opts.allowEmpty then
+    logWarning "no targets specified and no default targets configured\
+      \n  Note: This will be an error in a future version of Lake.\
+      \n  Hint: This warning (or error) can be suppressed with '--allow-empty'."
+    if opts.failLv ≤ .warning then
+      exit 1
+  specs.forM fun spec =>
+    unless spec.buildable do
+      throw <| .invalidBuildTarget spec.info.key.toSimpleString
+  let outputsPackage? ← id do
+    match opts.outputsFile?, opts.package? with
+    | some _, some pkg => some <$> parsePackageSpec ws pkg
+    | some _, none => return some ws.root
+    | none, some _ => error "`--package` requires `-o`"
+    | none, none => return none
+  let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
+  ws.runBuild (buildSpecs specs) buildConfig
+
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
   let pkg ← loadPackage (← mkLoadConfig (← getThe LakeOptions))
@@ -1273,10 +1296,33 @@ protected def env : CliM PUnit := do
       IO.println s!"{var}={val?.getD ""}"
     exit 0
 
+/--
+PaperLean: `lake build args` for `paperlean build` in this process, with the workspace `ws` that
+`lake paperlean` loaded with the options `opts₀`, if the Lake that it would start otherwise
+(`Lake.PaperLean.runBuild`: in the workspace's directory, with `args` alone) would load the workspace
+in the same way and not exit by itself (`--no-build`); its exit code, else `none`.
+-/
+def _root_.Lake.PaperLean.buildIn (opts₀ : LakeOptions) : PaperLean.BuildIn := fun ws args => do
+  let here ← (do return (← IO.FS.realPath (← IO.currentDir)) == (← IO.FS.realPath ws.dir) : IO Bool)
+    |>.catchExceptions fun _ => pure false
+  unless here do return none
+  let other ← IO.mkRef false
+  let code ← CliM.run (args := args) do
+    processOptions lakeOption
+    let opts ← getThe LakeOptions
+    if opts.wantsHelp || opts.noBuild || opts.rootDir != "." || opts.configFile != opts₀.configFile ||
+        opts.configOpts.toList != opts₀.configOpts.toList || !opts.packageOverrides.isEmpty ||
+        !opts₀.packageOverrides.isEmpty || opts.reconfigure || opts.updateDeps ||
+        opts.noCache != opts₀.noCache then
+      other.set true
+    else
+      buildLoaded ws
+  return if ← other.get then none else some code
+
 /-- PaperLean: `lake paperlean`, the `paperlean` command (`Lake.PaperLean.cli`). -/
 protected def paperlean : CliM PUnit := do
-  let config ← mkLoadConfig (← getThe LakeOptions)
-  exit <| ← PaperLean.cli config (← takeArgs)
+  let opts ← getThe LakeOptions
+  exit <| ← PaperLean.cli (← mkLoadConfig opts) (← takeArgs) (PaperLean.buildIn opts)
 
 protected def exe : CliM PUnit := do
   let exeSpec ← takeArg "executable target"
@@ -1404,7 +1450,6 @@ def lakeCli : (cmd : String) → CliM PUnit
 | "comparator"          => lake.comparator
 | "check"               => lake.check
 | "script"              => lake.script
-| "paperlean"           => lake.paperlean
 | "scripts"             => lake.script.list
 | "run"                 => lake.script.run
 | "serve"               => lake.serve
@@ -1422,7 +1467,12 @@ def lakeCli : (cmd : String) → CliM PUnit
   else
     throw <| CliError.unknownCommand cmd
 
-def lake : CliM PUnit := do
+/-- PaperLean: `lakeCli`, and the `paperlean` command, which only PaperLean's Lake has. -/
+private def lakeCliPaperLean (cmd : String) : CliM PUnit :=
+  if cmd == "paperlean" then lake.paperlean else lakeCli cmd
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def lake : CliM PUnit := do
   match (← getArgs) with
   | [] => IO.println usage
   | ["--version"] => IO.println uiVersionString
@@ -1435,7 +1485,7 @@ def lake : CliM PUnit := do
       if (← getWantsHelp) then
         IO.println <| help cmd
       else
-        lakeCli cmd
+        lakeCliPaperLean cmd
     else
       if (← getWantsHelp) then
         IO.println usage

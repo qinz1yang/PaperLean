@@ -200,7 +200,8 @@ instance : Inhabited (SynthM α) where
   default := fun _ _ => default
 
 /-- Return globals and locals instances that may unify with `type` -/
-def getInstances (type : Expr) : MetaM (Array Instance) := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def getInstances (type : Expr) : MetaM (Array Instance) := do
   -- We must retrieve `localInstances` before we use `forallTelescopeReducing` because it will update the set of local instances
   let localInstances ← getLocalInstances
   forallTelescopeReducing type fun _ type => do
@@ -208,12 +209,17 @@ def getInstances (type : Expr) : MetaM (Array Instance) := do
     match className? with
     | none   => throwError "type class instance expected{indentExpr type}"
     | some className =>
-      let globalInstances ← getGlobalInstancesIndex
-      let result ← globalInstances.getUnify type
+      -- PaperLean: a recording of environment accesses depends only on the instances read here
+      -- (`Lean.PaperLean.TCCache.getInstancesUnify`)
+      let recording := PaperLean.envRecording type
+      let result ← if recording then PaperLean.TCCache.getInstancesUnify type else
+        let globalInstances ← getGlobalInstancesIndex
+        globalInstances.getUnify type
       -- Using insertion sort because it is stable and the array `result` should be mostly sorted.
       -- Most instances have default priority.
       let result := result.insertionSort fun e₁ e₂ => e₁.priority < e₂.priority
-      let erasedInstances ← getErasedInstances
+      let erasedInstances ← if recording then PaperLean.TCCache.erasedInstancesUnrecorded
+        else getErasedInstances
       let env ← getEnv
       let mut result ← result.filterMapM fun e => match e.val with
         | .const constName us =>
@@ -960,7 +966,20 @@ private def cacheResult (cacheKey : SynthInstanceCacheKey) (kind : PreprocessKin
     else
       modify fun s => { s with cache.synthInstance := s.cache.synthInstance.insert cacheKey (some abstResult) }
 
-def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) := do
+set_option compiler.ignoreBorrowAnnotation true in
+/-- PaperLean: `synthInstanceCore?` with the reuse of results (below). -/
+@[extern "lean_paperlean_synth_instance_core"]
+private opaque synthInstanceReusingOwned (type : Expr) (maxResultSize? : Option Nat) : MetaM (Option Expr)
+
+-- (its context is borrowed, so that the inferred calling convention stays upstream's)
+@[noinline] private def synthInstanceReusing (type : Expr) (maxResultSize? : Option Nat)
+    (ctx : @& Context) (s : @& ST.Ref IO.RealWorld State) (cctx : @& Core.Context)
+    (cs : @& ST.Ref IO.RealWorld Core.State) : EIO Exception (Option Expr) :=
+  synthInstanceReusingOwned type maxResultSize? ctx s cctx cs
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) :=
+  (PaperLean.nativePath type).select (synthInstanceReusing type maxResultSize?) do
   let opts ← getOptions
   let maxResultSize := maxResultSize?.getD (synthInstance.maxSize.get opts)
   withTraceNode `Meta.synthInstance
@@ -980,9 +999,75 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       return result?
     | none =>
       trace[Meta.synthInstance.cache] "new: {type}"
+      let abstResult? ← withNewMCtxDepth (allowLevelAssignments := true) do
+        match kind with
+        | .noMVars =>
+          /-
+          **Note**: The expensive `preprocessOutParam` step is morally **not** needed here because
+          the output params should be uniquely determined by the input params. During type class
+          resolution, definitional equality only unfolds `[reducible]` and `[instance_reducible]`
+          declarations. This is a contract with our users to ensure performance is reasonable.
+          However, the same `OrderDual` declaration that creates problems for `assignOutParams`
+          also prevents us from using this optimization. As an example, suppose we are trying to
+          synthesize
+          ```
+          FunLike F (OrderDual α) (OrderDual β)
+          ```
+          where the last two arguments of `FunLike` are output parameters. This term has no
+          metavariables, and it seems natural to skip `preprocessOutParam`, which would replace
+          the last two arguments with metavariables. However, if we don't replace them,
+          TC resolution fails because it cannot unfold `OrderDual` since it is semireducible.
+
+          **Note**: We should remove `preprocessOutParam` from the following line as soon as
+          Mathlib refactors `OrderDual`.
+          -/
+          SynthInstance.main (← preprocessOutParam type) maxResultSize
+        | .mvarsNoOutputParams => SynthInstance.main type maxResultSize
+        | .mvarsOutputParams => SynthInstance.main (← preprocessOutParam type) maxResultSize
+      let result? ← applyAbstractResult? type abstResult?
+      trace[Meta.synthInstance] "result {result?}"
+      cacheResult cacheKey kind abstResult? result?
+      return result?
+
+/-- PaperLean: records the operation `op` (as in `PaperLean.noteCache`) on the cache with `cacheKey`
+and `value` for this thread's recording, counting no heartbeats. -/
+private def noteSynthInstanceCache {α : Type} (op : UInt8) (cacheKey : SynthInstanceCacheKey)
+    (value : α) : MetaM Unit := do
+  let heartbeats ← IO.getNumHeartbeats
+  PaperLean.noteCache 2 op cacheKey value
+  PaperLean.setHeartbeats heartbeats
+
+set_option compiler.ignoreBorrowAnnotation true in
+@[export lean_paperlean_synth_instance_core]
+private def synthInstanceReusingImpl (type : Expr) (maxResultSize? : Option Nat) : MetaM (Option Expr) := do
+  let opts ← getOptions
+  let maxResultSize := maxResultSize?.getD (synthInstance.maxSize.get opts)
+  withTraceNode `Meta.synthInstance
+    (fun _ => return m!"{← instantiateMVars type}") do
+  withConfig (fun config => { config with isDefEqStuckEx := true, transparency := TransparencyMode.instances,
+                                          foApprox := true, ctxApprox := true, constApprox := false, univApprox := false }) do
+  withInTypeClassResolution do
+    let localInsts ← getLocalInstances
+    let type ← instantiateMVars type
+    let { type, cacheKeyType, kind } ← preprocess type
+    let cacheKey := { localInsts, type := cacheKeyType, synthPendingDepth := (← read).synthPendingDepth }
+    let found? := (← get).cache.synthInstance.find? cacheKey
+    -- PaperLean: (`Lean.PaperLean.TCCache` repeats a search's operations on the cache)
+    if PaperLean.envRecording cacheKey then noteSynthInstanceCache 0 cacheKey found?
+    match found? with
+    | some abstResult? =>
+      trace[Meta.synthInstance.cache] "cached: {type}"
+      let result? ← applyCachedAbstractResult? type abstResult?
+      trace[Meta.synthInstance] "result {result?} (cached)"
+      return result?
+    | none =>
+      trace[Meta.synthInstance.cache] "new: {type}"
       -- PaperLean: the result of the same search in an earlier command may be reused
       -- (`Lean.PaperLean.TCCache`)
-      let abstResult? ← (if kind matches .noMVars then PaperLean.TCCache.withCache localInsts type maxResultSize else id) <|
+      let abstResult? ← (match kind with
+          | .noMVars => PaperLean.TCCache.withCache localInsts type maxResultSize
+          | .mvarsOutputParams => PaperLean.TCCache.withCache localInsts cacheKeyType maxResultSize
+          | .mvarsNoOutputParams => PaperLean.TCCache.withoutCache) <|
         withNewMCtxDepth (allowLevelAssignments := true) do
           match kind with
           | .noMVars =>
@@ -1011,6 +1096,10 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       let result? ← applyAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?}"
       cacheResult cacheKey kind abstResult? result?
+      -- PaperLean: (`Lean.PaperLean.TCCache` repeats a search's operations on the cache)
+      if PaperLean.envRecording cacheKey then
+        if let some value := (← get).cache.synthInstance.find? cacheKey then
+          noteSynthInstanceCache 1 cacheKey value
       return result?
 
 def synthInstance? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) := do profileitM Exception "typeclass inference" (← getOptions) (decl := type.getAppFn.constName?.getD .anonymous) do

@@ -6,10 +6,12 @@ module
 
 prelude
 public import Init.System.IO
+import Lake.PaperLean.Env
 
 /-!
-The olean packs written so far during this build (`Lake.PaperLean.BuildData`), for the `lean`
-processes that the build starts (`Lake.compileLeanModule`).
+What the `lean` processes that a build starts (`Lake.compileLeanModule`) get from PaperLean: the olean
+packs written so far during this build (`Lake.PaperLean.BuildData`), and under a `paperlean` command
+the request to reuse results (`PAPERLEAN_REUSE`, `Lean.PaperLean.Speculation.reuse`).
 -/
 
 namespace Lake.PaperLean.BuildEnv
@@ -24,10 +26,12 @@ public def addPack (pack : String) : BaseIO Unit :=
 public def clear : BaseIO Unit :=
   packsRef.set #[]
 
-/-- The environment for a `lean` process that the build starts: the packs written so far. -/
+/-- The environment for a `lean` process that the build starts: the packs written so far, and under a
+`paperlean` command (`accelerated`) the request to reuse results. -/
 public def leanEnv : BaseIO (Array (String × Option String)) := do
   let packs ← packsRef.get
-  if packs.isEmpty then return #[]
-  return #[("LEAN_OLEAN_PACK", some (String.intercalate ":" packs.toList))]
+  let env := if (← accelerated) then #[("PAPERLEAN_REUSE", some "1")] else #[]
+  if packs.isEmpty then return env
+  return env.push ("LEAN_OLEAN_PACK", some (String.intercalate ":" packs.toList))
 
 end Lake.PaperLean.BuildEnv

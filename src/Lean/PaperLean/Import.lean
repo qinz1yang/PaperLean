@@ -11,6 +11,12 @@ import Lean.PaperLean.GraphDiff
 import Lean.Compiler.ModPkgExt
 import Lean.Compiler.NameMangling
 import Lean.Compiler.InitAttr
+import Lean.Compiler.ExternAttr
+
+-- (no `SizeOf` instances for PaperLean's types: an instance of a module of `Lean` would be one of
+-- every environment that imports it, which Lean's searches would try)
+set_option genSizeOf false
+set_option genInjectivity false
 
 /-!
 The faster steps of `Lean.importModules`, which `Lean.Environment` calls through `@[extern]` hooks
@@ -120,6 +126,22 @@ private structure NativeImportInfo where
   /-- Its direct imports: twice the module index (`names.size` for a module that is not imported),
   plus one for a `meta import` in a `module` (otherwise initializers run every phase). -/
   imports : Array (Array Nat)
+  /-- Whether the module's native code can do what the interpreter does not, so that neither it nor
+  that of the modules that import it is used: it declares `@[extern]` functions (the interpreter
+  calls none of a package's, their native code calls whatever has the symbol) or has
+  `builtin_initialize` declarations (only its native initializer runs them), or it may, as the
+  import has only its IR, which tells neither (a library's manifest records it from all of the
+  module's data). -/
+  nativeDiffers : Array Bool
+  /-- The package of the module, empty if it has none: its symbols then have the package's prefix
+  (`mkPackageSymbolPrefix`), which Lean's own symbols do not. -/
+  packages : Array String
+  /-- Whether the module has `[init]` declarations marked `meta` and others: its native
+  initializers run them in another order than the interpreter. -/
+  mixedInits : Array Bool
+  /-- Whether the environment is that of a `module`: `runInitAttrForMod` then runs the initializers
+  for run time and compile time instead of that for all phases. -/
+  isModule : Bool
 
 @[export lean_paperlean_native_import_info]
 private def nativeImportInfo (env : Environment) (opts : Options) : NativeImportInfo :=
@@ -136,11 +158,41 @@ private def nativeImportInfo (env : Environment) (opts : Options) : NativeImport
       mkModuleInitializationFunctionName mod.module (env.getModulePackageByIdx? idx)
     imports := env.header.moduleData.map fun d =>
       d.imports.map fun i =>
-        2 * ((env.getModuleIdx? i.module).map (·.toNat)).getD mods.size + if isModule && i.isMeta then 1 else 0 }
+        2 * ((env.getModuleIdx? i.module).map (·.toNat)).getD mods.size + if isModule && i.isMeta then 1 else 0
+    nativeDiffers := mods.mapIdx fun idx mod =>
+      !mod.hasData || !(externAttr.ext.getModuleEntries env idx).isEmpty ||
+        !(builtinInitAttr.ext.getModuleEntries env idx).isEmpty
+    packages := mods.mapIdx fun idx _ => (env.getModulePackageByIdx? idx).getD ""
+    mixedInits := mods.mapIdx fun idx _ =>
+      let inits := regularInitAttr.ext.getModuleEntries env idx ++ regularInitAttr.ext.getModuleIREntries env idx
+      inits.any (isMarkedMeta env ·.1) && inits.any (!isMarkedMeta env ·.1)
+    isModule }
+
+/-- The imported modules of `env` and their packages, empty for a module without one: what an import
+without native libraries needs of `NativeImportInfo`, which takes long for many modules. -/
+@[export lean_paperlean_import_packages]
+private def importPackages (env : Environment) : Array Name × Array String :=
+  (env.header.moduleNames, env.header.modules.mapIdx fun idx _ => (env.getModulePackageByIdx? idx).getD "")
+
+/-- The initializer of the imported module `idx` that `runInitAttrForMod` looks up last, whose symbol
+tells whether something loaded the module's native code. -/
+@[export lean_paperlean_module_init_symbol]
+private def moduleInitSymbol (env : Environment) (idx : Nat) : String :=
+  -- (`EnvironmentHeader.moduleNames` maps all imported modules: an array per call)
+  let name := mkModuleInitializationFunctionName env.header.modules[idx]!.module (env.getModulePackageByIdx? idx)
+  if env.header.isModule then "meta_" ++ name else name
 
 /-- Whether `n` is marked `meta` in `env`; then a module's compile-time initializer initializes it. -/
 @[export lean_paperlean_is_meta_const]
 private def isMetaConst (env : Environment) (n : Name) : Bool := isMarkedMeta env n
+
+/-- The module of the imported constant `n` of `env`, `.anonymous` if `n` is not imported. -/
+@[export lean_paperlean_const_module_name]
+private def constModuleName (env : Environment) (n : Name) : Name :=
+  match env.getModuleIdxFor? n with
+  -- (`EnvironmentHeader.moduleNames` maps all imported modules: an array per call)
+  | some idx => env.header.modules[idx]?.map (·.module) |>.getD .anonymous
+  | none => .anonymous
 
 /-- The module index of the imported constant `n` of `env` plus one, `0` if `n` is not imported. -/
 @[export lean_paperlean_const_module_idx]
@@ -252,6 +304,14 @@ private def privateConstantMapsImpl (moduleData irData : Array ModuleData)
   importTimingMark "constants.private"
   return r
 
+/-- `m`, or with `PAPERLEAN_IMPORT_CHECK_FAULT=maps`, `m` without an entry: a defect of the faster import,
+for the tests to see that `PAPERLEAN_IMPORT=check` reports it. -/
+private def withCheckFault (m : Std.HashMap Name ConstantInfo) :
+    BaseIO (Std.HashMap Name ConstantInfo) := do
+  if (← IO.getEnv "PAPERLEAN_IMPORT_CHECK_FAULT") == some "maps" then
+    if let some n := m.keys.head? then return m.erase n
+  return m
+
 /-- `PAPERLEAN_IMPORT=check`: fails if the maps built faster differ from those of the fold, which
 did not fail. -/
 @[export lean_paperlean_check_private_constant_maps]
@@ -260,7 +320,7 @@ private def checkPrivateConstantMapsImpl
     (privateConstantMap : Std.HashMap Name ConstantInfo) (const2ModIdx : Std.HashMap Name ModuleIdx) :
     IO Unit := do
   if fast.2.2.isSome then throw <| IO.userError "PAPERLEAN_IMPORT=check: only the fast import fails"
-  checkSameAsLegacy "the private constant map" privateConstantMap fast.1
+  checkSameAsLegacy "the private constant map" privateConstantMap (← withCheckFault fast.1)
   checkSameAsLegacy "`const2ModIdx`" const2ModIdx fast.2.1
 
 /-- The public constant map of `finalizeImport` built faster; `none` if `finalizeImport` builds it by
@@ -276,15 +336,17 @@ private def publicConstantMapImpl (modules : Array ImportedModule) (capacity : N
 
 /-- `PAPERLEAN_IMPORT=check`: fails if the public constant map built faster differs from the fold's. -/
 @[export lean_paperlean_check_public_constant_map]
-private def checkPublicConstantMapImpl (fast fold : Std.HashMap Name ConstantInfo) : IO Unit :=
-  checkSameAsLegacy "the public constant map" fold fast
+private def checkPublicConstantMapImpl (fast fold : Std.HashMap Name ConstantInfo) : IO Unit := do
+  checkSameAsLegacy "the public constant map" fold (← withCheckFault fast)
 
 /-!
 `fastImportModules` computes the result of `importModulesCore` reading the modules of olean packs
 (`LEAN_OLEAN_PACK`) from the packs' module tables instead of their `.olean` files: the imports of a
 packed module come from the table, which also identifies the module, and its files are served from
-the pack without searching for them. Other modules are read as in `importModulesCore`. When the
-tables do not suffice it throws, and `importModules` uses `importModulesCore` instead.
+the pack without searching for them, and before checking that they did not change since packing:
+other threads check them meanwhile, and the traversal ends by waiting for the checks
+(`packJoin`). Other modules are read as in `importModulesCore`. When the tables do not suffice, or a
+packed file changed, it throws, and `importModules` uses `importModulesCore` instead.
 -/
 
 /-- The packed module named `name` whose imports are in its pack's table, if any (`noPackModule`). -/
@@ -294,11 +356,20 @@ private opaque packModuleFind (name : @& Name) : UInt32
 @[extern "lean_paperlean_packs_loaded"]
 private opaque packsLoaded : BaseIO Bool
 /--
-Starts checking, on other threads, whether the files of the packed modules reachable from `m` in its
-pack's table changed since packing, so that serving them later need not wait for the check.
+With `wait`, whether no file of the packed modules that `packModuleParts` served to this thread
+before checking them changed since packing, checking them (other threads check them meanwhile);
+forgets them.
 -/
-@[extern "lean_paperlean_pack_prevalidate"]
-private opaque packPrevalidate (m : UInt32) : BaseIO Unit
+@[extern "lean_paperlean_pack_join"]
+private opaque packJoin (wait : Bool) : BaseIO Bool
+/-- Starts an import: what is known about the files of the olean packs is forgotten, as Lean reads
+them again. -/
+@[extern "lean_paperlean_pack_next_import"]
+private opaque packNextImport : BaseIO Unit
+/-- Starts a fast import on this thread, which `packJoin` ends: the files it reads are counted
+(`OLeanPack.stats`) if it succeeds. -/
+@[extern "lean_paperlean_pack_begin_import"]
+private opaque packBeginImport : BaseIO Unit
 @[extern "lean_paperlean_pack_module_num_edges"]
 private opaque packModuleNumEdges (m : UInt32) : UInt32
 /-- The module imported by the `j`-th import of `m` if it is in the same pack (`noPackModule`). -/
@@ -318,14 +389,17 @@ private opaque packModulePaths (m : UInt32) : Array String × Array String
 private opaque packModulePackage (m : UInt32) : String × String
 @[extern "lean_paperlean_pack_module_is_module"]
 private opaque packModuleIsModule (m : UInt32) : Bool
-/-- The first `count` parts of the `.olean` (or IR) chain of `m`, if they can be served. -/
+/-- The first `count` parts of the `.olean` (or IR) chain of `m`, if they can be served; if they are
+not checked yet, `packJoin` checks them. -/
 @[extern "lean_paperlean_pack_module_parts"]
 private opaque packModuleParts (m : UInt32) (ir : Bool) (count : UInt32) :
     BaseIO (Option (Array (ModuleData × CompactedRegion)))
 
 private def noPackModule : UInt32 := 0xffffffff
 
-deriving instance Inhabited for ImportedModule
+-- (local: an instance of a module of `Lean` would be one of every environment that imports it)
+local instance : Inhabited ImportedModule :=
+  ⟨{ toEffectiveImport := default, parts := #[], irParts := #[], needsIRTrans := false }⟩
 
 private structure FastImportState where
   records : Array ImportedModule := #[]
@@ -372,11 +446,11 @@ private partial def fastImportModules (imports : Array Import) (globalLevel : OL
       if let some mod := (← lookup (← target i) i).bind (·.mainModule?) then
         if !mod.isModule then
           throw <| IO.userError s!"cannot import non-`module` {i.module} from `module`"
+  unless ← packJoin true do fastImportFail "a packed file changed since packing"
 where
   target (i : Import) : FastImportM (Option UInt32) := do
     let m := packModuleFind i.module
     if m == noPackModule then return none
-    packPrevalidate m
     return some m
   lookup (m? : Option UInt32) (i : Import) : FastImportM (Option ImportedModule) := do
     let s ← get
@@ -573,6 +647,7 @@ private def importModulesImpl (imports : Array Import) (levelIdx : UInt8) (arts 
     (core : Unit → IO ImportState) : IO ImportState := do
   let level : OLeanLevel := match levelIdx with | 0 => .exported | 1 => .server | _ => .private
   importTimingMark "start"
+  packNextImport
   let mode ← importMode
   let isExported := level < .private
   -- The modules and the regions the traversal read from files.
@@ -580,12 +655,14 @@ private def importModulesImpl (imports : Array Import) (levelIdx : UInt8) (arts 
       IO (Option ((Array Name × Array ImportedModule) × List CompactedRegion)) := do
     unless ← packsLoaded do return none
     let some artsOf := packedArtifacts arts level | return none
+    packBeginImport
     let ref ← IO.mkRef ({} : FastImportState)
     match ← (fastImportModules imports level arts isExported artsOf reuse ref).toBaseIO with
     | .ok _ =>
       if ← importTimingEnabled then importTimingMark s!"modules.fast packed={(← ref.get).byPack.size}"
       return some ((← ref.get).result, (← ref.get).read)
     | .error e =>
+      discard <| packJoin false
       if ← importTimingEnabled then importTimingMark s!"modules.fallback ({e})"
       -- Release what was read from files before `importModulesCore` reads them again.
       for region in (← ref.get).read do

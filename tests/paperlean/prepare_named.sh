@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests `paperlean prepare` and `paperlean clean` of named packages (`Lake.PaperLean.Prepare`): a name
 # is a package's or a library's (exact, else in any case); preparing a package adds it and the
 # packages it depends on that are not prepared yet, builds the native libraries of the named packages
@@ -6,8 +9,6 @@
 # cleaning a package deletes its data and that of the prepared packages that depend on it.
 # Workspace: root requires b (which requires a) and c (library Cee).
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK LEAN_IMPORT_IMAGE PAPERLEAN_NATIVE_LIBS
-unset ELAN_TOOLCHAIN
 WS="$(cd "$TMP_DIR" && pwd -P)/ws"
 mkdir -p "$TMP_DIR/a" "$TMP_DIR/b" "$TMP_DIR/c" "$WS/Root"
 lib() {  # <package dir> <name> <library> [required package]
@@ -50,7 +51,9 @@ status_of() {
 lib_of() { grep -o "\"native-[0-9]*/$1\.[a-z]*\"" .lake/paperlean/env.json | grep -v paperlean || true; }
 native_used() {
   capture env PAPERLEAN_IMPORT_TIMING=1 PAPERLEAN_ACCELERATE=1 lake lean Root/Main.lean
-  check_out_contains "17"
+  # (the program's output, without the timing lines, which may contain the same digits)
+  [ "$(grep -v '^paperlean-' "$CAPTURED.out.produced")" = 17 ] ||
+    fail "the program printed $(grep -v '^paperlean-' "$CAPTURED.out.produced")"
   if [ "$1" = 0 ]; then
     ! grep -q "paperlean-timing native libs=[1-9]" "$CAPTURED.out.produced" || fail "native libraries were used"
   else
@@ -122,6 +125,35 @@ ls -d .lake/paperlean/deps-* .lake/paperlean/native-* 2> /dev/null && fail "clea
 native_used 0
 capture lake paperlean clean c
 check_out_contains "c: not prepared; nothing was deleted"
+
+# A failure after `env.json` was written (here: a stale directory that cannot be deleted) keeps the
+# data that `env.json` refers to, in `prepare` and in `clean`.
+refs_exist() {
+  for f in $(grep -o '"\(deps\|native\|root\)-[0-9]*/[^"]*"' .lake/paperlean/env.json | tr -d '"'); do
+    [ -e ".lake/paperlean/$f" ] || fail "$1 deleted $f, which env.json refers to"
+  done
+}
+# (not as root, for whom `chmod 555` does not keep a directory from being deleted)
+if [ "$(id -u)" != 0 ]; then
+  run lake paperlean prepare b
+  mkdir -p .lake/paperlean/deps-1/locked
+  touch .lake/paperlean/deps-1/locked/f
+  chmod 555 .lake/paperlean/deps-1/locked
+  trap 'chmod 755 "$WS/.lake/paperlean/deps-1/locked"; rm -rf "$TMP_DIR"' EXIT
+  capture_exit 1 lake paperlean prepare cee
+  refs_exist "a prepare that failed late"
+  status_of prepared prepared prepared
+  native_used 3
+  capture_exit 1 lake paperlean clean c
+  refs_exist "a clean that failed late"
+  status_of prepared prepared "not prepared"
+  native_used 2
+  chmod 755 .lake/paperlean/deps-1/locked
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  capture lake paperlean clean b
+  check_out_contains "Deleted the prepared data of b"
+  [ ! -e .lake/paperlean/deps-1 ] || fail "clean b kept a stale directory"
+fi
 
 # A name that matches nothing changes nothing; one that matches several packages lists them.
 capture_exit 1 lake paperlean prepare d

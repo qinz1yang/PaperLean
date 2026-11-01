@@ -1,13 +1,21 @@
+/-
+Copyright (c) 2026 PaperLean contributors.
+Released under Apache 2.0 license as described in the file LICENSE.
+-/
 import Lean.Setup
 import Lean.Util.Path
 
 /-!
-Tests the JSON encoding of `ModuleSetup.importArts`: artifacts at their default location below a
-package root are stored as a root index and part counts, all other entries keep their full paths,
-and the older encoding with full paths for every entry is still accepted.
+Tests the compact JSON encoding of `ModuleSetup.importArts`: artifacts at their default location
+below a package root are stored as a root index and part counts, all other entries keep their full
+paths, and official Lean's encoding with full paths for every entry is accepted too.
 -/
 
 open Lean
+
+-- (the encoding's functions have no instances outside this test)
+local instance : ToJson (NameMap ImportArtifacts) := ⟨PaperLean.artifactsToJson⟩
+local instance : FromJson (NameMap ImportArtifacts) := ⟨PaperLean.artifactsFromJson?⟩
 
 def mkArts (root : System.FilePath) (mod : Name) (oleanExts irExts : Array String) : ImportArtifacts :=
   .ofArrays #[oleanExts.map (modToFilePath root mod ·), irExts.map (modToFilePath root mod ·)]
@@ -80,9 +88,17 @@ def fullPathsSize (m : NameMap ImportArtifacts) : Nat :=
 #guard roundTrips big
 #guard (toJson big).compress.length * 8 < fullPathsSize big
 
--- `ModuleSetup` uses the same encoding.
+-- `PaperLean.setupToJsonCompact` uses the same encoding; `toJson` of a `ModuleSetup` gives official
+-- Lean's, with full paths; `PaperLean.setupFromJsonCompact?`, which `ModuleSetup.load` uses, reads both.
+def readsBack (j : Json) : Bool :=
+  match PaperLean.setupFromJsonCompact? j with
+  | .ok setup' => entries setup'.importArts == entries sample
+  | .error _ => false
+
+def hasRoots (j : Json) : Bool :=
+  ((j.getObjValD "importArts").getObjVal? "").toOption.isSome
+
 #guard
   let setup : ModuleSetup := { name := `Test, importArts := sample }
-  match fromJson? (toJson setup) with
-  | .ok (setup' : ModuleSetup) => entries setup'.importArts == entries sample
-  | .error _ => false
+  readsBack (toJson setup) && !hasRoots (toJson setup) &&
+    readsBack (PaperLean.setupToJsonCompact setup) && hasRoots (PaperLean.setupToJsonCompact setup)

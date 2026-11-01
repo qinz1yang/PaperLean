@@ -1,8 +1,10 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests the faster implementations of `importModules` steps (`PAPERLEAN_IMPORT`): imports give
 # the same results and errors with and without them, and `PAPERLEAN_IMPORT=check`, which builds the
 # imported state both ways and compares the objects, finds no difference.
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK
 SRC="$TMP_DIR/src"
 LIB="$TMP_DIR/lib"
 mkdir -p "$SRC" "$LIB"
@@ -62,6 +64,11 @@ import Lean
 EOF
 capture env PAPERLEAN_IMPORT=check lean UseLean.lean
 check_out_contains "Lean.Environment : Type"
+# Check mode finds a defect of the faster import: the comparison runs and reports it.
+capture_fail env PAPERLEAN_IMPORT=check PAPERLEAN_IMPORT_CHECK_FAULT=maps lean UseLean.lean
+check_out_contains "PAPERLEAN_IMPORT=check: the private constant map differs from the legacy import"
+capture env PAPERLEAN_IMPORT_CHECK_FAULT=maps lean UseLean.lean
+check_out_contains "Lean.Environment : Type"
 
 # The mode is really selected: only the fast constant maps report their step.
 capture env PAPERLEAN_IMPORT=legacy PAPERLEAN_IMPORT_TIMING=1 lean UseLean.lean
@@ -104,9 +111,11 @@ for mode in "" legacy check; do
   check_out_contains "import A failed, environment already contains 't' from C"
 done
 
-# Several packs over the same root: a file is served by the first pack with a root that is a prefix
-# of its path, or read from disk if that pack lacks it, even when a later pack has it. `a.paperlean`
-# has only `A`; `B` must be read from disk, not from `ab.paperlean`.
+# Several packs over the same root: a file is served by the first pack that has it below the first
+# of its roots that is a prefix of its path; a later pack adds the files that earlier ones lack (as a
+# pack of changed modules, given first, does). The number of packed modules says where `B` comes
+# from: `a.paperlean` has only `A`, so `B` is read from disk with it alone and comes from
+# `late-ab.paperlean` after it.
 LATE="$TMP_DIR/late"
 mkdir -p "$LATE"
 cp "$LIB/A.olean" "$LATE/"
@@ -115,10 +124,25 @@ check_out_contains "packed: 1"
 cp "$LIB/B.olean" "$LATE/"
 capture lean --run "$TMP_DIR/pack.lean" "$TMP_DIR/late-ab.paperlean" "$LATE" $((0x210000000000))
 check_out_contains "packed: 2"
-for mode in "" check; do
-  capture env LEAN_PATH="$LATE" LEAN_OLEAN_PACK="$TMP_DIR/a.paperlean:$TMP_DIR/late-ab.paperlean" PAPERLEAN_IMPORT="$mode" lean UseAB.lean
-  $DIFF -- "$TMP_DIR/ab..out" "$CAPTURED.out.produced" || fail "output of ab differs with two packs ($mode)"
-done
+late_packs() {
+  local packs="$1" expect="$2"
+  for mode in "" check; do
+    capture env LEAN_PATH="$LATE" LEAN_OLEAN_PACK="$packs" PAPERLEAN_IMPORT="$mode" PAPERLEAN_IMPORT_TIMING=1 lean UseAB.lean
+    check_out_contains "paperlean-timing $expect"
+    grep -v "^paperlean-" "$CAPTURED.out.produced" | $DIFF -- "$TMP_DIR/ab..out" - ||
+      fail "output of ab differs with the packs $packs ($mode)"
+  done
+}
+late_packs "$TMP_DIR/a.paperlean" "modules.fast packed=1 "
+late_packs "$TMP_DIR/a.paperlean:$TMP_DIR/late-ab.paperlean" "modules.fast packed=2 "
+# The first pack that has a file decides also when the file changed since it packed it: the file is
+# then read from disk, not from a later pack with its current version (and the import falls back to
+# reading every module as Lean does).
+cp "$LIB/A.olean" "$LATE/A.olean.new"; mv "$LATE/A.olean.new" "$LATE/A.olean"
+capture lean --run "$TMP_DIR/pack.lean" "$TMP_DIR/late-ab.paperlean" "$LATE" $((0x210000000000))
+check_out_contains "packed: 2"
+late_packs "$TMP_DIR/late-ab.paperlean" "modules.fast packed=2 "
+late_packs "$TMP_DIR/a.paperlean:$TMP_DIR/late-ab.paperlean" "modules.fallback (fast import not applicable: "
 
 # A package found in two pack roots: the search path decides which root the import reads, for each
 # module of the package. `P.X` lies in the first root, `P.Y` only in the second, which the search

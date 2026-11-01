@@ -382,9 +382,17 @@ struct native_symbol_cache_entry {
     bool m_boxed;
 };
 
+// PaperLean: a native symbol cache entry, and whether `<sym>___boxed` was looked up for it, which is
+// done only for a declaration whose IR has a boxed version: native code has a boxed version only of
+// those (`ExplicitBoxing.requiresBoxedVersion`).
+struct native_symbol_lookup {
+    native_symbol_cache_entry m_entry;
+    bool m_boxed_probed;
+};
+
 // Caches native symbol lookup successes _and_ failures; we assume no native code is loaded or
 // unloaded after the interpreter is first invoked, so this can be a global cache.
-name_hash_map<native_symbol_cache_entry> * g_native_symbol_cache;
+name_hash_map<native_symbol_lookup> * g_native_symbol_cache;
 std::shared_mutex * g_native_symbol_cache_mutex;
 
 class interpreter {
@@ -870,56 +878,70 @@ private:
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
+        // PaperLean: the lookup counts no heartbeats, as its steps allocate otherwise than Lean's
+        // (e.g. the probe of the boxed version)
+        uncounted_heartbeats uncounted;
         shared_symbol sh;
         if (find_shared_symbol(m_env.raw(), fn.raw(), sh)) {
             symbol_cache_entry e_new { decl(sh.decl, true), { sh.addr, sh.boxed } };
             m_symbol_cache.insert({ fn, e_new });
             return e_new;
         }
-        std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
-        auto ne = g_native_symbol_cache->find(fn);
-        if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), filter(fn, ne->second) };
+        decl d = get_decl(fn);
+        auto found = [&](native_symbol_cache_entry n) {
+            symbol_cache_entry e_new { d, filter(fn, n) };
             m_symbol_cache.insert({ fn, e_new });
-            lock.unlock();
             share(fn, e_new);
             return e_new;
+        };
+        bool native = m_prefer_native || decl_tag(d) == decl_kind::Extern || has_init_attribute(m_env, fn);
+        // (only computed if needed)
+        int boxed = -1;
+        auto has_boxed = [&]() {
+            if (boxed < 0) boxed = native && find_ir_decl_boxed(m_env, fn);
+            return boxed == 1;
+        };
+        {
+            std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
+            auto ne = g_native_symbol_cache->find(fn);
+            if (ne != g_native_symbol_cache->end()) {
+                native_symbol_lookup l = ne->second;
+                lock.unlock();
+                if (l.m_boxed_probed || !has_boxed()) return found(l.m_entry);
+            }
         }
-        lock.unlock();
+        // PaperLean: no lookup if the filter would drop whatever it finds (`paperlean/native_libs.h`)
+        if (native && skip_native_lookup(m_env.raw(), fn.raw()) && !get_export_name_for(m_env, fn))
+            return found({ nullptr, false });
         std::unique_lock<std::shared_mutex> unique_lock(*g_native_symbol_cache_mutex);
-        ne = g_native_symbol_cache->find(fn);
-        if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), filter(fn, ne->second) };
-            m_symbol_cache.insert({ fn, e_new });
-            unique_lock.unlock();
-            share(fn, e_new);
-            return e_new;
-        }
-        symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
-        if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
+        auto ne = g_native_symbol_cache->find(fn);
+        bool cached = ne != g_native_symbol_cache->end();
+        native_symbol_lookup l = cached ? ne->second : native_symbol_lookup { { nullptr, false }, !native };
+        if (native && (!cached || (has_boxed() && !l.m_boxed_probed))) {
             string_ref mangled = get_symbol_stem(m_env, fn);
-            string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
             // check for boxed version first
-            if (void *p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data())) {
-                e_new.m_native.m_addr = p_boxed;
-                e_new.m_native.m_boxed = true;
-            } else {
+            if (has_boxed()) {
+                string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
+                if (void *p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data()))
+                    l.m_entry = { p_boxed, true };
+                l.m_boxed_probed = true;
+            }
+            if (!cached && !l.m_entry.m_addr) {
                 // `@[export]` affects only the unboxed symbol name
                 if (optional<name> n = get_export_name_for(m_env, fn)) {
                     mangled = n->get_string();
                 }
                 if (void *p = lookup_symbol_in_cur_exe(mangled.data())) {
                     // if there is no boxed version, there are no unboxed parameters, so use default version
-                    e_new.m_native.m_addr = p;
+                    l.m_entry = { p, false };
                 }
             }
+            (*g_native_symbol_cache)[fn] = l;
+        } else if (!cached) {
+            g_native_symbol_cache->insert({ fn, l });
         }
-        g_native_symbol_cache->insert({ fn, e_new.m_native });
-        e_new.m_native = filter(fn, e_new.m_native);
-        m_symbol_cache.insert({ fn, e_new });
         unique_lock.unlock();
-        share(fn, e_new);
-        return e_new;
+        return found(l.m_entry);
     }
 
     /** \brief Retrieve Lean declaration from elab_environment. */
@@ -1274,7 +1296,9 @@ extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, obj
 
 /* runModInitCore (sym : @& String) : IO Bool */
 extern "C" LEAN_EXPORT obj_res lean_run_mod_init_core(b_obj_arg  sym) {
-    if (void * init = filter_native_initializer(string_cstr(sym), lookup_symbol_in_cur_exe(string_cstr(sym)))) {
+    void * found = found_native_initializer(string_cstr(sym));
+    if (!found) found = lookup_symbol_in_cur_exe(string_cstr(sym));
+    if (void * init = filter_native_initializer(string_cstr(sym), found)) {
         auto init_fn = reinterpret_cast<object *(*)(uint8_t)>(init);
         uint8_t builtin = 0;
         object * r = init_fn(builtin);
@@ -1306,7 +1330,7 @@ void initialize_ir_interpreter() {
         ir::g_interpreter_step = new name({"interpreter", "step"});
         register_trace_class(*ir::g_interpreter_step);
     });
-    ir::g_native_symbol_cache = new name_hash_map<ir::native_symbol_cache_entry>();
+    ir::g_native_symbol_cache = new name_hash_map<ir::native_symbol_lookup>();
     ir::g_native_symbol_cache_mutex = new std::shared_mutex();
 }
 

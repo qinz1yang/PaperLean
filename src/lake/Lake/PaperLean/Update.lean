@@ -47,7 +47,7 @@ def showLean (v : ToolchainVer) : String :=
   | v => v.toString
 
 /-- The PaperLean version of a PaperLean release name, e.g. `0.1.0` for `o/r:v0.1.0-lean4.35.0-rc3`. -/
-def paperleanVersionOf? (tc : String) : Option StdVer := do
+public def paperleanVersionOf? (tc : String) : Option StdVer := do
   let [_, tag] := tc.splitOn ":" | none
   let [v, _] := tag.splitOn "-lean" | none
   (StdVer.parse (if v.startsWith "v" then (v.drop 1).toString else v)).toOption
@@ -93,7 +93,8 @@ def predictGit (name : Name) (dir : FilePath) (url : String) (rev? : Option Stri
     (subDir? : Option FilePath) : IO (Except String DepPrediction) := do
   -- the revision Lake fetches (`materializeGitRepo`, `Lake/Load/Materialize.lean`)
   let rev := rev?.getD Git.upstreamBranch
-  let some _ ← git dir #["fetch", "--tags", "--force", "--filter=tree:0", url, rev]
+  -- (no `--filter`: it could make the clone a partial one; `lake update` fetches the revision anyway)
+  let some _ ← git dir #["fetch", "--tags", "--force", url, rev]
     | return .error s!"cannot fetch {rev} of {url} for {name}"
   let some commit ← git dir #["rev-parse", "--verify", "--end-of-options", "FETCH_HEAD^{commit}"]
     | return .error s!"cannot resolve {rev} of {name}"
@@ -201,8 +202,9 @@ public def fromReservoir (ws : Workspace) : Bool :=
   ws.packages.any (·.reservoirScope?.isSome)
 
 /-- The origin of this PaperLean toolchain if it is a release, e.g. `qinz1yang/PaperLean`: from its
-name in `ELAN_TOOLCHAIN` (as elan and the front end set it), or from the directory elan installed it
-in, e.g. `~/.elan/toolchains/qinz1yang--PaperLean---v0.1.0-lean4.35.0-rc3`. -/
+name in `ELAN_TOOLCHAIN` if that names it (as elan sets it for a project whose toolchain is this one;
+the front end sets the project's own toolchain), or from the directory elan installed it in, e.g.
+`~/.elan/toolchains/qinz1yang--PaperLean---v0.1.0-lean4.35.0-rc3`. -/
 def ownOrigin? (ws : Workspace) : BaseIO (Option String) := do
   if let some tc ← IO.getEnv "ELAN_TOOLCHAIN" then
     if (paperleanVersionOf? tc).isSome then
@@ -271,10 +273,12 @@ public def update (ws : Workspace) (names : Array Name) : LoggerIO UInt32 := do
   if changesTc then
     IO.println s!"The toolchain changes to {newTc}."
     IO.FS.writeFile tcFile (newTc ++ "\n")
-  -- With another toolchain, elan runs its `lake` (it reads `lean-toolchain`).
+  -- With another toolchain, elan runs its `lake` (it reads `lean-toolchain`, unless the variables of
+  -- this toolchain, e.g. the front end's `ELAN_TOOLCHAIN`, say otherwise).
   let lakeCmd := if changesTc then "lake" else ws.lakeEnv.lake.lake.toString
   let args := #["update"] ++ names.map (·.toString)
-  let child ← IO.Process.spawn { cmd := lakeCmd, args, cwd := ws.dir }
+  let env := if changesTc then ws.lakeEnv.noToolchainVars else #[]
+  let child ← IO.Process.spawn { cmd := lakeCmd, args, cwd := ws.dir, env }
   if (← child.wait) != 0 then
     IO.eprintln "paperlean: `lake update` failed; the previous state is restored."
     restore
@@ -304,7 +308,9 @@ public def update (ws : Workspace) (names : Array Name) : LoggerIO UInt32 := do
       {if cache then "cache get" else "prepare"}`."
   IO.println s!"Updated; {if cache then "downloading and preparing" else "preparing"} the dependencies again..."
   let paperlean := if changesVer then "paperlean" else (ws.lakeEnv.lean.sysroot / "bin" / "paperlean").toString
-  let child ← IO.Process.spawn { cmd := paperlean, args := if cache then #["cache", "get"] else #["prepare"], cwd := ws.dir }
+  let env := if changesVer then ws.lakeEnv.noToolchainVars else #[]
+  let child ← IO.Process.spawn {
+    cmd := paperlean, args := if cache then #["cache", "get"] else #["prepare"], cwd := ws.dir, env }
   return (← child.wait)
 
 end Lake.PaperLean

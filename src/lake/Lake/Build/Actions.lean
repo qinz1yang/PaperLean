@@ -17,6 +17,7 @@ import Init.System.Platform
 import Lean.CoreM
 import Lean.Compiler.Options
 import Lake.PaperLean.BuildEnv
+import Lake.PaperLean.Env
 
 /-! # Common Build Actions
 Low level actions to build common Lean artifacts via the Lean toolchain.
@@ -27,7 +28,8 @@ open Lean hiding SearchPath
 
 namespace Lake
 
-public def compileLeanModule
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def compileLeanModule
   (leanFile relLeanFile : FilePath)
   (setup : ModuleSetup) (setupFile : FilePath)
   (arts : ModuleArtifacts)
@@ -53,7 +55,15 @@ public def compileLeanModule
     createParentDirs bcFile
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
-  IO.FS.writeFile setupFile (toJson setup).compress
+  -- PaperLean: under `paperlean build`, compact in a side file, which saves writing and reading it,
+  -- unless that file cannot be written
+  let side := setupFile.withExtension "paperlean"
+  let compact ← if ← PaperLean.accelerated then
+      PaperLean.writeSideFile side (PaperLean.setupToJsonCompact setup).compress
+    else pure false
+  let setupPath := if compact then side else setupFile
+  unless compact do
+    IO.FS.writeFile setupFile (toJson setup).pretty
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
@@ -67,7 +77,9 @@ public def compileLeanModule
   -- PaperLean: with the olean packs written so far during the build (`Lake.PaperLean.BuildData`),
   -- which the logged command leaves out, so that the log that the trace records is Lake's
   logVerbose (mkCmdLog spawnArgs)
-  let out ← rawProc (quiet := true) { spawnArgs with env := spawnArgs.env ++ (← PaperLean.BuildEnv.leanEnv) }
+  let out ← rawProc (quiet := true) { spawnArgs with
+    args := args.set! (args.size - 2) setupPath.toString
+    env := spawnArgs.env ++ (← PaperLean.BuildEnv.leanEnv) }
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
@@ -103,7 +115,7 @@ public def compileLeanModule
       try
         proc {
           cmd := leanir.toString
-          args := #[setupFile.toString, irFile.toString, cFile.toString]
+          args := #[setupPath.toString, irFile.toString, cFile.toString]
           env := #[
             ("LEAN_PATH", leanPath.toString)
           ]

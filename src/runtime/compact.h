@@ -63,6 +63,7 @@ class LEAN_EXPORT object_compactor {
     size_t capacity() const { return static_cast<char*>(m_capacity) - static_cast<char*>(m_begin); }
     object_offset save(object * o, object * new_o);
     object_offset save_max_sharing(object * o, object * new_o, size_t new_o_sz);
+    object_offset save_max_sharing_mpz(object * o, object * new_o, bool neg, void const * digits, size_t digits_sz);
     object_offset to_offset(object * o);
     // Compacts a not-yet-seen heap object (and, recursively, its children),
     // returning its offset. Dispatches on the object's tag.

@@ -59,6 +59,23 @@ def ScopedEntries.insert (scopedEntries : ScopedEntries β) (ns : Name) (b : β)
   | some bs => { map := scopedEntries.map.insert ns <| bs.push b }
 
 def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) := do
+  let mut s ← descr.mkInitial
+  let mut scopedEntries : ScopedEntries β := {}
+  for a in as do
+    for e in a do
+      match e with
+      | Entry.global a =>
+        let b ← descr.ofOLeanEntry s a
+        s := descr.addEntry s b
+      | Entry.scoped ns a =>
+        let b ← descr.ofOLeanEntry s a
+        scopedEntries := scopedEntries.insert ns b
+  s := descr.finalizeImport s
+  return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
+
+/-- PaperLean: `addImportedFn`, with the state of the global entries built faster, which is the
+function that extensions run on import. -/
+@[noinline] def _root_.Lean.PaperLean.addImportedFnFast (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) := do
   let mut s ← descr.mkInitial; let fast? ← PaperLean.importedState? descr.name s as -- PaperLean: faster
   let mut scopedEntries : ScopedEntries β := {}; let fold := fast?.isNone || (← PaperLean.importMode) == 2
   for a in as do
@@ -122,11 +139,12 @@ structure ScopedEnvExtension (α : Type) (β : Type) (σ : Type) where
 
 builtin_initialize scopedEnvExtensionsRef : IO.Ref (Array (ScopedEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState)) ← IO.mkRef #[]
 
-unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ) := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ) := do
   let ext ← registerPersistentEnvExtension {
     name            := descr.name
     mkInitial       := mkInitial descr
-    addImportedFn   := addImportedFn descr
+    addImportedFn   := PaperLean.addImportedFnFast descr
     addEntryFn      := addEntryFn descr
     exportEntriesFnEx := exportEntriesFn descr
     statsFn         := fun s => format "number of local entries: " ++ format s.newEntries.length
@@ -202,34 +220,43 @@ def ScopedEnvExtension.add [Monad m] [MonadResolveName m] [MonadEnv m] (ext : Sc
   let ns ← getCurrNamespace
   modifyEnv (ext.addCore · b kind ns)
 
-private def getStateCore [Inhabited σ] (ext : ScopedEnvExtension α β σ)
-    (env : Environment) (asyncMode : EnvExtension.AsyncMode) : σ :=
+/-- PaperLean: `ScopedEnvExtension.getState` while this thread records environment accesses (below). -/
+@[extern "lean_paperlean_scoped_state_recorded"]
+private opaque recordStateOwned {α β σ : Type} [Inhabited σ] (ext : ScopedEnvExtension α β σ)
+    (env : Environment) (asyncMode : EnvExtension.AsyncMode) : σ
+
+-- (its parameters are borrowed, so that the inferred calling convention stays upstream's)
+@[noinline] private def recordState {α β σ : Type} (inst : @& Inhabited σ)
+    (ext : @& ScopedEnvExtension α β σ) (env : @& Environment)
+    (asyncMode : @& EnvExtension.AsyncMode) : σ :=
+  @recordStateOwned α β σ inst ext env asyncMode
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def ScopedEnvExtension.getState [Inhabited σ] (ext : ScopedEnvExtension α β σ)
+    (env : Environment) (asyncMode := ext.ext.toEnvExtension.asyncMode) : σ :=
+  -- PaperLean: recorded as the top scope's state (`Lean.PaperLean.EnvDeps`), which entering and
+  -- leaving a scope keep, while they rebuild the stack around it
+  (PaperLean.recordingPath ext).select (recordState inferInstance ext env asyncMode) <|
   match ext.ext.getState (asyncMode := asyncMode) env |>.stateStack with
   | top :: _ => top.state
   | _        => unreachable!
 
-private unsafe def recordStateUnsafe {α β σ : Type} (inst : @& Inhabited σ)
-    (ext : @& ScopedEnvExtension α β σ) (env : @& Environment) (asyncMode : @& EnvExtension.AsyncMode) :
-    σ :=
+private unsafe def recordStateCore {α β σ : Type} (inst : Inhabited σ)
+    (ext : ScopedEnvExtension α β σ) (env : Environment) (asyncMode : EnvExtension.AsyncMode)
+    (_ : Unit) : σ :=
   have : Inhabited σ := inst
-  let s := PaperLean.envWithoutRecording fun _ => getStateCore ext env asyncMode
+  let s := PaperLean.envWithoutRecording fun _ => ext.getState env asyncMode
   PaperLean.envRecord (.ext ext.ext.toEnvExtension.idx 100 .anonymous) (unsafeCast
     fun (env' : Environment) (_ : Name) (_ : NonScalar) =>
-      ptrEq (getStateCore ext env' asyncMode) s) s
+      ptrEq (PaperLean.envWithoutRecording fun _ => ext.getState env' asyncMode) s) s
 
--- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's)
-@[implemented_by recordStateUnsafe, noinline]
-private def recordState {α β σ : Type} (inst : @& Inhabited σ) (ext : @& ScopedEnvExtension α β σ)
-    (env : @& Environment) (asyncMode : @& EnvExtension.AsyncMode) : σ :=
-  have : Inhabited σ := inst
-  getStateCore ext env asyncMode
-
-def ScopedEnvExtension.getState [Inhabited σ] (ext : ScopedEnvExtension α β σ)
-    (env : Environment) (asyncMode := ext.ext.toEnvExtension.asyncMode) : σ :=
-  -- PaperLean: recorded as the top scope's state (`Lean.PaperLean.EnvDeps`), which entering and
-  -- leaving a scope keep, while they rebuild the stack around it
-  if PaperLean.envRecording ext then recordState inferInstance ext env asyncMode
-  else getStateCore ext env asyncMode
+-- (the read and its record count no heartbeats; at one type: the `extern` above has no parameters for
+-- the types, an `export` would)
+@[export lean_paperlean_scoped_state_recorded]
+private unsafe def recordStateImpl (inst : Inhabited NonScalar)
+    (ext : ScopedEnvExtension NonScalar NonScalar NonScalar) (env : Environment)
+    (asyncMode : EnvExtension.AsyncMode) : NonScalar :=
+  PaperLean.uncounted5 recordStateCore inst ext env asyncMode ()
 
 def ScopedEnvExtension.activateScoped (ext : ScopedEnvExtension α β σ) (env : Environment) (namespaceName : Name) : Environment :=
   ext.ext.modifyState (asyncMode := .local) env fun s =>

@@ -15,4 +15,5 @@ public import Lean.PaperLean.NativeLibs
 public import Lean.PaperLean.SectionVars
 public import Lean.PaperLean.Speculation
 public import Lean.PaperLean.TCCache
+public import Lean.PaperLean.Whitelist
 public import Lean.PaperLean.System

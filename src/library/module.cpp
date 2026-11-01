@@ -8,27 +8,15 @@ Modified by PaperLean.
 .olean serialization and deserialization.
 */
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <utility>
 #include <string>
 #include <sstream>
 #include <fstream>
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
-#include <climits>
 #include <cstdint>
-#include <memory>
-#include <mutex>
-#include <string_view>
-#include <condition_variable>
-#include <deque>
-#include <thread>
 #include <sys/stat.h>
-#ifdef __linux__
-#include <sched.h>
-#endif
 #include <cerrno>
 #include <cstring>
 #include "runtime/thread.h"
@@ -472,14 +460,16 @@ bool olean_header_info(char const * h, uint8_t & version, size_t & base_addr) {
     base_addr = header.base_addr;
     return true;
 }
-bool olean_header_githash_ok(char const * h) {
-#ifdef LEAN_CHECK_OLEAN_VERSION
+bool olean_header_githash_matches(char const * h) {
     olean_header header;
     memcpy(&header, h, sizeof(header));
     return strncmp(header.githash, LEAN_GITHASH, sizeof(header.githash)) == 0;
-#else
-    (void)h;
+}
+bool olean_githash_checked() {
+#ifdef LEAN_CHECK_OLEAN_VERSION
     return true;
+#else
+    return false;
 #endif
 }
 object * mk_olean_region(b_obj_arg ofname, object * root, char * buffer, size_t base_addr, size_t full_sz, bool is_mmap) {
@@ -501,7 +491,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
         if (find_in_packs(olean_fn, dep_regions, hit)) {
             object * pair = alloc_cnstr(0, 2, 0);
             cnstr_set(pair, 0, hit.root);
-            cnstr_set(pair, 1, mk_compacted_region(ofname, hit.root, hit.begin, hit.orig_base, hit.size, true));
+            cnstr_set(pair, 1, mk_compacted_region(ofname, hit.region_root, hit.begin, hit.orig_base, hit.size, true));
             return io_result_mk_ok(pair);
         }
 #ifdef LEAN_WINDOWS

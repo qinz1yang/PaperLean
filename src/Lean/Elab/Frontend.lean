@@ -269,7 +269,8 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
-def runFrontend
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def runFrontend
     (input : String)
     (opts : Options)
     (fileName : String)
@@ -335,25 +336,16 @@ def runFrontend
       -- imports) calls `importModules`, which in turn requires the flag to be set. Restore it.
       unsafe enableInitializersExecution
     return snap
-  -- PaperLean: elaboration may speculate, checked in the background; the messages are then held
-  -- back until the checks pass (`Lean.PaperLean.Speculation`)
-  let speculate ←
-    if incrSaveFileName?.isNone && incrLoadFileName?.isNone && fileName != "<stdin>" then
-      PaperLean.Speculation.enable
-    else pure false
+  -- PaperLean: reuse is for the first frontend of a process (`Lean.PaperLean.Speculation`)
+  PaperLean.Speculation.noteFrontend fileName
   let processor := Language.Lean.process
   let snap ← processor setup old? ctx
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
 
   -- reporting should be done before any early exit from the function
-  let hasErrors ← PaperLean.Speculation.withChecks speculate fileName <|
-    snaps.runAndReport opts jsonOutput severityOverrides
-  -- PaperLean: (to measure the reuse of section variables and typeclass results of a build)
-  if let some log ← IO.getEnv "PAPERLEAN_REUSE_STATS" then
-    let (r, n, f) ← PaperLean.SectionVars.stats
-    let (tr, tn, tf) ← PaperLean.TCCache.stats
-    IO.FS.withFile log .append (·.putStrLn s!"{fileName}\t{r}\t{n}\t{f}\t{tr}\t{tn}\t{tf}")
+  let hasErrors ← snaps.runAndReport opts jsonOutput severityOverrides
+  PaperLean.SectionVars.writeReuseStats fileName
 
   let some cmdState := Language.Lean.waitForFinalCmdState? snap
     | return none

@@ -10,6 +10,11 @@ public import Lean.Meta.Tactic.Simp.SimpTheorems
 public import Lean.Meta.Instances
 import Lean.PaperLean.GraphDiff
 
+-- (no `SizeOf` instances for PaperLean's types: an instance of a module of `Lean` would be one of
+-- every environment that imports it, which Lean's searches would try)
+set_option genSizeOf false
+set_option genInjectivity false
+
 /-!
 The imported states of simp sets and of the instance extension, replayed by
 `paperlean/import_state.cpp` instead of folded, which `ScopedEnvExtension.addImportedFn` calls
@@ -102,6 +107,9 @@ builtin_initialize enableImportedStateReplay
 -- monomorphic, as exported functions keep erased parameters in their signature
 @[export lean_paperlean_check_imported_state]
 private def checkImportedStateImpl (extName : Name) (fast fold : NonScalar) : IO Unit := do
+  -- (`PAPERLEAN_IMPORT_CHECK_FAULT=state`: a defect, for the tests to see that it is reported)
+  let fast : NonScalar := if (← IO.getEnv "PAPERLEAN_IMPORT_CHECK_FAULT") == some "state" then
+    unsafe unsafeCast #[fast] else fast
   if let some d := unsafe graphDiff fast fold true then
     throw <| IO.userError s!"PAPERLEAN_IMPORT=check: the imported state of {extName} differs from the fold: {d}"
 

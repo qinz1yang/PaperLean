@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests `Lean.Expr.instantiateLevelParams` in native code (`src/paperlean/inst_lparams.cpp`): for the
 # types and values of the constants of `Init`, `Std` and `Lean` that have universe parameters, it
 # gives the same expressions as Lean's traversal (`instantiateLevelParamsArray`), with the parameters
@@ -19,7 +22,8 @@ run_cmd do
     for e in [info.type] ++ info.value?.toList do
       for us in [us, us.take 1] do
         checked := checked + 1
-        unless e.instantiateLevelParams ps us == e.instantiateLevelParamsArray ps.toArray us.toArray do
+        -- (`equal`: `==` does not see binder names and annotations, which the result must keep)
+        unless (e.instantiateLevelParams ps us).equal (e.instantiateLevelParamsArray ps.toArray us.toArray) do
           differ := differ.push c
   unless differ.isEmpty do
     throwError "different results for {differ.size} constants, e.g. {differ.toList.take 5}"

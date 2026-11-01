@@ -8,7 +8,6 @@ module
 prelude
 public import Lean.Data.Json.Parser
 public import Lean.Util.LeanOptions
-import Lean.Util.Path
 
 set_option doc.verso true
 
@@ -108,97 +107,6 @@ def ImportArtifacts.oleanParts (inServer : Bool) (arts : ImportArtifacts) : Arra
 
 def ImportArtifacts.irParts (arts : ImportArtifacts) : Array System.FilePath :=
   arts.toArrays[1]?.getD #[]
-
-/-!
-Lake lists the artifacts of every transitively imported module, so these maps can have tens of
-thousands of entries. An entry whose files are a prefix of the usual parts at their default location
-below a package root ({lit}`modToFilePath root mod ext`) is therefore encoded as
-{lit}`[root, numOLeanParts]` or {lit}`[root, numOLeanParts, numIRParts]`, where {lit}`root` indexes
-the array of roots stored under the key {lit}`""` (which cannot name a module). All other entries
-keep their full paths.
--/
-
-private def oleanPartExts : Array String := #["olean", "olean.server", "olean.private"]
-private def irPartExts : Array String := #["ir.sig", "ir"]
-
-private def hasOnlyStrComponents : Name → Bool
-  | .anonymous => true
-  | .str p _ => hasOnlyStrComponents p
-  | .num .. => false
-
-private def partsAt (root : System.FilePath) (mod : Name) (exts : Array String) (n : Nat) :
-    Array System.FilePath :=
-  let stem := (modToFilePath root mod "").toString
-  (exts.extract 0 n).map fun ext => ⟨stem ++ "." ++ ext⟩
-
-/--
-If the files of {name}`arts` are at their default location for {name}`mod`, returns their root and
-the number of olean parts and, if there is a second array, of IR parts.
--/
-private def ImportArtifacts.defaultLayout? (mod : Name) (arts : ImportArtifacts) :
-    Option (String × Nat × Option Nat) := do
-  guard (!mod.isAnonymous && hasOnlyStrComponents mod && arts.toArrays.size ≤ 2)
-  let olean ← arts.olean?
-  let root ← (List.range mod.getNumParts).foldlM (init := olean) fun p _ => p.parent
-  let oleans := arts.toArrays[0]!
-  let irs? := arts.toArrays[1]?
-  guard (oleans.size ≤ oleanPartExts.size && oleans == partsAt root mod oleanPartExts oleans.size)
-  if let some irs := irs? then
-    guard (irs.size ≤ irPartExts.size && irs == partsAt root mod irPartExts irs.size)
-  return (root.toString, oleans.size, irs?.map (·.size))
-
-/-- Encodes {name}`m` as described above. -/
-def ImportArtifacts.mapToJson (m : NameMap ImportArtifacts) : Json := Id.run do
-  let mut roots : Array String := #[]
-  let mut obj : Std.TreeMap.Raw String Json := ∅
-  for (mod, arts) in m do
-    if let some (root, numOLeans, numIRs?) := arts.defaultLayout? mod then
-      -- consecutive entries mostly share their root
-      let idx := if roots.back? == some root then roots.size - 1 else
-        roots.findIdx? (· == root) |>.getD roots.size
-      if idx == roots.size then
-        roots := roots.push root
-      let counts := #[toJson numOLeans] ++ (numIRs?.map toJson).toArray
-      obj := obj.insert mod.toString (Json.arr (#[toJson idx] ++ counts))
-    else
-      obj := obj.insert mod.toString (toJson arts)
-  if !roots.isEmpty then
-    obj := obj.insert "" (toJson roots)
-  return .obj obj
-
-private def decodeArts (roots : Array System.FilePath) (k : String) (mod : Name) (v : Json) :
-    Except String ImportArtifacts := do
-  let .arr a := v | fromJson? v
-  unless (a.size == 2 || a.size == 3) && a[0]! matches .num _ do
-    return ← fromJson? v
-  let idx : Nat ← fromJson? a[0]!
-  let numOLeans : Nat ← fromJson? a[1]!
-  let numIRs? : Option Nat ← if a.size == 3 then some <$> fromJson? a[2]! else pure none
-  let some root := roots[idx]?
-    | throw s!"invalid root index {idx} for '{k}'"
-  unless !mod.isAnonymous && hasOnlyStrComponents mod && numOLeans ≥ 1 &&
-      numOLeans ≤ oleanPartExts.size && numIRs?.all (· ≤ irPartExts.size) do
-    throw s!"invalid artifacts for '{k}': {v}"
-  return .ofArrays <| #[partsAt root mod oleanPartExts numOLeans] ++
-    (numIRs?.map (partsAt root mod irPartExts)).toArray
-
-/-- Decodes {name}`ImportArtifacts.mapToJson`, as well as the encoding with full paths only. -/
-def ImportArtifacts.mapFromJson? : Json → Except String (NameMap ImportArtifacts)
-  | j@(.obj obj) => do
-    let roots : Array System.FilePath ← match j.getObjVal? "" with
-      | .ok r => fromJson? r
-      | .error _ => pure #[]
-    obj.foldlM (init := {}) fun m k v => do
-      if k.isEmpty then
-        return m
-      let mod ← if k == "[anonymous]" then pure .anonymous else
-        let n := k.toName
-        if n.isAnonymous then throw s!"expected a `Name`, got '{k}'" else pure n
-      return m.insert mod (← decodeArts roots k mod v)
-  | j => throw s!"expected a `NameMap`, got '{j}'"
-
-instance : ToJson (NameMap ImportArtifacts) := ⟨ImportArtifacts.mapToJson⟩
-instance : FromJson (NameMap ImportArtifacts) := ⟨ImportArtifacts.mapFromJson?⟩
 
 /-- Files containing data for a single module. -/
 structure ModuleArtifacts where
@@ -303,10 +211,130 @@ structure ModuleSetup where
   options : LeanOptions := {}
   deriving Repr, Inhabited, ToJson, FromJson
 
+/-!
+{lit}`paperlean` commands: the setup files of the modules that a build compiles. PaperLean's code comes
+after the upstream declarations above, whose specializations it reuses, and the instances above are
+what `deriving` gives, so that the compiled code of this file up to here is official Lean's.
+
+Lake lists the artifacts of every transitively imported module, so these maps can have tens of
+thousands of entries. An entry whose files are a prefix of the usual parts at their default location
+below a package root ({lit}`modToFilePath root mod ext`) is therefore encoded as
+{lit}`[root, numOLeanParts]` or {lit}`[root, numOLeanParts, numIRParts]`, where {lit}`root` indexes
+the array of roots stored under the key {lit}`""` (which cannot name a module). All other entries
+keep their full paths.
+-/
+
+namespace PaperLean
+
+private def oleanPartExts : Array String := #["olean", "olean.server", "olean.private"]
+private def irPartExts : Array String := #["ir.sig", "ir"]
+
+private def hasOnlyStrComponents : Name → Bool
+  | .anonymous => true
+  | .str p _ => hasOnlyStrComponents p
+  | .num .. => false
+
+/-- {lit}`modToFilePath root mod ""`: this module lies below {lit}`Lean.Util.Path`. -/
+private def modStem (root : System.FilePath) : Name → System.FilePath
+  | .str p h => modStem root p / h
+  | _ => root
+
+private def partsAt (root : System.FilePath) (mod : Name) (exts : Array String) (n : Nat) :
+    Array System.FilePath :=
+  let stem := (modStem root mod).toString
+  (exts.extract 0 n).map fun ext => ⟨stem ++ "." ++ ext⟩
+
+/--
+If the files of {name}`arts` are at their default location for {name}`mod`, returns their root and
+the number of olean parts and, if there is a second array, of IR parts.
+-/
+private def defaultLayout? (mod : Name) (arts : ImportArtifacts) :
+    Option (String × Nat × Option Nat) := do
+  guard (!mod.isAnonymous && hasOnlyStrComponents mod && arts.toArrays.size ≤ 2)
+  let olean ← arts.olean?
+  let root ← (List.range mod.getNumParts).foldlM (init := olean) fun p _ => p.parent
+  let oleans := arts.toArrays[0]!
+  let irs? := arts.toArrays[1]?
+  guard (oleans.size ≤ oleanPartExts.size && oleans == partsAt root mod oleanPartExts oleans.size)
+  if let some irs := irs? then
+    guard (irs.size ≤ irPartExts.size && irs == partsAt root mod irPartExts irs.size)
+  return (root.toString, oleans.size, irs?.map (·.size))
+
+/-- Encodes {name}`m` as described above. -/
+def artifactsToJson (m : NameMap ImportArtifacts) : Json := Id.run do
+  let mut roots : Array String := #[]
+  let mut obj : Std.TreeMap.Raw String Json := ∅
+  for (mod, arts) in m do
+    if let some (root, numOLeans, numIRs?) := defaultLayout? mod arts then
+      -- consecutive entries mostly share their root
+      let idx := if roots.back? == some root then roots.size - 1 else
+        roots.findIdx? (· == root) |>.getD roots.size
+      if idx == roots.size then
+        roots := roots.push root
+      let counts := #[toJson numOLeans] ++ (numIRs?.map toJson).toArray
+      obj := obj.insert mod.toString (Json.arr (#[toJson idx] ++ counts))
+    else
+      obj := obj.insert mod.toString (toJson arts)
+  if !roots.isEmpty then
+    obj := obj.insert "" (toJson roots)
+  return .obj obj
+
+private def decodeArts (roots : Array System.FilePath) (k : String) (mod : Name) (v : Json) :
+    Except String ImportArtifacts := do
+  let .arr a := v | fromJson? v
+  unless (a.size == 2 || a.size == 3) && a[0]! matches .num _ do
+    return ← fromJson? v
+  let idx : Nat ← fromJson? a[0]!
+  let numOLeans : Nat ← fromJson? a[1]!
+  let numIRs? : Option Nat ← if a.size == 3 then some <$> fromJson? a[2]! else pure none
+  let some root := roots[idx]?
+    | throw s!"invalid root index {idx} for '{k}'"
+  unless !mod.isAnonymous && hasOnlyStrComponents mod && numOLeans ≥ 1 &&
+      numOLeans ≤ oleanPartExts.size && numIRs?.all (· ≤ irPartExts.size) do
+    throw s!"invalid artifacts for '{k}': {v}"
+  return .ofArrays <| #[partsAt root mod oleanPartExts numOLeans] ++
+    (numIRs?.map (partsAt root mod irPartExts)).toArray
+
+/-- Decodes {name}`artifactsToJson`, as well as the encoding with full paths only. -/
+def artifactsFromJson? : Json → Except String (NameMap ImportArtifacts)
+  | j@(.obj obj) => do
+    let roots : Array System.FilePath ← match j.getObjVal? "" with
+      | .ok r => fromJson? r
+      | .error _ => pure #[]
+    obj.foldlM (init := {}) fun m k v => do
+      if k.isEmpty then
+        return m
+      let mod ← if k == "[anonymous]" then pure .anonymous else
+        let n := k.toName
+        if n.isAnonymous then throw s!"expected a `Name`, got '{k}'" else pure n
+      return m.insert mod (← decodeArts roots k mod v)
+  | j => throw s!"expected a `NameMap`, got '{j}'"
+
+/--
+The JSON of a module's setup with {lit}`importArts` encoded compactly (as described for
+{lit}`artifactsToJson`), which {lit}`ModuleSetup.load` reads and official Lean does not. A build writes
+it to a side file ({lit}`<module>.setup.paperlean`).
+-/
+def setupToJsonCompact (x : ModuleSetup) : Json :=
+  (toJson { x with importArts := {} }).setObjVal! "importArts" (artifactsToJson x.importArts)
+
+/-- Like {lit}`fromJson?`, also reading the compact encoding of {lit}`setupToJsonCompact`. -/
+def setupFromJsonCompact? (json : Json) : Except String ModuleSetup :=
+  match json.getObjVal? "importArts" with
+  | .ok arts@(.obj o) =>
+    if o.contains "" then do
+      let setup : ModuleSetup ← fromJson? (json.setObjVal! "importArts" (.obj ∅))
+      return { setup with importArts := ← artifactsFromJson? arts }
+    else fromJson? json
+  | _ => fromJson? json
+
+end PaperLean
+
 /-- Load a {lean}`ModuleSetup` from a JSON file. -/
-def ModuleSetup.load (path : System.FilePath) : IO ModuleSetup := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def ModuleSetup.load (path : System.FilePath) : IO ModuleSetup := do
   let contents ← IO.FS.readFile path
-  match Json.parse contents >>= fromJson? with
+  match Json.parse contents >>= PaperLean.setupFromJsonCompact? with
   | .ok info => pure info
   | .error msg => throw <| IO.userError s!"failed to load header from {path}: {msg}"
 -- Modified by PaperLean.

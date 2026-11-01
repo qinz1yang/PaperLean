@@ -1,10 +1,12 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Differential test for the import traversal (`importModulesCore`): a small module graph with
 # public/private/meta/all edges, diamonds that force flag bumps and closure re-traversals, a module
 # without IR files, and a missing `.olean`.  The same roots are run under PAPERLEAN_IMPORT=legacy
 # (the original folds), the default (the faster implementation), and PAPERLEAN_IMPORT=check (which
 # builds both); the observable imported environment and all errors must be identical.
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK
 # Extra environment of the runs; set below to use an olean pack of the modules.
 EXTRA_ENV=()
 SRC="$TMP_DIR/src"
@@ -281,6 +283,10 @@ EOF
 # Runs a successful root in all three modes and compares the complete output.
 run_root() {
   local name="$1" expect="$2" mode
+  # (check mode finds a defect of the faster import)
+  capture_fail env LEAN_PATH="$LIB" PAPERLEAN_IMPORT=check PAPERLEAN_IMPORT_CHECK_FAULT=maps \
+    "${EXTRA_ENV[@]}" lean "$name.lean"
+  check_out_contains "PAPERLEAN_IMPORT=check: the private constant map differs"
   for mode in "" legacy check; do
     capture env LEAN_PATH="$LIB" PAPERLEAN_IMPORT="$mode" "${EXTRA_ENV[@]}" lean "$name.lean"
     check_out_contains "modules="

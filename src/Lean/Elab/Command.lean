@@ -997,6 +997,16 @@ def liftTermElabM (x : TermElabM α) : CommandElabM α := do
 instance : MonadEval TermElabM CommandElabM where
   monadEval := liftTermElabM
 
+set_option compiler.ignoreBorrowAnnotation true in
+/-- PaperLean: `runTermElabM` with the reuse of section variables (below). -/
+@[extern "lean_paperlean_run_term_elab_m"]
+private opaque runTermElabMReusingOwned {α : Type} (elabFn : Array Expr → TermElabM α) : CommandElabM α
+
+-- (its context is borrowed, so that the inferred calling convention stays upstream's)
+@[noinline] private def runTermElabMReusing {α : Type} (elabFn : Array Expr → TermElabM α)
+    (ctx : @& Context) (s : @& IO.Ref State) : EIO Exception α :=
+  runTermElabMReusingOwned elabFn ctx s
+
 /--
 Execute the monadic action `elabFn xs` as a `CommandElabM` monadic action, where `xs` are free variables
 corresponding to all active scoped variables declared using the `variable` command.
@@ -1021,25 +1031,11 @@ variable (n : Nat)
       IO.println s!"{← ppExpr x} : {← ppExpr (← inferType x)}"
 ```
 -/
-def runTermElabM (elabFn : Array Expr → TermElabM α) : CommandElabM α := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def runTermElabM (elabFn : Array Expr → TermElabM α) : CommandElabM α :=
+  (PaperLean.nativePath elabFn).select (runTermElabMReusing elabFn) do
   let scope ← getScope
   liftTermElabM <|
-    -- PaperLean: the section variables as elaborated for an earlier command of the scope are reused
-    -- when that elaboration would give the same (`Lean.PaperLean.SectionVars`)
-    PaperLean.SectionVars.withSectionVars (scope.varDecls.map (·.raw)) scope.varUIds scope.opts
-      (elabVars scope) fun xs sectionFVars =>
-        withReader ({ · with sectionFVars := sectionFVars }) do
-          if xs.all (·.isFVar) then
-            Term.withoutAutoBoundImplicit <| elabFn xs
-          else
-            -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
-            -- and then rebuild the local context from scratch.
-            -- Resetting prevents the local context from including the original fvars from `xs`.
-            let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
-            Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
-              Term.withoutAutoBoundImplicit <| elabFn xs
-where
-  elabVars {β} (scope : Scope) (k : Array Expr → NameMap Expr → TermElabM β) : TermElabM β :=
     Term.withAutoBoundImplicit <|
       Term.elabBinders scope.varDecls fun xs => do
         -- We need to synthesize postponed terms because this is a checkpoint for the auto-bound implicit feature
@@ -1053,7 +1049,59 @@ where
           -- So, we use `Core.resetMessageLog`.
           Core.resetMessageLog
           let xs ← Term.addAutoBoundImplicits xs none
-          k xs sectionFVars
+          if xs.all (·.isFVar) then
+            Term.withoutAutoBoundImplicit <| elabFn xs
+          else
+            -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
+            -- and then rebuild the local context from scratch.
+            -- Resetting prevents the local context from including the original fvars from `xs`.
+            let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
+            Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
+              Term.withoutAutoBoundImplicit <| elabFn xs
+
+/-- The elaboration of the section variables of `runTermElabM`, which passes the variables and the
+map from their unique names to them to `k`. -/
+-- PaperLean: (separate, for `Lean.PaperLean.SectionVars`)
+private def elabSectionVars {β} (scope : Scope) (k : Array Expr → NameMap Expr → TermElabM β) :
+    TermElabM β :=
+  Term.withAutoBoundImplicit <|
+    Term.elabBinders scope.varDecls fun xs => do
+      -- We need to synthesize postponed terms because this is a checkpoint for the auto-bound implicit feature
+      -- If we don't use this checkpoint here, then auto-bound implicits in the postponed terms will not be handled correctly.
+      Term.synthesizeSyntheticMVarsNoPostponing
+      let mut sectionFVars := {}
+      for uid in scope.varUIds, x in xs do
+        sectionFVars := sectionFVars.insert uid x
+      -- We don't want to store messages produced when elaborating `(getVarDecls s)` because they have already been saved when we elaborated the `variable`(s) command.
+      -- So, we use `Core.resetMessageLog`.
+      Core.resetMessageLog
+      let xs ← Term.addAutoBoundImplicits xs none
+      k xs sectionFVars
+
+private def _root_.Lean.PaperLean.runTermElabMReusingImpl {α : Type} (elabFn : Array Expr → TermElabM α) : CommandElabM α := do
+  let scope ← getScope
+  liftTermElabM <|
+    -- PaperLean: the section variables are set as an earlier command's elaboration of them left
+    -- them when that elaboration would give the same (`Lean.PaperLean.SectionVars`)
+    PaperLean.SectionVars.withSectionVars (scope.varDecls.map (·.raw)) scope.varUIds scope.opts
+      (elabSectionVars scope) fun xs sectionFVars =>
+        withReader ({ · with sectionFVars := sectionFVars }) do
+          if xs.all (·.isFVar) then
+            Term.withoutAutoBoundImplicit <| elabFn xs
+          else
+            -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
+            -- and then rebuild the local context from scratch.
+            -- Resetting prevents the local context from including the original fvars from `xs`.
+            let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
+            Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
+              Term.withoutAutoBoundImplicit <| elabFn xs
+
+-- (at one type: the `extern` above has no parameter for the type, an `export` would)
+set_option compiler.ignoreBorrowAnnotation true in
+@[export lean_paperlean_run_term_elab_m]
+private def runTermElabMReusingExport (elabFn : Array Expr → TermElabM NonScalar) :
+    CommandElabM NonScalar :=
+  PaperLean.runTermElabMReusingImpl elabFn
 
 private def liftAttrM {α} (x : AttrM α) : CommandElabM α := do
   liftCoreM x

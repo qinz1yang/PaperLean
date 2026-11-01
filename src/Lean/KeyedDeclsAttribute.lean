@@ -10,6 +10,8 @@ public import Lean.ScopedEnvExtension
 import Lean.Compiler.InitAttr
 import Lean.Compiler.IR.CompilerM
 import Lean.ExtraModUses
+import Lean.PaperLean.Speculation
+import Lean.PaperLean.Whitelist
 
 public section
 
@@ -101,7 +103,9 @@ def ExtensionState.insert (s : ExtensionState γ) (v : AttributeEntry γ) :  Ext
   erased     := s.erased.erase v.declName
 }
 
-def addBuiltin (attr : KeyedDeclsAttribute γ) (key : Key) (declName : Name) (value : γ) : IO Unit :=
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def addBuiltin (attr : KeyedDeclsAttribute γ) (key : Key) (declName : Name) (value : γ) : IO Unit := do
+  PaperLean.Speculation.checkBuiltinRegistration declName (← initializing)
   attr.tableRef.modify fun m => m.insert { key, declName, value, isBuiltin := true }
 
 def mkStateOfTable (table : Table γ) : ExtensionState γ := {
@@ -173,14 +177,66 @@ protected unsafe def init {γ} (df : Def γ) (attrDeclName : Name := by exact de
   }
   pure { defn := df, tableRef := tableRef, ext := ext }
 
+/-- PaperLean: `getEntries` while this thread records environment accesses (below). -/
+@[extern "lean_paperlean_get_entries_recorded"]
+private opaque getEntriesRecordedOwned {γ} (attr : KeyedDeclsAttribute γ) (env : Environment)
+    (key : Name) : List (AttributeEntry γ)
+
+-- (its parameters are borrowed, so that the inferred calling convention stays upstream's)
+@[noinline] private def getEntriesRecorded {γ} (attr : @& KeyedDeclsAttribute γ) (env : Environment)
+    (key : @& Name) : List (AttributeEntry γ) :=
+  getEntriesRecordedOwned attr env key
+
 /-- Retrieve entries tagged with `[attr key]` or `[builtinAttr key]`. -/
-def getEntries {γ} (attr : KeyedDeclsAttribute γ) (env : Environment) (key : Name) : List (AttributeEntry γ) :=
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def getEntries {γ} (attr : KeyedDeclsAttribute γ) (env : Environment) (key : Name) : List (AttributeEntry γ) :=
+  -- PaperLean: recorded as the entries for `key` and the erased ones (`Lean.PaperLean.EnvDeps`),
+  -- which entries for other keys keep the same objects
+  (PaperLean.recordingPath key).select (getEntriesRecorded attr env key) <|
   let s := attr.ext.getState env
   let attrs := s.table.findD key []
   if s.erased.isEmpty then
     attrs
   else
     attrs.filter fun attr => !s.erased.contains attr.declName
+
+private def getEntriesCore {γ} (s : ExtensionState γ) (attrs : List (AttributeEntry γ)) :
+    List (AttributeEntry γ) :=
+  if s.erased.isEmpty then
+    attrs
+  else
+    attrs.filter fun attr => !s.erased.contains attr.declName
+
+private unsafe def sameObj? {α : Type} (a b : Option α) : Bool :=
+  match a, b with
+  | some x, some y => ptrEq x y
+  | none, none => true
+  | _, _ => false
+
+private unsafe def _root_.Lean.PaperLean.getEntriesRecordedCore {γ} (attr : KeyedDeclsAttribute γ) (env : Environment)
+    (key : Name) (_ _ : Unit) : List (AttributeEntry γ) :=
+  let state (env : Environment) := PaperLean.envWithoutRecording fun _ => attr.ext.getState env
+  let s := state env
+  let attrs? := s.table.find? key
+  let erased := s.erased
+  let entries := getEntriesCore s (attrs?.getD [])
+  -- (macros cannot read the environment, and read the namespace through a function, which records
+  -- it: `Lean.Elab.expandMacroImpl?`)
+  let entries := if attr.defn.name == `macro then entries else
+    entries.foldl (fun r e => PaperLean.Whitelist.noteEntry env e.declName e.isBuiltin r) entries
+  PaperLean.envRecord (.extPart attr.ext.ext.toEnvExtension.idx key) (unsafeCast
+    fun (env' : Environment) (_ : Name) (_ : NonScalar) =>
+      let s' := state env'
+      sameObj? (s'.table.find? key) attrs? &&
+        (ptrEq s'.erased erased || s'.erased.isEmpty && erased.isEmpty))
+    entries
+
+-- (counting no heartbeats; at one type: the `extern` above has no parameter for the type, an `export`
+-- would)
+@[export lean_paperlean_get_entries_recorded]
+private unsafe def getEntriesRecordedImpl (attr : KeyedDeclsAttribute NonScalar) (env : Environment)
+    (key : Name) : List (AttributeEntry NonScalar) :=
+  PaperLean.uncounted5 PaperLean.getEntriesRecordedCore attr env key () ()
 
 /-- Retrieve values tagged with `[attr key]` or `[builtinAttr key]`. -/
 def getValues {γ} (attr : KeyedDeclsAttribute γ) (env : Environment) (key : Name) : List γ :=
@@ -189,3 +245,4 @@ def getValues {γ} (attr : KeyedDeclsAttribute γ) (env : Environment) (key : Na
 end KeyedDeclsAttribute
 
 end Lean
+-- Modified by PaperLean.

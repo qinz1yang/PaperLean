@@ -12,6 +12,7 @@ public import Lean.Elab.Open
 public import Lean.Elab.SetOption
 public import Lean.Elab.Eval
 import Lean.Compiler.NoncomputableAttr
+import Lean.PaperLean.EnvDeps
 
 public section
 
@@ -267,7 +268,15 @@ def elabScientificLit : TermElab := fun stx expectedType? => do
     | throwError "invalid `decl_name%` macro, the declaration name is not available"
   return (quote declName : Term)
 
-@[builtin_term_elab Parser.Term.withDeclName] def elabWithDeclName : TermElab := fun stx expectedType? => do
+/-- PaperLean: a recording of environment accesses records the read of the current namespace by
+`elabWithDeclName` (`Lean.PaperLean.EnvDeps`). -/
+@[noinline] private def noteDeclNameScope (stx : Syntax) : TermElabM Unit := do
+  -- (not the name of the syntax: the closed terms of its `builtin_term_elab` must stay declarations)
+  if PaperLean.envRecording stx && !stx[1].isNone then PaperLean.EnvDeps.recordScope `with_decl_name
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[builtin_term_elab Parser.Term.withDeclName, noinline] def elabWithDeclName : TermElab := fun stx expectedType? => do
+  noteDeclNameScope stx
   let id := stx[2].getId
   let id ← if stx[1].isNone then pure id else pure <| (← getCurrNamespace) ++ id
   let e := stx[3]
@@ -468,3 +477,4 @@ private opaque evalFilePath (stx : Syntax) : TermElabM System.FilePath
   | _ => throwUnsupportedSyntax
 
 end Lean.Elab.Term
+-- Modified by PaperLean.

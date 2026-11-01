@@ -1,10 +1,12 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests `paperlean build --prepare` (`refresh`, `src/lake/Lake/PaperLean/Prepare.lean`): the files
 # of the root package's modules that changed or were added since its pack was written go into a pack
 # of their own, which Lean reads before the root package's pack (`find_in_packs`); that pack is not
-# rewritten, every file is served from the packs, and the results equal those without packs.
+# rewritten, every file is served from the packs, and the results equal those without packs; what
+# interrupted runs left is deleted.
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK LEAN_IMPORT_IMAGE PAPERLEAN_NATIVE_LIBS
-unset ELAN_TOOLCHAIN
 WS="$(cd "$TMP_DIR" && pwd -P)/ws"
 mkdir -p "$TMP_DIR/dep" "$WS/Root"
 cat > "$TMP_DIR/dep/lakefile.toml" <<'END'
@@ -101,6 +103,30 @@ expected
 capture env PAPERLEAN_ACCELERATE=1 lake env lean Probe.lean
 check_out_contains "served from packs: true, read from disk: 0"
 same_as_expected
+
+# A failure after the pack of changes was written (here: env.json cannot be written) leaves the data
+# as it was, without that pack.
+DELTAS=$(ls .lake/paperlean/root-*/changes-*.delta.paperlean)
+cp .lake/paperlean/env.json "$TMP_DIR/env.before"
+printf 'def a4 : Nat := 4\n' >> Root/A.lean
+chmod a-w .lake/paperlean
+capture_exit 1 lake paperlean build --prepare
+chmod u+w .lake/paperlean
+[ "$(ls .lake/paperlean/root-*/changes-*.delta.paperlean)" = "$DELTAS" ] || fail "a failed refresh left a pack of changes"
+cmp -s .lake/paperlean/env.json "$TMP_DIR/env.before" || fail "a failed refresh changed env.json"
+capture lake paperlean build --prepare
+expected
+capture env PAPERLEAN_ACCELERATE=1 lake env lean Probe.lean
+check_out_contains "served from packs: true, read from disk: 0"
+same_as_expected
+# The packs of changes that interrupted runs left (here made by hand) and their temporary files are
+# deleted by the next run.
+RDIR=$(dirname "$BASE")
+touch "$RDIR/changes-1.delta.paperlean" "$RDIR/changes-2.delta.paperlean.tmp.99999999"
+capture lake paperlean build --prepare
+[ ! -e "$RDIR/changes-1.delta.paperlean" ] && [ ! -e "$RDIR/changes-2.delta.paperlean.tmp.99999999" ] ||
+  fail "build --prepare kept what interrupted runs left: $(ls "$RDIR")"
+ls "$RDIR"/changes-*.delta.paperlean > /dev/null || fail "build --prepare deleted its pack of changes"
 
 # Preparing the dependencies again keeps the root package's packs.
 capture lake paperlean build --prepare=dep

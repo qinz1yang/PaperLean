@@ -12,6 +12,7 @@ public import Lean.KeyedDeclsAttribute
 import Lean.BuiltinDocAttr
 public import Lean.ExtraModUses
 import all Init.Prelude  -- for `Lean.Macro.State.expandedMacroDecls` access
+import Lean.PaperLean.Base
 
 public section
 
@@ -150,11 +151,52 @@ directly.
 @[builtin_doc]
 builtin_initialize macroAttribute : KeyedDeclsAttribute Macro ← mkMacroAttribute decl_name%
 
+set_option compiler.ignoreBorrowAnnotation true in
+/-- PaperLean: `expandMacroImpl?` while this thread records environment accesses (below). -/
+@[extern "lean_paperlean_expand_macro_recorded"]
+private opaque expandMacroRecordedOwned (env : Environment) (stx : Syntax) :
+    MacroM (Option (Name × Except Macro.Exception Syntax))
+
+-- (its context is borrowed, so that the inferred calling convention stays upstream's)
+@[noinline] private def expandMacroRecorded (env : Environment) (stx : Syntax)
+    (ctx : @& Macro.Context) (s : Macro.State) :
+    EStateM.Result Macro.Exception Macro.State (Option (Name × Except Macro.Exception Syntax)) :=
+  expandMacroRecordedOwned env stx ctx s
+
 /--
 Try to expand macro at syntax tree root and return macro declaration name and new syntax if successful.
 Return none if all macros threw `Macro.Exception.unsupportedSyntax`.
 -/
-def expandMacroImpl? (env : Environment) : Syntax → MacroM (Option (Name × Except Macro.Exception Syntax)) := fun stx => do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def expandMacroImpl? (env : Environment) : Syntax → MacroM (Option (Name × Except Macro.Exception Syntax)) := fun stx =>
+  (PaperLean.recordingPath stx).select (expandMacroRecorded env stx) do
+  for e in macroAttribute.getEntries env stx.getKind do
+    try
+      let stx' ← withFreshMacroScope (e.value stx)
+      if !e.isBuiltin then
+        modify fun st => { st with expandedMacroDecls := e.declName :: st.expandedMacroDecls }
+      return some (e.declName, Except.ok stx')
+    catch
+      | Macro.Exception.unsupportedSyntax => pure ()
+      | ex                                => return some (e.declName, Except.error ex)
+  return none
+
+/-- PaperLean: the context `ctx` of a macro whose read of the current namespace is recorded
+(`EnvAccess.scope`), for a recording of environment accesses, which records its resolutions of names
+and lookups of declarations anyway; counting no heartbeats. -/
+private def recordingContext (ctx : Macro.Context) (m : Macro.Methods) : Macro.Context :=
+  PaperLean.uncounted5 (fun ctx (m : Macro.Methods) _ _ _ =>
+    { ctx with methods := Macro.mkMethods { m with getCurrNamespace := do
+        let ns ← m.getCurrNamespace
+        return PaperLean.uncounted5 (fun ns _ _ _ _ =>
+          PaperLean.envRecord (.scope ``Macro.getCurrNamespace) (unsafe unsafeCast ()) ns)
+          ns () () () () } }) ctx m () () ()
+
+set_option compiler.ignoreBorrowAnnotation true in
+@[export lean_paperlean_expand_macro_recorded]
+private def expandMacroRecordedImpl (env : Environment) : Syntax → MacroM (Option (Name × Except Macro.Exception Syntax)) := fun stx => do
+  let methods ← Macro.getMethods
+  withReader (recordingContext · methods) do
   for e in macroAttribute.getEntries env stx.getKind do
     try
       let stx' ← withFreshMacroScope (e.value stx)
@@ -268,3 +310,4 @@ builtin_initialize
   registerTraceClass `Elab.step.result (inherited := true)
 
 end Lean.Elab
+-- Modified by PaperLean.

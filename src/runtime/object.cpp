@@ -173,8 +173,14 @@ static void print_backtrace(bool force_stderr) {
 #endif
 }
 
+// (for the analysis of `Lean.PaperLean.evalImpuritiesMain`, whatever is done about panic messages)
+static std::atomic<size_t> g_panic_count{0};
+
+extern "C" LEAN_EXPORT size_t lean_paperlean_panic_count() { return g_panic_count.load(); }
+
 // Morally, `{msg, size}` is an `std::string_view`.
 static void lean_panic_impl(char const * msg, size_t size, bool force_stderr = false) {
+    g_panic_count++;
     if (g_panic_messages) {
         panic_eprintln(msg, size, force_stderr);
 #if LEAN_SUPPORTS_BACKTRACE

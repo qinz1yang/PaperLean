@@ -605,4 +605,11 @@ where
         | .star  => cs.foldlM (init := result) fun result ⟨k, c⟩ => process k.arity todo c result
         | _      => visitNonStar k args (← visitStar result)
 
+/-- PaperLean: the root key under which `getUnify` looks up `e`. Unless that is `.star`, the result
+of `getUnify d e` depends only on the entries of `d` under that key and under `.star`
+(`Lean.PaperLean.TCCache`). -/
+def getUnifyRootKey (e : Expr) : MetaM Key :=
+  withReducible do return (← getUnifyKeyArgs e (root := true)).1
+
 end Lean.Meta.DiscrTree
+-- Modified by PaperLean.

@@ -18,6 +18,7 @@ struct pack_hit {
     size_t size;
     size_t orig_base;   // the file's `base_addr`
     object * root;
+    object * region_root; // the root that the region's data holds (`root` may be a copy of it)
 };
 
 // Whether the file `fname`, to be read with `deps` as the regions of the earlier parts of its
@@ -54,6 +55,9 @@ bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint
 void for_each_first_pack_ext_entries(b_obj_arg ext_name, std::function<void(object *)> const & f);
 bool first_pack_identity(uint64_t & checksum, uint64_t & base, uint64_t & size);
 void extension_name_key(b_obj_arg n, std::string & key);
+// For writing an import image: why the index of the first pack is not as its writer left it, if it is
+// not (readers check only the entries they use).
+char const * first_pack_damaged();
 
 // In `library/module.cpp`: the `.olean` format and regions.
 size_t olean_header_size();
@@ -62,9 +66,11 @@ size_t olean_header_base_addr_offset();
 uint8_t olean_header_flags();
 // Whether `h` starts an `.olean` header with this build's marker and flags; its version and base address.
 bool olean_header_info(char const * h, uint8_t & version, size_t & base_addr);
-// Whether the `.olean` header `h` passes the githash check of `lean_compacted_region_read` (in builds
-// with `CHECK_OLEAN_VERSION`; always otherwise).
-bool olean_header_githash_ok(char const * h);
+// Whether the githash of the `.olean` header `h` is this build's `LEAN_GITHASH`.
+bool olean_header_githash_matches(char const * h);
+// Whether `lean_compacted_region_read` rejects files whose githash is not this build's (in builds with
+// `CHECK_OLEAN_VERSION`).
+bool olean_githash_checked();
 // A `CompactedRegion` object.
 object * mk_olean_region(b_obj_arg ofname, object * root, char * buffer, size_t base_addr, size_t full_sz, bool is_mmap);
 }

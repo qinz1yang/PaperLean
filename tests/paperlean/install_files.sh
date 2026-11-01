@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests the makefile that the toolchain installs for packages (`share/lean/lean.mk`): it names no
 # file of the build directory, such as the shim that only the build of Lean's own library loads
 # (`paperlean/stage0_shim.c`) or an archiver that the toolchain ships in its `bin`, and `leanmake`

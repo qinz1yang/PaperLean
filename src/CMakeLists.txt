@@ -87,9 +87,10 @@ option(STRIP_BINARIES "Strip produced binaries" ON)
 option(USE_GITHASH "GIT_HASH" ON)
 # The commit of the upstream release this source tree is compatible with. It is used as the githash
 # instead of the checked-out commit, so that `Lean.githash`, which Lake uses to decide whether build
-# artifacts can be reused, and the `.olean` headers are those of the official release.
-set(LEAN_UPSTREAM_GITHASH "470d5ce1400764999581fd26d5d72b00d990b0f4" CACHE STRING
-  "githash to embed instead of the checked-out commit (empty: the checked-out commit)")
+# artifacts can be reused, and the `.olean` headers are those of the official release. (Not a cache
+# entry, which would keep an older release's commit in a build directory after a rebase.)
+set(LEAN_UPSTREAM_GITHASH "470d5ce1400764999581fd26d5d72b00d990b0f4")
+option(PAPERLEAN_CHECKOUT_GITHASH "embed the checked-out commit as the githash instead of LEAN_UPSTREAM_GITHASH" OFF)
 # When ON we install LICENSE files to CMAKE_INSTALL_PREFIX
 option(INSTALL_LICENSE "INSTALL_LICENSE" ON)
 # When ON we install a copy of cadical
@@ -742,7 +743,7 @@ endif()
 file(WRITE "${CMAKE_BINARY_DIR}/lake-githash" "${LAKE_LEAN_GITHASH}")
 
 # Git HASH
-if(USE_GITHASH AND NOT "${LEAN_UPSTREAM_GITHASH}" STREQUAL "")
+if(USE_GITHASH AND NOT PAPERLEAN_CHECKOUT_GITHASH)
   set(GIT_SHA1 "${LEAN_UPSTREAM_GITHASH}")
   message(STATUS "git commit sha1 (upstream release): ${GIT_SHA1}")
 elseif(USE_GITHASH)
@@ -761,6 +762,21 @@ else()
     message(STATUS "stage0 sha1: ${GIT_SHA1}")
   else()
     set(GIT_SHA1 "")
+  endif()
+endif()
+# PaperLean: with `CHECK_OLEAN_VERSION`, the previous stage's `lean`, which writes the library, must
+# have this one's githash, or this Lean would refuse to read the library. (An upstream stage0 has the
+# checked-out commit, none without a `.git`, unlike `LEAN_UPSTREAM_GITHASH`.)
+set(PREV_STAGE_LEAN "${PREV_STAGE}/bin/lean${PREV_STAGE_CMAKE_EXECUTABLE_SUFFIX}")
+if(CHECK_OLEAN_VERSION AND PREV_STAGE AND NOT EXISTS "${PREV_STAGE_LEAN}")
+  message(WARNING "${PREV_STAGE_LEAN} does not exist yet, so its githash is not compared with this one")
+elseif(CHECK_OLEAN_VERSION AND PREV_STAGE)
+  execute_process(COMMAND "${PREV_STAGE_LEAN}" --githash OUTPUT_VARIABLE PREV_STAGE_SHA1
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT PREV_STAGE_SHA1 STREQUAL GIT_SHA1)
+    message(FATAL_ERROR "With CHECK_OLEAN_VERSION, the previous stage's lean (githash \"${PREV_STAGE_SHA1}\") \
+would write the library, which this Lean (githash \"${GIT_SHA1}\") would refuse to read. Build from a \
+source tree that script/paperlean-export-source.sh exports.")
   endif()
 endif()
 configure_file("${LEAN_SOURCE_DIR}/githash.h.in" "${LEAN_BINARY_DIR}/githash.h")
@@ -1315,7 +1331,10 @@ endfunction()
 string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}" LEANC_CC "${LEANC_CC}")
 string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}" LEANC_INTERNAL_FLAGS "${LEANC_INTERNAL_FLAGS}")
 
-toml_escape("${LEAN_EXTRA_OPTS}${PAPERLEAN_STAGE0_SHIM_OPTS}" LEAN_EXTRA_OPTS_TOML)
+toml_escape("${LEAN_EXTRA_OPTS}" LEAN_EXTRA_OPTS_TOML)
+# PaperLean: the stage0 shim is loaded through untraced arguments, as its path is the build directory's
+toml_escape("${PAPERLEAN_STAGE0_SHIM_OPTS}" PAPERLEAN_STAGE0_SHIM_OPTS_TOML)
+toml_escape("${LEAN_EXTRA_OPTS}${PAPERLEAN_STAGE0_SHIM_OPTS}" LEAN_SERVER_OPTS_TOML)
 # PaperLean: `PAPERLEAN_STDLIB_CC_FLAGS` (e.g. for profile-guided optimization) are used for the C code
 # of Lean's own libraries only; unlike `LEANC_EXTRA_CC_FLAGS`, they are not passed to the C compiler
 # for packages' code (`Lean.Compiler.FFI.getCFlags`, `leanc`)

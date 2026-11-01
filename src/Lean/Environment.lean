@@ -643,7 +643,8 @@ accessible in both the private and public scope. All other data is empty.
 def ofKernelEnv (env : Kernel.Environment) : Environment :=
   { base.private := env, base.public := env, importRealizationCtx? := none }
 
-@[export lean_elab_environment_to_kernel_env]
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[export lean_elab_environment_to_kernel_env, noinline]
 def toKernelEnv (env : Environment) : Kernel.Environment :=
   -- PaperLean: cannot be recorded (`Lean.PaperLean.EnvDeps`)
   if PaperLean.envRecording env then
@@ -660,10 +661,12 @@ def setExporting (env : Environment) (isExporting : Bool) : Environment :=
 -- PaperLean: the task that applies `f` to the checked environment does not make a recording of
 -- environment accesses unusable (`Lean.PaperLean.EnvDeps`): the change itself is either repeated on
 -- reuse or makes the recording unusable, and whether `Task.map` creates a task depends on timing
--- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's)
+-- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's;
+-- it counts no heartbeats)
 @[noinline] private def mapCheckedUnrecorded (checked : @& Task Kernel.Environment)
     (f : @& Kernel.Environment → Kernel.Environment) : Task Kernel.Environment :=
-  PaperLean.envWithoutRecording fun _ => checked.map (sync := true) f
+  PaperLean.uncounted5 (fun checked f _ _ _ => PaperLean.envWithoutRecording fun _ =>
+    checked.map (sync := true) f) checked f () () ()
 
 private def mapChecked (checked : Task Kernel.Environment) (f : Kernel.Environment → Kernel.Environment) :
     Task Kernel.Environment :=
@@ -814,19 +817,26 @@ private def findTaskCore (env : Environment) (n : Name) (skipRealize := false) :
     -- see `findAsyncCore?`
     .pure <| .ofConstantInfo <$> (env.base.get env |>.constants.map₂.find? n)
 
-private unsafe def recordConstUnsafe {α : Type} (n : @& Name) (skipRealize : Bool) (r : Option α) :
-    Option α :=
+private unsafe def recordConstCore {α : Type} (n : Name) (skipRealize : Bool) (r : Option α)
+    (_ _ : Unit) : Option α :=
+  -- (not `r` in the check: holding it, it would keep Lean from reusing that object, which would count)
+  let found := r.isSome
   PaperLean.envRecord (.const n skipRealize) (unsafeCast
     fun (env' : Environment) (_ : Name) (_ : NonScalar) =>
-      (env'.findAsyncCore? n (skipRealize := skipRealize)).isSome == r.isSome) r
+      (env'.findAsyncCore? n (skipRealize := skipRealize)).isSome == found) r
+
+-- (the record counts no heartbeats)
+private unsafe def recordConstUnsafe {α : Type} (n : @& Name) (skipRealize : Bool) (r : Option α) :
+    Option α :=
+  PaperLean.uncounted5 recordConstCore n skipRealize r () ()
 
 -- (`n` is borrowed, so that the callers' inferred calling conventions stay upstream's)
 @[implemented_by recordConstUnsafe, noinline]
 private def recordConstImpl {α : Type} (_n : @& Name) (_skipRealize : Bool) (r : Option α) :
     Option α := r
 
--- PaperLean: lookups of constants that are not imported are recorded for the reuse of section
--- variables (`Lean.PaperLean.EnvDeps`); the imported ones of a visibility do not change
+-- PaperLean: lookups of constants that are not imported are recorded for the reuse of typeclass
+-- results (`Lean.PaperLean.EnvDeps`); the imported ones of a visibility do not change
 @[inline] private def recordConst {α : Type} (n : Name) (skipRealize : Bool) (r : Option α) :
     Option α :=
   if PaperLean.envRecording n then recordConstImpl n skipRealize r else r
@@ -845,14 +855,16 @@ negative lookups are as fast as positive ones.
 
 Use `findTask` instead if any blocking should be avoided.
 -/
-def findAsync? (env : Environment) (n : Name) (skipRealize := false) : Option AsyncConstantInfo := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def findAsync? (env : Environment) (n : Name) (skipRealize := false) : Option AsyncConstantInfo := do
   -- Avoid going through `AsyncConstantInfo` for `base` access
   if let some c := env.base.get env |>.constants.map₁[n]? then
     return .ofConstantInfo c
   recordConst n skipRealize <| findAsyncCore? (skipRealize := skipRealize) env n
 
 /-- Like `findAsync?` but returns a task instead of resorting to blocking. -/
-def findTask (env : Environment) (n : Name) (skipRealize := false) : Task (Option AsyncConstantInfo) := Id.run do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def findTask (env : Environment) (n : Name) (skipRealize := false) : Task (Option AsyncConstantInfo) := Id.run do
   -- Avoid going through `AsyncConstantInfo` for `base` access
   if let some c := env.base.get env |>.constants.map₁[n]? then
     return .pure <| some <| .ofConstantInfo c
@@ -865,7 +877,8 @@ def findTask (env : Environment) (n : Name) (skipRealize := false) : Task (Optio
 Like `findAsync` but blocks on everything but the constant's body (if any), which is not accessible
 through the result.
 -/
-def findConstVal? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantVal := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def findConstVal? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantVal := do
   -- Avoid going through `AsyncConstantInfo` for `base` access
   if let some c := env.base.get env |>.constants.map₁[n]? then
     return c.toConstantVal
@@ -873,7 +886,8 @@ def findConstVal? (env : Environment) (n : Name) (skipRealize := false) : Option
     env.findAsyncCore? n (skipRealize := skipRealize) |>.map (·.toConstantVal)
 
 /-- Like `findAsync?`, but blocks until the constant's info is fully available.  -/
-def find? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantInfo := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def find? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantInfo := do
   if let some c := env.base.get env |>.constants.map₁[n]? then
     return c
   recordConst n skipRealize <|
@@ -1187,7 +1201,8 @@ def contains (env : Environment) (n : Name) (skipRealize := true) : Bool :=
 Checks whether the given declaration is known on the current branch, in which case `findAsync?` will
 not block.
 -/
-def containsOnBranch (env : Environment) (n : Name) : Bool :=
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def containsOnBranch (env : Environment) (n : Name) : Bool :=
   -- PaperLean: cannot be recorded (`Lean.PaperLean.EnvDeps`) unless the answer is an imported
   -- constant
   if (env.base.get env).constants.contains n then true else
@@ -1203,7 +1218,8 @@ and visiting them would only add latency by having to wait for proof elaboration
 
 Unlike iterating `env.constants.map₂`, this does not block on `env.checked`, i.e. kernel checking.
 -/
-partial def getLocalConstantInfos (env : Environment) (skipTheoremSubDecls := false) :
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] partial def getLocalConstantInfos (env : Environment) (skipTheoremSubDecls := false) :
     BaseIO (Array AsyncConstantInfo) := do
   -- PaperLean: cannot be recorded (`Lean.PaperLean.EnvDeps`)
   if PaperLean.envRecording env then PaperLean.envMarkUnusableIO "all of the module's constants"
@@ -1541,16 +1557,22 @@ private unsafe def getStateUnsafeCore {σ : Type} [Inhabited σ] (ext : EnvExten
 private def asyncModeIdx : AsyncMode → Nat
   | .mainOnly => 0 | .local => 1 | .sync => 2 | .async .mainEnv => 3 | .async .asyncEnv => 4
 
--- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's)
-@[noinline] private unsafe def recordStateRead {σ : Type} (inst : @& Inhabited σ)
-    (ext : @& EnvExtension σ) (asyncMode : @& AsyncMode) (asyncDecl : @& Name) (s : σ) : σ :=
+private unsafe def recordStateReadCore {σ : Type} (inst : Inhabited σ) (ext : EnvExtension σ)
+    (asyncMode : AsyncMode) (asyncDecl : Name) (s : σ) : σ :=
   PaperLean.envRecord (.ext ext.idx (asyncModeIdx asyncMode) asyncDecl) (unsafeCast
     fun (env' : Environment) (_ : Name) (_ : NonScalar) =>
       ptrEq (@getStateUnsafeCore σ inst ext env' asyncMode asyncDecl) s) s
 
--- PaperLean: reads of the state are recorded for the reuse of section variables
+-- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's;
+-- the record counts no heartbeats)
+@[noinline] private unsafe def recordStateRead {σ : Type} (inst : @& Inhabited σ)
+    (ext : @& EnvExtension σ) (asyncMode : @& AsyncMode) (asyncDecl : @& Name) (s : σ) : σ :=
+  PaperLean.uncounted5 recordStateReadCore inst ext asyncMode asyncDecl s
+
+-- PaperLean: reads of the state are recorded for the reuse of typeclass results
 -- (`Lean.PaperLean.EnvDeps`)
-private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ)
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ)
     (env : Environment) (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous) : σ :=
   let s := getStateUnsafeCore ext env asyncMode asyncDecl
   if PaperLean.envRecording ext then recordStateRead inferInstance ext asyncMode asyncDecl s else s
@@ -2034,8 +2056,8 @@ private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
   return env.modifyCheckedAsync ({ · with extensions := exts })
 
-private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options) (persistent := false) : IO Environment := do
-  PaperLean.prefetchImportedStates env opts 0 persistent; try loop 0 env finally PaperLean.dropPrefetchedStates env
+private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options) : IO Environment := do
+  loop 0 env
 where
   loop (i : Nat) (env : Environment) : IO Environment := do
     -- Recall that the size of the array stored `persistentEnvExtensionRef` may increase when we import user-defined environment extensions.
@@ -2047,7 +2069,7 @@ where
       let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
       let prevSize := (← persistentEnvExtensionsRef.get).size
       let prevAttrSize ← getNumBuiltinAttributes
-      let newState ← PaperLean.importedExtensionState extDescr.name s.importedEntries env opts fun _ => extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+      let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
       let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := newState }
       if extDescr.name == `Lean.regularInitAttr then
         -- Run `[init]` attributes now. We do this after `setState` so `runInitAttrs` can access
@@ -2059,7 +2081,7 @@ where
         -- This branch is executed when `pExtDescrs[i]` is the extension associated with the `init` attribute, and
         -- a user-defined persistent extension is imported.
         -- Thus, we invoke `setImportedEntries` to update the array `importedEntries` with the entries for the new extensions.
-        env := env.setCheckedSync { env.base.private with extensions := (← PaperLean.setImportedEntriesHook env.base.private.extensions mods prevSize persistent fun _ => setImportedEntries env.base.private.extensions mods prevSize) }; PaperLean.prefetchImportedStates env opts prevSize persistent
+        env := env.setCheckedSync { env.base.private with extensions := (← setImportedEntries env.base.private.extensions mods prevSize) }
         -- See comment at `updateEnvAttributesRef`
         env ← updateEnvAttributes env
       loop (i + 1) env
@@ -2139,9 +2161,9 @@ abbrev ImportStateM := StateRefT ImportState IO
 
 private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
   let mFile ← findOLean mod
-  let main ← tryCatch (unsafe CompactedRegion.read (α := ModuleData) mFile #[]) fun e => do -- PaperLean: exists? only on failure
-    unless (← mFile.pathExists) do throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
-    throw e
+  unless (← mFile.pathExists) do
+    throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
+  let main ← unsafe CompactedRegion.read (α := ModuleData) mFile #[]
   if !main.1.isModule then
     return #[main]
   -- Opportunistically load all available parts.
@@ -2157,9 +2179,9 @@ private def readIRPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRe
   let irSigFile := mFile.withExtension "ir.sig"
   -- TODO: we don't (necessarily) know whether the module is a `module` or not, but file existence
   -- checks are not great in the face of module-ness changes
-  let some irSig ← tryCatch (some <$> unsafe CompactedRegion.read (α := ModuleData) irSigFile #[])
-      fun e => do if ← irSigFile.pathExists then throw e else return none
-    | return #[]
+  unless (← irSigFile.pathExists) do
+    return #[]
+  let irSig ← unsafe CompactedRegion.read (α := ModuleData) irSigFile #[]
   -- Opportunistically load all available parts.
   -- Necessary because the import level may be upgraded a later import.
   let irFile := mFile.withExtension "ir"
@@ -2361,15 +2383,248 @@ where
       p := body
     p.isProp
 
+/-- PaperLean: `finalizeImport` with PaperLean's hooks (below). -/
+@[extern "lean_paperlean_finalize_import"]
+private opaque finalizeImportFastOwned (s : ImportState) (imports : Array Import) (opts : Options)
+    (trustLevel : UInt32) (leakEnv loadExts : Bool) (level : OLeanLevel) (isModule loadIRSig : Bool) :
+    IO Environment
+
+-- (`s` is borrowed, so that the inferred calling convention stays upstream's)
+@[noinline] private def finalizeImportFast (s : @& ImportState) (imports : Array Import) (opts : Options)
+    (trustLevel : UInt32) (leakEnv loadExts : Bool) (level : OLeanLevel) (isModule loadIRSig : Bool) :
+    IO Environment :=
+  finalizeImportFastOwned s imports opts trustLevel leakEnv loadExts level isModule loadIRSig
+
 /--
 Constructs environment from `importModulesCore` results.
 
 See also `importModules` for parameter documentation.
 -/
-def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (trustLevel : UInt32 := 0)
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (trustLevel : UInt32 := 0)
     (leakEnv loadExts : Bool) (level := OLeanLevel.private) (isModule := level != .private)
     -- If true, prefer loading `.ir.sig` over `.ir` unless `import all`ed; used by leanir
     (loadIRSig := false) :
+    IO Environment :=
+  -- PaperLean: faster, where native code is available (`finalizeImportFast`)
+  (PaperLean.nativePath s).select
+    (finalizeImportFast s imports opts trustLevel leakEnv loadExts level isModule loadIRSig) do
+  let modules := s.moduleNames.filterMap (s.moduleNameMap[·]?)
+  let moduleData ← modules.mapM fun mod => do
+    let some data := mod.mainModule? |
+      throw <| IO.userError s!"missing data file for module {mod.module}"
+    return data
+  let irData ← modules.mapM fun mod => do
+    let some data := mod.irData? loadIRSig |
+      throw <| IO.userError s!"missing IR data file for module {mod.module}"
+    return data
+  let numPrivateConsts := moduleData.foldl (init := 0) fun numPrivateConsts data =>
+    numPrivateConsts + data.constants.size
+  let numExtraConsts := irData.foldl (init := 0) fun numExtraConsts data =>
+    numExtraConsts + data.extraConstNames.size
+  let numPublicConsts := modules.foldl (init := 0) fun numPublicConsts mod => Id.run do
+    if !mod.isExported then numPublicConsts else
+      let some data := mod.publicModule? | numPublicConsts
+      numPublicConsts + data.constants.size
+  let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts)
+  let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts)
+  let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts)
+  for h : modIdx in *...moduleData.size do
+    let data := moduleData[modIdx]
+    for cname in data.constNames, cinfo in data.constants do
+      match privateConstantMap.getThenInsertIfNew? cname cinfo with
+      | (cinfoPrev?, constantMap') =>
+        privateConstantMap := constantMap'
+        if let some cinfoPrev := cinfoPrev? then
+          -- Recall that the map has not been modified when `cinfoPrev? = some _`.
+          if subsumesInfo privateConstantMap cinfo cinfoPrev then
+            privateConstantMap := privateConstantMap.insert cname cinfo
+          else if !subsumesInfo privateConstantMap cinfoPrev cinfo then
+            throwAlreadyImported s const2ModIdx modIdx cname
+      const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+    if let some data := irData[modIdx]? then
+      for cname in data.extraConstNames do
+        const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+
+  if isModule then
+    for mod in modules.filter (·.isExported) do
+      let some data := mod.publicModule? | continue
+      for cname in data.constNames, cinfo in data.constants do
+        match publicConstantMap.getThenInsertIfNew? cname cinfo with
+        | (cinfoPrev?, constantMap') =>
+          publicConstantMap := constantMap'
+          if let some cinfoPrev := cinfoPrev? then
+            if subsumesInfo publicConstantMap cinfo cinfoPrev then
+              publicConstantMap := publicConstantMap.insert cname cinfo
+            -- no need to check for duplicates again, `privateConstMap` should be a superset
+
+  let exts ← mkInitialExtensionStates
+  let privateConstants : ConstMap := SMap.fromHashMap privateConstantMap false
+  let privateBase : Kernel.Environment := {
+    const2ModIdx, constants := privateConstants
+    quotInit        := !imports.isEmpty -- We assume `Init.Prelude` initializes quotient module
+    extensions      := exts
+    irBaseExts      := exts
+    header     := {
+      trustLevel, imports, moduleData, isModule
+      modules      := modules.map (·.toEffectiveImport)
+      regions      := modules.flatMap (·.parts.map (·.2)) ++ modules.flatMap (·.irParts.map (·.2))
+    }
+  }
+  let publicConstants : ConstMap := SMap.fromHashMap publicConstantMap false
+  let publicBase := { privateBase with constants := publicConstants, header.regions := #[] }
+  let extensions ← setImportedEntries privateBase.extensions moduleData
+  -- fall back to basic data when not in server
+  let serverData := modules.mapIdx (fun idx mod => mod.serverData? level |>.getD moduleData[idx]!)
+  let privateBase := { privateBase with
+    extensions
+    irBaseExts := (← setImportedEntries privateBase.extensions irData)
+  }
+  let mut env : Environment := {
+    base.private := privateBase
+    base.public  := publicBase
+    importRealizationCtx? := none
+    serverBaseExts := (← setImportedEntries privateBase.extensions serverData)
+  }
+  if leakEnv then
+    /- Mark persistent a first time before `finalizePersistentExtensions`, which
+       avoids costly MT markings when e.g. an interpreter closure (which
+       contains the environment) is put in an `IO.Ref`. This can happen in e.g.
+       initializers of user environment extensions and is wasteful because the
+       environment is marked persistent immediately afterwards anyway when the
+       constructed extension including the closure is ultimately stored in the
+       initialized constant. We have seen significant savings in `open Mathlib`
+       timings, where we have both a big environment and interpreted environment
+       extensions, from this. There is no significant extra cost to calling
+       `markPersistent` multiple times like this.
+
+       Safety: There are no concurrent accesses to `env` at this point. -/
+    env ← unsafe Runtime.markPersistent env
+  if loadExts then
+    env ← finalizePersistentExtensions env moduleData opts
+    if leakEnv then
+      /- Ensure the final environment including environment extension states is
+        marked persistent as documented.
+
+        Safety: There are no concurrent accesses to `env` at this point, assuming
+        extensions' `addImportFn`s did not spawn any unbound tasks. -/
+      env ← unsafe Runtime.markPersistent env
+  return { env with importRealizationCtx? := some {
+    -- safety: `RealizationContext` is private
+    env := unsafe unsafeCast env
+    opts
+    realizeMapRef := (← IO.mkRef {})
+  } }
+
+/-- PaperLean: `importModules` with PaperLean's faster import (below). -/
+@[extern "lean_paperlean_import_modules_fast"]
+private opaque importModulesFast (imports : Array Import) (opts : Options) (trustLevel : UInt32)
+    (plugins : Array Plugin) (leakEnv loadExts : Bool) (level : OLeanLevel)
+    (arts : NameMap ImportArtifacts) : IO Environment
+
+/--
+Creates environment object from given imports.
+
+If `leakEnv` is true, we mark the environment as persistent, which means it will not be freed. We
+set this when the object would survive until the end of the process anyway. In exchange, RC updates
+are avoided, which is especially important when they would be atomic because the environment is
+shared across threads (potentially, storing it in an `IO.Ref` is sufficient for marking it as such).
+
+If `loadExts` is true, we initialize the environment extensions using the imported data. Doing so
+may use the interpreter and thus is only safe to do after calling `enableInitializersExecution`; see
+also caveats there. If not set, every extension will have its initial value as its state. While the
+environment's constant map can be accessed without `loadExts`, many functions that take
+`Environment` or are in a monad carrying it such as `CoreM` may not function properly without it.
+
+If `level` is `exported`, the module to be elaborated is assumed to be participating in the module
+system and imports will be restricted accordingly. If it is `server`, the data for
+`getModuleEntries (includeServer := true)` is loaded as well. If it is `private`, all data is loaded
+as if no `module` annotations were present in the imports.
+-/
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32 := 0)
+    (plugins : Array Plugin := #[]) (leakEnv := false) (loadExts := false)
+    (level := OLeanLevel.private) (arts : NameMap ImportArtifacts := {})
+    : IO Environment :=
+  -- PaperLean: faster, where native code is available (`importModulesFast`)
+  (PaperLean.nativePath imports).select
+    (importModulesFast imports opts trustLevel plugins leakEnv loadExts level arts) <|
+  profileitIO "import" opts do
+  for imp in imports do
+    if imp.module matches .anonymous then
+      throw <| IO.userError "import failed, trying to import module with anonymous name"
+  withImporting do
+    plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
+    let (_, s) ← importModulesCore (globalLevel := level) imports arts |>.run
+    finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
+      s imports opts trustLevel
+
+/--
+Creates environment object from imports and frees compacted regions after calling `act`. No live
+references to the environment object or imported objects may exist after `act` finishes. As this
+cannot be ruled out after loading environment extensions, `importModules`'s `loadExts` is always
+unset using this function.
+-/
+unsafe def withImportModules {α : Type} (imports : Array Import) (opts : Options)
+    (act : Environment → IO α) (trustLevel : UInt32 := 0) : IO α := do
+  let env ← importModules (loadExts := false) imports opts trustLevel
+  try act env finally env.freeRegions
+
+@[inherit_doc Kernel.Environment.enableDiag]
+def Kernel.enableDiag (env : Lean.Environment) (flag : Bool) : Lean.Environment :=
+  env.modifyCheckedAsync (·.enableDiag flag)
+
+def Kernel.isDiagnosticsEnabled (env : Lean.Environment) : Bool :=
+  env.base.private.isDiagnosticsEnabled
+
+def Kernel.resetDiag (env : Lean.Environment) : Lean.Environment :=
+  env.modifyCheckedAsync (·.resetDiag)
+
+def Kernel.getDiagnostics (env : Lean.Environment) : Diagnostics :=
+  env.checked.get.diagnostics
+
+def Kernel.setDiagnostics (env : Lean.Environment) (diag : Diagnostics) : Lean.Environment :=
+  env.modifyCheckedAsync (·.setDiagnostics diag)
+
+/-! PaperLean: the import with PaperLean's hooks, after the upstream functions above, whose
+specializations these reuse, so that those keep the code and the names of official Lean's. -/
+
+/-- `finalizePersistentExtensions` with PaperLean's hooks; `persistent` is as in `finalizeImportFast`. -/
+private partial def finalizePersistentExtensionsFast (env : Environment) (mods : Array ModuleData) (opts : Options) (persistent : Bool) : IO Environment := do
+  PaperLean.prefetchImportedStates env opts 0 persistent; try loop 0 env finally PaperLean.dropPrefetchedStates env
+where
+  loop (i : Nat) (env : Environment) : IO Environment := do
+    -- Recall that the size of the array stored `persistentEnvExtensionRef` may increase when we import user-defined environment extensions.
+    let pExtDescrs ← persistentEnvExtensionsRef.get
+    if h : i < pExtDescrs.size then
+      let extDescr := pExtDescrs[i]
+      -- Use `sync` to avoid `async` checks; there is only one environment branch at this point
+      -- anyway.
+      let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
+      let prevSize := (← persistentEnvExtensionsRef.get).size
+      let prevAttrSize ← getNumBuiltinAttributes
+      let newState ← PaperLean.importedExtensionState extDescr.name s.importedEntries env opts fun _ => extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+      let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := newState }
+      if extDescr.name == `Lean.regularInitAttr then
+        -- Run `[init]` attributes now. We do this after `setState` so `runInitAttrs` can access
+        -- `getModule(IR)Entries` but we should also do it before attempting to run user-defined
+        -- extensions further down in `pExtDescrs` so they can access initialized declarations.
+        runInitAttrs env opts
+      env ← ensureExtensionsArraySize env
+      if (← persistentEnvExtensionsRef.get).size > prevSize || (← getNumBuiltinAttributes) > prevAttrSize then
+        -- This branch is executed when `pExtDescrs[i]` is the extension associated with the `init` attribute, and
+        -- a user-defined persistent extension is imported.
+        -- Thus, we invoke `setImportedEntries` to update the array `importedEntries` with the entries for the new extensions.
+        env := env.setCheckedSync { env.base.private with extensions := (← PaperLean.setImportedEntriesHook env.base.private.extensions mods prevSize persistent fun _ => setImportedEntries env.base.private.extensions mods prevSize) }; PaperLean.prefetchImportedStates env opts prevSize persistent
+        -- See comment at `updateEnvAttributesRef`
+        env ← updateEnvAttributes env
+      loop (i + 1) env
+    else
+      return env
+
+@[export lean_paperlean_finalize_import]
+private def PaperLean.finalizeImportFastImpl (s : ImportState) (imports : Array Import) (opts : Options)
+    (trustLevel : UInt32) (leakEnv loadExts : Bool) (level : OLeanLevel) (isModule loadIRSig : Bool):
     IO Environment := do
   let modules := s.moduleNames.filterMap (s.moduleNameMap[·]?)
   let moduleData ← modules.mapM fun mod => do
@@ -2390,7 +2645,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
       numPublicConsts + PaperLean.moduleDataNumConstants data
   let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts); let fast? : Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name)) ← PaperLean.privateConstantMaps? moduleData irData numPrivateConsts (numPrivateConsts + numExtraConsts) leakEnv
   let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts); let check := (← PaperLean.importMode) == 2; let fold := fast?.isNone || check
-  let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts); let fastPublic? : Option (Std.HashMap Name ConstantInfo) ← PaperLean.publicConstantMap? modules numPublicConsts isModule leakEnv
+  let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts); let fastPublic? : Option (Std.HashMap Name ConstantInfo) ← PaperLean.publicConstantMap? modules numPublicConsts isModule (leakEnv && !fast?.any (·.2.2.isSome))
   for h : modIdx in *...moduleData.size do
     let data := moduleData[modIdx]; if !fold then break
     for cname in data.constNames, cinfo in data.constants do
@@ -2463,7 +2718,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env; PaperLean.importTimingMark "markPersistent.1"
   if loadExts then
-    env ← finalizePersistentExtensions env moduleData opts (persistent := leakEnv)
+    env ← finalizePersistentExtensionsFast env moduleData opts leakEnv
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.
@@ -2478,64 +2733,18 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     realizeMapRef := (← IO.mkRef {})
   } }
 
-/--
-Creates environment object from given imports.
-
-If `leakEnv` is true, we mark the environment as persistent, which means it will not be freed. We
-set this when the object would survive until the end of the process anyway. In exchange, RC updates
-are avoided, which is especially important when they would be atomic because the environment is
-shared across threads (potentially, storing it in an `IO.Ref` is sufficient for marking it as such).
-
-If `loadExts` is true, we initialize the environment extensions using the imported data. Doing so
-may use the interpreter and thus is only safe to do after calling `enableInitializersExecution`; see
-also caveats there. If not set, every extension will have its initial value as its state. While the
-environment's constant map can be accessed without `loadExts`, many functions that take
-`Environment` or are in a monad carrying it such as `CoreM` may not function properly without it.
-
-If `level` is `exported`, the module to be elaborated is assumed to be participating in the module
-system and imports will be restricted accordingly. If it is `server`, the data for
-`getModuleEntries (includeServer := true)` is loaded as well. If it is `private`, all data is loaded
-as if no `module` annotations were present in the imports.
--/
-def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32 := 0)
-    (plugins : Array Plugin := #[]) (leakEnv := false) (loadExts := false)
-    (level := OLeanLevel.private) (arts : NameMap ImportArtifacts := {})
-    : IO Environment := PaperLean.uncountedHeartbeats <| profileitIO "import" opts do
+@[export lean_paperlean_import_modules_fast]
+private def importModulesFastImpl (imports : Array Import) (opts : Options) (trustLevel : UInt32)
+    (plugins : Array Plugin) (leakEnv loadExts : Bool) (level : OLeanLevel)
+    (arts : NameMap ImportArtifacts) : IO Environment :=
+  PaperLean.uncountedHeartbeats <| profileitIO "import" opts do
   for imp in imports do
     if imp.module matches .anonymous then
       throw <| IO.userError "import failed, trying to import module with anonymous name"
   withImporting do
     plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
     let s ← PaperLean.importModulesHook imports level.ctorIdx.toUInt8 arts fun _ => do return (← importModulesCore (globalLevel := level) imports arts |>.run).2
-    finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
-      s imports opts trustLevel
-
-/--
-Creates environment object from imports and frees compacted regions after calling `act`. No live
-references to the environment object or imported objects may exist after `act` finishes. As this
-cannot be ruled out after loading environment extensions, `importModules`'s `loadExts` is always
-unset using this function.
--/
-unsafe def withImportModules {α : Type} (imports : Array Import) (opts : Options)
-    (act : Environment → IO α) (trustLevel : UInt32 := 0) : IO α := do
-  let env ← importModules (loadExts := false) imports opts trustLevel
-  try act env finally env.freeRegions
-
-@[inherit_doc Kernel.Environment.enableDiag]
-def Kernel.enableDiag (env : Lean.Environment) (flag : Bool) : Lean.Environment :=
-  env.modifyCheckedAsync (·.enableDiag flag)
-
-def Kernel.isDiagnosticsEnabled (env : Lean.Environment) : Bool :=
-  env.base.private.isDiagnosticsEnabled
-
-def Kernel.resetDiag (env : Lean.Environment) : Lean.Environment :=
-  env.modifyCheckedAsync (·.resetDiag)
-
-def Kernel.getDiagnostics (env : Lean.Environment) : Diagnostics :=
-  env.checked.get.diagnostics
-
-def Kernel.setDiagnostics (env : Lean.Environment) (diag : Diagnostics) : Lean.Environment :=
-  env.modifyCheckedAsync (·.setDiagnostics diag)
+    PaperLean.finalizeImportFastImpl s imports opts trustLevel leakEnv loadExts level (level != .private) false
 
 namespace Environment
 
@@ -2598,7 +2807,12 @@ such as in `#eval`.
 @[noinline] unsafe def evalConst (α) (env : @& Environment) (opts : @& Options) (constName : @& Name) (checkMeta := true) : Except String α := do
   if checkMeta then
     evalCheckMeta env constName
-  evalConstCore α env opts constName
+  let r := evalConstCore α env opts constName
+  -- PaperLean: code that Lean's own elaborators evaluate makes a recording of environment accesses
+  -- unusable (`Lean.PaperLean.EnvDeps`)
+  if PaperLean.envRecording constName then
+    PaperLean.envMarkUnusable "evaluated code" r
+  else r
 
 private def throwUnexpectedType {α} (typeName : Name) (constName : Name) : ExceptT String Id α :=
   throw ("unexpected type at '" ++ toString constName ++ "', `" ++ toString typeName ++ "` expected")
@@ -2701,7 +2915,8 @@ def hasUnsafe (env : Environment) (e : Expr) : Bool :=
     | _ => false;
   c?.isSome
 
-private def realizeValueCore [BEq α] [Hashable α] [TypeName α] (env : Environment) (forConst : Name) (key : α)
+/-- Plumbing function for `Lean.Meta.realizeValue`; see documentation there. -/
+def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forConst : Name) (key : α)
     (realize : Environment → Options → BaseIO Dynamic) : IO Dynamic := do
   -- the following code is inherently non-deterministic in number of heartbeats, reset them at the
   -- end
@@ -2759,27 +2974,6 @@ private structure RealizeConstKey where
   constName : Name
 deriving BEq, Hashable, TypeName
 
-
--- PaperLean: a realized value is computed in the realization context of `forConst`, not from the
--- environment that a recording of environment accesses (`Lean.PaperLean.EnvDeps`) is about, and
--- whether this thread computes it or finds it computed depends on timing; so it is not recorded
--- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's)
-@[noinline] private def realizeValueUnrecorded (instBEq : @& BEq α) (instHashable : @& Hashable α)
-    (instTypeName : @& TypeName α) (env : @& Environment) (forConst : @& Name) (key : @& α)
-    (realize : @& Environment → Options → BaseIO Dynamic) : IO Dynamic :=
-  have := instBEq; have := instHashable; have := instTypeName
-  do
-    let paused ← PaperLean.envPause
-    try realizeValueCore env forConst key realize finally PaperLean.envResume paused
-
-/-- Plumbing function for `Lean.Meta.realizeValue`; see documentation there. -/
-def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forConst : Name) (key : α)
-    (realize : Environment → Options → BaseIO Dynamic) : IO Dynamic :=
-  if PaperLean.envRecording forConst then
-    realizeValueUnrecorded inferInstance inferInstance inferInstance env forConst key realize
-  else
-    realizeValueCore env forConst key realize
-
 /-- Realization results, to be replayed onto other branches. -/
 private structure RealizeConstResult where
   newConsts : VisibilityMap (List AsyncConst)
@@ -2787,10 +2981,18 @@ private structure RealizeConstResult where
   dyn : Dynamic
 deriving Nonempty, TypeName
 
-/-- Plumbing function for `Lean.Meta.realizeConst`; see documentation there. -/
-def realizeConst (env : Environment) (forConst : Name) (constName : Name)
+/-- PaperLean: `realizeConst` while this thread records environment accesses (below). -/
+@[extern "lean_paperlean_realize_const_recorded"]
+private opaque realizeConstRecorded (env : Environment) (forConst : Name) (constName : Name)
     (realize : Environment → Options → BaseIO (Environment × Dynamic)) :
-    IO (Environment × Task (Option Kernel.Exception) × Dynamic) := do
+    IO (Environment × Task (Option Kernel.Exception) × Dynamic)
+
+/-- Plumbing function for `Lean.Meta.realizeConst`; see documentation there. -/
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def realizeConst (env : Environment) (forConst : Name) (constName : Name)
+    (realize : Environment → Options → BaseIO (Environment × Dynamic)) :
+    IO (Environment × Task (Option Kernel.Exception) × Dynamic) :=
+  (PaperLean.recordingPath forConst).select (realizeConstRecorded env forConst constName realize) do
   let res ← env.realizeValue forConst { constName : RealizeConstKey } fun realizeEnv realizeOpts => do
     -- ensure that environment extension modifications know they are in an async context
     let realizeEnv := realizeEnv.enterAsyncRealizing constName
@@ -2862,6 +3064,23 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
         allRealizations.insert c.constInfo.name c
   }
   return (env, exPromise.result?, res.dyn)
+
+/-- PaperLean: a realized value is computed in the realization context of `forConst`, not from the
+environment that a recording of environment accesses (`Lean.PaperLean.EnvDeps`) is about, and whether
+this thread computes it or finds it computed depends on timing; so it is not recorded. The recording
+is then unusable, as the realization changes the environment. -/
+@[export lean_paperlean_realize_const_recorded]
+private def realizeConstRecordedImpl (env : Environment) (forConst : Name) (constName : Name)
+    (realize : Environment → Options → BaseIO (Environment × Dynamic)) :
+    IO (Environment × Task (Option Kernel.Exception) × Dynamic) := do
+  -- (`realizeValue` counts no heartbeats, and the pause neither)
+  let heartbeats ← IO.getNumHeartbeats
+  let paused ← PaperLean.envPause
+  try realizeConst env forConst constName realize
+  finally
+    PaperLean.envResume paused
+    PaperLean.setHeartbeats heartbeats
+    PaperLean.envMarkUnusableIO "a realization of a constant"
 
 end Environment
 

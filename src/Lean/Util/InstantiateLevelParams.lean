@@ -29,12 +29,6 @@ private def getParamSubst : List Name → List Level → Name → Option Level
   | p::ps, u::us, p' => if p == p' then some u else getParamSubst ps us p'
   | _,     _,     _  => none
 
-/-- The `const` and `sort` case of `instantiateLevelParamsCore.replaceFn`, for
-`instantiateLevelParamsNative`. -/
-@[export lean_paperlean_inst_lparams_leaf]
-private def instantiateLevelParamsLeaf (e : Expr) (paramNames : List Name) (lvls : List Level) : Expr :=
-  (instantiateLevelParamsCore.replaceFn (getParamSubst paramNames lvls) e).getD e
-
 /-- `instantiateLevelParamsCore (getParamSubst paramNames lvls) e`, computed by the same traversal
 in native code, which calls back `instantiateLevelParamsLeaf` only for `const` and `sort` nodes with
 level parameters. -/
@@ -79,4 +73,10 @@ def instantiateLevelParamsArray (e : Expr) (paramNames : Array Name) (lvls : Arr
   if paramNames.isEmpty || lvls.isEmpty then e else
     e.instantiateLevelParamsCore fun p =>
       getParamSubstArray paramNames lvls p 0
+
+/-- The `const` and `sort` case of `instantiateLevelParamsCore.replaceFn`, for
+`instantiateLevelParamsNative`. -/
+@[export lean_paperlean_inst_lparams_leaf]
+private def instantiateLevelParamsLeaf (e : Expr) (paramNames : List Name) (lvls : List Level) : Expr :=
+  (instantiateLevelParamsCore.replaceFn (getParamSubst paramNames lvls) e).getD e
 -- Modified by PaperLean.

@@ -46,9 +46,6 @@ void import_timing_mark(char const * phase);
 bool import_legacy_mode();
 // `PAPERLEAN_IMPORT=check`
 bool import_check_mode();
-// `PAPERLEAN_HEARTBEATS=lean`: the optimizations that lower heartbeat counts while elaborating (native
-// libraries, the interpreters' shared entries) are off, so that counts are Lean's.
-bool lean_heartbeats_mode();
 void import_timing_add(import_counter c, uint64_t ns);
 
 // Adds the wall time of its scope to a counter if import timing is enabled.

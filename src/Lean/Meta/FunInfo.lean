@@ -8,6 +8,7 @@ module
 prelude
 public import Lean.Meta.InferType
 import Init.Data.Range.Polymorphic.Iterators
+import Lean.PaperLean.Base
 
 public section
 
@@ -134,13 +135,69 @@ private def getFunInfoAux (fn : Expr) (maxArgs? : Option Nat) : MetaM FunInfo :=
         paramInfo := updateHasFwdDeps paramInfo resultDeps
         return { resultDeps, paramInfo }
 
-def getFunInfo (fn : Expr) (maxArgs? : Option Nat := none) : MetaM FunInfo :=
-  getFunInfoAux fn maxArgs?
+/-- PaperLean: `k`, `checkFunInfoCache fn maxArgs?`, with its lookup in the cache and its insertion
+recorded for this thread's recording (`PaperLean.noteCache`), counting no heartbeats for that. -/
+private def noteFunInfoCache (fn : Expr) (maxArgs? : Option Nat) (k : MetaM FunInfo) :
+    MetaM FunInfo := do
+  let heartbeats ← IO.getNumHeartbeats
+  let key ← mkInfoCacheKey fn maxArgs?
+  let found? := (← get).cache.funInfo.find? key
+  PaperLean.noteCache 1 0 key found?
+  PaperLean.setHeartbeats heartbeats
+  let info ← k
+  if found?.isNone then
+    let heartbeats ← IO.getNumHeartbeats
+    if let some info := (← get).cache.funInfo.find? key then
+      PaperLean.noteCache 1 1 key info
+    PaperLean.setHeartbeats heartbeats
+  return info
 
-def getFunInfoNArgs (fn : Expr) (nargs : Nat) : MetaM FunInfo :=
-  getFunInfoAux fn (some nargs)
+/-- PaperLean: `env.areRealizationsEnabledForConst c`, recorded if this thread records
+(`EnvAccess.realizations`), counting no heartbeats. An imported constant always has them. (Not in
+`Lean.PaperLean.EnvDeps`, whose imports, here, would change the order of the extensions in `.olean`
+files.) -/
+private def realizationsEnabled (env : Environment) (c : Name) : BaseIO Bool := do
+  let heartbeats ← IO.getNumHeartbeats
+  let enabled := env.areRealizationsEnabledForConst c
+  unless env.isImportedConst c do
+    let check : Environment → Name → List OpenDecl → Bool := fun env' _ _ =>
+      env'.areRealizationsEnabledForConst c == enabled
+    PaperLean.envRecordAll #[.realizations c] #[unsafe unsafeCast check]
+  PaperLean.setHeartbeats heartbeats
+  return enabled
+
+/-- PaperLean: `getFunInfoAux`, recorded while this thread records environment accesses
+(`Lean.PaperLean.TCCache` repeats a search's operations on the cache when it reuses the search). A
+value that `checkFunInfoCache` realizes is computed from the realization context of the constant, not
+from the environment that the recording is about, and whether this thread computes it or finds it
+computed depends on timing; so it is not recorded. Before the realizations of the constant are
+enabled, the value is computed here, taking names from the caller's generator, and it is. -/
+private def getFunInfoRecorded (fn : Expr) (maxArgs? : Option Nat) : MetaM FunInfo :=
+  noteFunInfoCache fn maxArgs? do
+    if let .const c ls := fn then
+      unless ls.any (·.hasMVar) do
+        if ← realizationsEnabled (← getEnv) c then
+          -- (the realization counts no heartbeats, and the pause neither)
+          let heartbeats ← IO.getNumHeartbeats
+          let paused ← PaperLean.envPause
+          try
+            return (← getFunInfoAux fn maxArgs?)
+          finally
+            PaperLean.envResume paused
+            PaperLean.setHeartbeats heartbeats
+    getFunInfoAux fn maxArgs?
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def getFunInfo (fn : Expr) (maxArgs? : Option Nat := none) : MetaM FunInfo :=
+  (PaperLean.recordingPath fn).select (getFunInfoRecorded fn maxArgs?) (getFunInfoAux fn maxArgs?)
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def getFunInfoNArgs (fn : Expr) (nargs : Nat) : MetaM FunInfo :=
+  (PaperLean.recordingPath fn).select (getFunInfoRecorded fn (some nargs))
+    (getFunInfoAux fn (some nargs))
 
 def FunInfo.getArity (info : FunInfo) : Nat :=
   info.paramInfo.size
 
 end Lean.Meta
+-- Modified by PaperLean.

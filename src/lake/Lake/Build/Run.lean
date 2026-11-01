@@ -12,6 +12,8 @@ import Lake.Build.Job.Monad
 import Lake.Build.Index
 import Init.Omega
 import Lake.PaperLean.BuildData
+import Lake.PaperLean.Schedule
+import Lake.PaperLean.HashCache
 
 /-! # Build Runner
 
@@ -454,17 +456,24 @@ public def Workspace.checkNoBuild
   return result.isOk -- `isOk` means no failures, and thus no `--no-build` failures
 
 /-- Run a build function in the Workspace's context and await the result. -/
-public def Workspace.runBuild
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def Workspace.runBuild
   (ws : Workspace) (build : FetchM (Job α)) (cfg : BuildConfig := {})
 : IO α := do
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
+  -- PaperLean: under `paperlean build`, the order of compiles and the record of `.hash` files read
+  -- (`Lake.PaperLean.Schedule`, `Lake.PaperLean.HashCache`)
+  PaperLean.Schedule.start ws.dir
+  PaperLean.HashCache.start ws.dir
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
   -- PaperLean: the packs written during the build are not needed after it (`Lake.PaperLean.BuildData`)
   PaperLean.BuildData.finish
+  PaperLean.Schedule.finish
+  PaperLean.HashCache.finish
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/

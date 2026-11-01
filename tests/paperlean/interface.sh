@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests that code compiled against the library calls upstream functions that PaperLean changed as it
 # calls them in official Lean 4.35.0-rc3: the calling conventions recorded in the library's `.olean`
 # files (IR signatures with borrow flags) are upstream's, also for the functions with hooks that

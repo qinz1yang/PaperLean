@@ -1,9 +1,12 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests native libraries of packages (`PAPERLEAN_NATIVE_LIBS`, `src/paperlean/native_libs.cpp`): an
 # import uses a library's native code only for imported modules served from an olean pack whose
 # files are those of the library's manifest, and the output is that of interpreting them; the module
 # being compiled is interpreted; changed, shadowed or damaged inputs disable the library.
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK PAPERLEAN_NATIVE_LIBS
+cp native_helper.lean "$TMP_DIR/"
 SRC="$TMP_DIR/src"
 LIB="$TMP_DIR/lib"
 mkdir -p "$SRC" "$LIB"
@@ -41,15 +44,6 @@ def main (args : List String) : IO Unit := do
   let n ← Lean.PaperLean.OLeanPack.create #[args[1]!] args[0]!
   IO.println s!"packed: {decide (n > 0)}"
 END
-# manifest.lean <manifest> <library> <directory of the `.c` files> <module>...
-cat > "$TMP_DIR/manifest.lean" <<'END'
-import Lean.PaperLean.NativeLibs
-def main (args : List String) : IO Unit := do
-  Lean.initSearchPath (← Lean.findSysroot)
-  let mods := (args.drop 3).map fun m => (m.toName, s!"{args[2]!}/{m}.c")
-  Lean.PaperLean.writeNativeManifest args[0]! args[1]! #[] mods.toArray
-  IO.println "manifest written"
-END
 
 # Compiles modules to `.olean` (and `.c` with `-c`) files.
 compile() {
@@ -72,7 +66,7 @@ link() {
 }
 # manifest <manifest> <library> <module>...
 manifest() {
-  capture env LEAN_PATH="$LIB" lean --run "$TMP_DIR/manifest.lean" "$1" "$2" "$TMP_DIR" "${@:3}"
+  capture env LEAN_PATH="$LIB" lean --run "$TMP_DIR/native_helper.lean" manifest "$1" "$2" "$TMP_DIR" "${@:3}"
   check_out_contains "manifest written"
 }
 pack() {
@@ -96,10 +90,6 @@ cp "$CAPTURED.out.produced" "$TMP_DIR/UseN.expected"
 capture env LEAN_PATH="$LIB" "${NATIVE[@]}" lean UseN.lean
 check_out_contains "paperlean-timing native libs=1 modules=2"
 expect_output UseN "$TMP_DIR/UseN.expected" "with the native library"
-# `PAPERLEAN_HEARTBEATS=lean` turns native code off, so that heartbeats are counted as by Lean.
-capture env LEAN_PATH="$LIB" "${NATIVE[@]}" PAPERLEAN_HEARTBEATS=lean lean UseN.lean
-if grep -q "native libs=" "$CAPTURED.out.produced"; then fail "native code is used with PAPERLEAN_HEARTBEATS=lean"; fi
-expect_output UseN "$TMP_DIR/UseN.expected" "with PAPERLEAN_HEARTBEATS=lean"
 # `check` compares with the legacy import, which reads the packed files from the pack as well
 capture env LEAN_PATH="$LIB" "${NATIVE[@]}" PAPERLEAN_IMPORT=check lean UseN.lean
 check_out_contains "paperlean-timing native libs=1 modules=2"
@@ -136,12 +126,15 @@ pack
 capture env LEAN_PATH="$LIB" "${NATIVE[@]}" lean UseN.lean
 check_out_contains "paperlean-timing native libs=1 modules=2"
 check_out_contains "111"
-# The module being compiled, which the library also contains, is interpreted.
-capture env LEAN_PATH="$LIB" lean N1.lean
-cp "$CAPTURED.out.produced" "$TMP_DIR/N1.expected"
-check_out_contains "10"
-capture env LEAN_PATH="$LIB" "${NATIVE[@]}" lean N1.lean
-expect_output N1 "$TMP_DIR/N1.expected" "with the library of another version"
+# The module being compiled, which the library also contains, is interpreted, also where the library
+# serves what it imports: `N2` is changed (the library's says 100), and its import uses the library
+# (`nf 3` is the first version's 7).
+mkdir "$TMP_DIR/edited"
+printf 'import N1\ndef ng (n : Nat) : Nat := nf n + 200\n#eval ng 3\n' > "$TMP_DIR/edited/N2.lean"
+capture env LEAN_PATH="$LIB" "${NATIVE[@]}" lean -R "$TMP_DIR/edited" "$TMP_DIR/edited/N2.lean"
+check_out_matches "paperlean-timing native libs=1 .*verified=[1-9]"
+{ grep -v "^paperlean-" "$CAPTURED.out.produced" || true; } > "$TMP_DIR/N2.out"
+[ "$(cat "$TMP_DIR/N2.out")" = 207 ] || fail "N2 in the library, not the one being compiled, ran: $(cat "$TMP_DIR/N2.out")"
 
 # After a change of N1, the library no longer matches and is not used.
 compile N1 N2
@@ -222,3 +215,177 @@ capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/n.paperlean" PAPERLEAN_NA
   PAPERLEAN_IMPORT_TIMING=1 lean UseB.lean
 check_out_contains "paperlean-timing native libs=0 modules=0 meta=0"
 expect_output UseB "$TMP_DIR/UseB.expected" "with a runtime initializer that initializes declarations"
+# A module whose runtime initializer initializes declarations that its `meta` code does not use (the
+# manifest records that from its `.c` file): its `meta` code is used, with the same output.
+cat > MC.lean <<'END'
+module
+public def mcTable : Array Nat := (List.range 5).toArray.map (· * 3)
+public meta def mcf (n : Nat) : Nat := n + 9
+END
+cat > UseC.lean <<'END'
+module
+import MC
+#eval mcf 1
+END
+run env LEAN_PATH="$LIB" lean -Dcompiler.postponeCompile=false -o "$LIB/MC.olean" -i "$LIB/MC.ilean" -c "$TMP_DIR/MC.c" MC.lean
+awk '/^LEAN_EXPORT lean_object\* runtime_initialize_/,/^}/' "$TMP_DIR/MC.c" | grep -q "mcTable = " ||
+  fail "MC's runtime initializer initializes no declaration; the test does not test this"
+link "$TMP_DIR/libc.so" MC
+manifest "$TMP_DIR/libc.paperlean" "$TMP_DIR/libc.so" MC
+pack
+capture env LEAN_PATH="$LIB" lean UseC.lean
+check_out_contains "10"
+cp "$CAPTURED.out.produced" "$TMP_DIR/UseC.expected"
+capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/n.paperlean" PAPERLEAN_NATIVE_LIBS="$TMP_DIR/libc.paperlean" \
+  PAPERLEAN_IMPORT_TIMING=1 lean UseC.lean
+check_out_contains "paperlean-timing native libs=1 modules=0 meta=1"
+expect_output UseC "$TMP_DIR/UseC.expected" "with a runtime initializer that initializes declarations that meta code does not use"
+
+# The compile-time initializer of a module that comes before one of its indirect imports in the
+# import order (P2's private import P1 is imported only after P2): whether it may run before the
+# compile-time initializers of those that the manifest says what it runs. P2's initializes a
+# declaration with P2's own code and Lean's, so P2's native code is used; P3's calls P1's code, which
+# may need P1's initializer, so P3 is interpreted. The output is the same.
+cat > P1.lean <<'END'
+module
+public structure P1S where
+  x : Nat
+  h : x = x := by rfl
+@[noinline] public meta def p1f (n : Nat) : Nat := n + 1
+END
+cat > P2.lean <<'END'
+module
+import P1
+public structure P2S where
+  y : Nat
+  h : y = y := by rfl
+END
+cat > P3.lean <<'END'
+module
+import P1
+meta def p3c : Nat := p1f 2
+public def p3 : Nat := 3
+END
+cat > UseP.lean <<'END'
+module
+import P2
+import P3
+import P1
+def s : P2S := { y := 3 }
+#check p3
+#eval s.y
+END
+compile -c P1 P2 P3
+link "$TMP_DIR/libp.so" P1 P2 P3
+manifest "$TMP_DIR/libp.paperlean" "$TMP_DIR/libp.so" P1 P2 P3
+pack
+capture env LEAN_PATH="$LIB" lean UseP.lean
+check_out_contains "3"
+cp "$CAPTURED.out.produced" "$TMP_DIR/UseP.expected"
+capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/n.paperlean" PAPERLEAN_NATIVE_LIBS="$TMP_DIR/libp.paperlean" \
+  PAPERLEAN_IMPORT_TIMING=1 lean UseP.lean
+check_out_contains "paperlean-timing native libs=1 modules=0 meta=2 verified=3 importsNotUsed=0 initOrder=1"
+expect_output UseP "$TMP_DIR/UseP.expected" "with compile-time initializers before those of indirect imports"
+
+# Native functions that the interpreter calls through their boxed versions (scalar parameters or
+# results), which it looks up only for declarations whose IR has one, and through their unboxed
+# versions, from a module whose native code is used and from one whose code is not (G2's library
+# is of another version of G2).
+cat > G1.lean <<'END'
+@[noinline] def gScale (x : UInt64) (b : Bool) : UInt64 := if b then x * 2 else x + 1
+@[noinline] def gList (n : Nat) : List Nat := List.range n
+@[noinline] def gFloat (x : Float) : Float := x * 1.5
+END
+cat > G2.lean <<'END'
+import G1
+@[noinline] def gBoth (x : UInt64) : UInt64 := gScale x true + gScale x false
+END
+cat > UseG.lean <<'END'
+import G2
+#eval gScale 21 true
+#eval gBoth 5
+#eval gList 4
+#eval gFloat 2.0
+#eval (List.range 50).foldl (fun a n => a + gScale n.toUInt64 (n % 2 == 0)) 0
+END
+compile -c G1 G2
+link "$TMP_DIR/libg.so" G1 G2
+manifest "$TMP_DIR/libg.paperlean" "$TMP_DIR/libg.so" G1 G2
+perl -pi -e 's/gScale x false/gScale x false + 1/' G2.lean
+compile G2
+pack
+capture env LEAN_PATH="$LIB" lean UseG.lean
+check_out_contains "42"
+cp "$CAPTURED.out.produced" "$TMP_DIR/UseG.expected"
+capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/n.paperlean" PAPERLEAN_NATIVE_LIBS="$TMP_DIR/libg.paperlean" \
+  PAPERLEAN_IMPORT_TIMING=1 lean UseG.lean
+check_out_contains "paperlean-timing native libs=1 modules=1"
+expect_output UseG "$TMP_DIR/UseG.expected" "calling native functions through their boxed versions"
+
+# A module imported for run time only whose private import is not imported at all: its native code is
+# used if its compile-time initializer runs only its own code and Lean's (Q2's), not otherwise (Q3's
+# calls Q1's code).
+cat > Q1.lean <<'END'
+module
+@[noinline] public meta def q1f (n : Nat) : Nat := n + 1
+public def q1 : Nat := 1
+END
+cat > Q2.lean <<'END'
+module
+import Q1
+public structure Q2S where
+  y : Nat
+  h : y = y := by rfl
+public meta def q2f (n : Nat) : Nat := n + 2
+END
+cat > Q3.lean <<'END'
+module
+import Q1
+meta def q3c : Nat := q1f 2
+public meta def q3f (n : Nat) : Nat := n + 3
+END
+cat > UseQ.lean <<'END'
+module
+import Q2
+import Q3
+def s : Q2S := { y := 3 }
+#eval q2f s.y
+#eval q3f 1
+END
+compile -c Q1 Q2 Q3
+link "$TMP_DIR/libq.so" Q1 Q2 Q3
+manifest "$TMP_DIR/libq.paperlean" "$TMP_DIR/libq.so" Q1 Q2 Q3
+pack
+capture env LEAN_PATH="$LIB" lean UseQ.lean
+check_out_contains "5"
+cp "$CAPTURED.out.produced" "$TMP_DIR/UseQ.expected"
+capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/n.paperlean" PAPERLEAN_NATIVE_LIBS="$TMP_DIR/libq.paperlean" \
+  PAPERLEAN_IMPORT_TIMING=1 lean UseQ.lean
+check_out_contains "paperlean-timing native libs=1 modules=0 meta=1 verified=2 importsNotUsed=1"
+expect_output UseQ "$TMP_DIR/UseQ.expected" "with a private import that is not imported"
+
+# `meta` declarations with `@[export]` names, public and private: the manifest records their export
+# names (copies of the module data's strings, which the regions free), and their code is used.
+cat > XE.lean <<'END'
+module
+@[export lean_paperlean_test_xe_pub] public meta def xePub (n : Nat) : Nat := n * 10
+@[export lean_paperlean_test_xe_priv] meta def xePriv (n : Nat) : Nat := n * 100
+public meta def xeBoth (n : Nat) : Nat := xePub n + xePriv n
+END
+cat > UseXE.lean <<'END'
+module
+import XE
+#eval xeBoth 2
+#eval xePub 3
+END
+run env LEAN_PATH="$LIB" lean -Dcompiler.postponeCompile=false -o "$LIB/XE.olean" -i "$LIB/XE.ilean" -c "$TMP_DIR/XE.c" XE.lean
+link "$TMP_DIR/libxe.so" XE
+manifest "$TMP_DIR/libxe.paperlean" "$TMP_DIR/libxe.so" XE
+pack
+capture env LEAN_PATH="$LIB" lean UseXE.lean
+check_out_contains "220"
+cp "$CAPTURED.out.produced" "$TMP_DIR/UseXE.expected"
+capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/n.paperlean" PAPERLEAN_NATIVE_LIBS="$TMP_DIR/libxe.paperlean" \
+  PAPERLEAN_IMPORT_TIMING=1 lean UseXE.lean
+check_out_contains "paperlean-timing native libs=1 modules=0 meta=1"
+expect_output UseXE "$TMP_DIR/UseXE.expected" "with exported meta declarations"

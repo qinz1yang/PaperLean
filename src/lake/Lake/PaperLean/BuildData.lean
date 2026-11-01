@@ -5,7 +5,6 @@ Released under Apache 2.0 license as described in the file LICENSE.
 module
 
 prelude
-import Init
 public import Lake.Config.Module
 public import Lake.Config.Workspace
 import Lake.Config.Env
@@ -13,7 +12,7 @@ import Lake.PaperLean.Env
 import Lake.PaperLean.BuildEnv
 import Lean.PaperLean.OLeanPack
 import Lean.PaperLean.System
-import Lean.Data.NameMap
+import Lean.Data.NameMap.Basic
 
 /-!
 Olean packs written during a build, for the `lean` processes that the build starts later. When Lake
@@ -27,9 +26,10 @@ that the build starts afterwards reads its imports from the packs written so far
 module compiles to does not depend on which packs exist when it starts. (No import image is
 written: an image of the toolchain's library alone makes the import of states with many entries of
 other modules slower, as those are then replayed instead of folded.) The build's own packs are in
-`.lake/paperlean/build/<process id>/` and are removed at the end of the build (`finish`), or by the
-next build if this one was interrupted. `PAPERLEAN_BUILD_PACKS=0` turns this off,
-`PAPERLEAN_BUILD_PACKS=1` packs from the first compiled module on.
+`.lake/paperlean/build/<process id>/` and are removed at the end of the build (`finish`), or, if it
+was interrupted, by the next `paperlean build` or `paperlean prepare` (`removeEnded`).
+`PAPERLEAN_BUILD_PACKS=0` turns this off, `PAPERLEAN_BUILD_PACKS=1` packs from the first compiled
+module on.
 -/
 
 open System Lean
@@ -38,6 +38,8 @@ namespace Lake.PaperLean.BuildData
 
 /-- The packs of this build. -/
 structure State where
+  /-- The workspace's directory. -/
+  wsDir : FilePath
   dir : FilePath
   /-- Each finished module not packed yet: its library directory and its chains of files. -/
   pending : Array (String × Array (Array String)) := #[]
@@ -79,8 +81,12 @@ so that a build of many modules writes a few dozen packs. -/
 private def minBatch (s : State) : Nat :=
   s.batch?.getD (max 64 (s.packed / 4))
 
-/-- How long a finished module waits for its batch (ms). -/
-private def maxWait : Nat := 20000
+/-- How long a finished module waits for its batch (ms): longer the more packs the build wrote, as
+every later `lean` of the build maps all of them. -/
+private def maxWait (s : State) : Nat := 20000 * (1 + s.started / 8)
+
+/-- The number of packs that a build writes at most (a process serves modules from 255 packs). -/
+private def maxPacks : Nat := 128
 
 /-- The files below `dir` as packs chain them: each module's `.olean` parts, and its IR files. -/
 private def chainsBelow (dir : FilePath) : IO (Array (Array String)) := do
@@ -125,9 +131,11 @@ private def cacheDir? : BaseIO (Option FilePath) := do
     return some (FilePath.mk dir)
   return (· / "paperlean") <$> (← getSystemCacheHome?)
 
-/-- A stamp of the files of `chains`: their names, sizes and modification times. -/
-private def stamp (chains : Array (Array String)) : IO UInt64 := do
+/-- A stamp of the files of `chains`: their names, sizes and modification times; and their total
+size. -/
+private def stamp (chains : Array (Array String)) : IO (UInt64 × Nat) := do
   let mut h : UInt64 := 11
+  let mut size := 0
   for chain in chains do
     for f in chain do
       let m ← FilePath.metadata f
@@ -135,7 +143,8 @@ private def stamp (chains : Array (Array String)) : IO UInt64 := do
       h := mixHash h m.byteSize
       h := mixHash h (hash m.modified.sec)
       h := mixHash h m.modified.nsec.toUInt64
-  return h
+      size := size + m.byteSize.toNat
+  return (h, size)
 
 /-- The file holding this build's shared lock on the toolchain's pack, so that no other build
 removes it while this one uses it. -/
@@ -144,30 +153,43 @@ private builtin_initialize lockRef : IO.Ref (Option IO.FS.Handle) ← IO.mkRef n
 /-- The number of packs of other toolchains (or of earlier states of a toolchain) kept. -/
 private def keptToolchainPacks : Nat := 2
 
-/-- Removes from `dir` the temporary files of writers that ended before renaming theirs, and the packs
-other than `current` beyond the `keptToolchainPacks` newest if no build uses them. -/
+/-- Removes the pack `pack`, if it exists, and the file that records its identity. -/
+public def removePack (pack : FilePath) : IO Unit := do
+  removePath pack
+  removePath (Lean.PaperLean.OLeanPack.identityFile pack.toString)
+
+/-- Removes from `dir` the temporary files of writers that ended before renaming theirs (`.tmp.<pid>`,
+also after an earlier `.tmp-<pid>`), and the packs other than `current` beyond the
+`keptToolchainPacks` newest if no build uses them. -/
 private def cleanToolchainPacks (dir current : FilePath) : IO Unit := do
   let mut others := #[]
   for d in ← dir.readDir do
     let f := d.fileName
-    if let some pid := (f.splitOn ".tmp-").getLast?.bind (·.toNat?) then
+    let pid? := (f.split ".tmp." |>.toStringList).getLast?.bind (·.toNat?) <|>
+      (f.split ".tmp-" |>.toStringList).getLast?.bind (·.toNat?)
+    if let some pid := pid? then
       unless ← Lean.PaperLean.processAlive pid.toUInt32 do
         try IO.FS.removeFile d.path catch _ => pure ()
-    else if f.endsWith ".paperlean" && d.path != current then
+    else if f.endsWith ".paperlean" && !f.startsWith "id-" && d.path != current then
       try others := others.push (d.path, (← d.path.metadata).modified) catch _ => pure ()
   for (pack, _) in (others.qsort fun a b => compare a.2 b.2 == .gt)[keptToolchainPacks:] do
     try
       let h ← IO.FS.Handle.mk pack .read
       if ← h.tryLock (exclusive := true) then
-        IO.FS.removeFile pack
+        removePack pack
         h.unlock
     catch _ => pure ()
 
 /--
 The pack of the toolchain's library `leanLibDir` in PaperLean's cache directory, used by later `lean`
-processes of the build as soon as written. Its name holds a stamp of the library's files, so that a
-pack is only used for the library as it was packed. It is written to a temporary file renamed into
-place, so that concurrent builds see a whole pack.
+processes of the build as soon as written. Its name holds a stamp of the library's files and
+PaperLean's version and build, so that a pack is only used for the library as it was packed, by the
+build that packed it. Its writer renames it into place once it is on the disk, so that concurrent
+builds and later ones see a whole pack, and locks it until its identity is recorded, which they wait
+for at their shared lock. One that cannot be read, or some of whose files changed since it was written
+(a toolchain installed again keeps their names, sizes and modification times), is written again,
+unless another build uses it: then this one does too, as every packed file is checked before it is
+served. It is not written without the disk space for it (and a tenth more).
 -/
 private def toolchainPack (leanLibDir : FilePath) : IO Unit := do
   let some cache ← cacheDir? | return
@@ -175,22 +197,42 @@ private def toolchainPack (leanLibDir : FilePath) : IO Unit := do
   let chains := (← chainsBelow leanLibDir).qsort fun a b => a[0]! < b[0]!
   if chains.isEmpty then return
   let dir := cache / "toolchain-packs"
-  let name := s!"lib-{hash root}-{String.ofList (Nat.toDigits 16 (← stamp chains).toNat)}-{Lean.PaperLean.version}"
+  let (h, size) ← stamp chains
+  let stampHex := String.ofList (Nat.toDigits 16 h.toNat)
+  let name := s!"lib-{hash root}-{stampHex}-{Lean.PaperLean.version}+{Lean.PaperLean.build}"
   let pack := dir / s!"{name}.paperlean"
   IO.FS.createDirAll dir
   cleanToolchainPacks dir pack
   for _ in [0:2] do
     unless ← pack.pathExists do
-      let tmp := dir / s!"{name}.paperlean.tmp-{← IO.Process.getPID}"
-      discard <| Lean.PaperLean.OLeanPack.createOf chains #[root] tmp toolchainBaseAddr
-      IO.FS.rename tmp pack
+      if size + size / 10 > (← availableSpace dir) then return
+      discard <| Lean.PaperLean.OLeanPack.createOf chains #[root] pack toolchainBaseAddr
     let h ← IO.FS.Handle.mk pack .read
     h.lock (exclusive := false)
     -- unless another build removed it before this one held the lock
     if ← pack.pathExists then
-      lockRef.set (some h)
-      BuildEnv.addPack pack.toString
-      return
+      if ← usable pack then
+        lockRef.set (some h)
+        BuildEnv.addPack pack.toString
+        return
+      unless ← h.tryLock (exclusive := true) do
+        -- (a failed conversion of the lock may have released it, and another build may have removed
+        -- the pack meanwhile)
+        h.lock (exclusive := false)
+        if ← pack.pathExists then
+          lockRef.set (some h)
+          BuildEnv.addPack pack.toString
+          return
+        h.unlock
+        continue
+      removePack pack
+      h.unlock
+where
+  usable (pack : FilePath) : IO Bool := do
+    try
+      let (stale, _) ← Lean.PaperLean.OLeanPack.staleness pack.toString
+      return stale == 0
+    catch _ => return false
 
 /-- Writes the pack `i` of `batch` in the background, then records it. -/
 private def writePack (dir : FilePath) (i : Nat) (batch : Array (String × Array (Array String))) :
@@ -199,7 +241,8 @@ private def writePack (dir : FilePath) (i : Nat) (batch : Array (String × Array
     let out := dir / s!"pack-{i}.paperlean"
     let roots := batch.foldl (init := #[]) fun rs (r, _) => if rs.contains r then rs else rs.push r
     try
-      discard <| Lean.PaperLean.OLeanPack.createOf (batch.flatMap (·.2)) roots out (baseAddr i)
+      -- deleted at the end of the build, or by the next one if this one did not end
+      discard <| Lean.PaperLean.OLeanPack.createOf (batch.flatMap (·.2)) roots out (baseAddr i) (sync := false)
       BuildEnv.addPack out.toString
     catch _ => pure ()
     stateRef.modify fun
@@ -212,8 +255,10 @@ private def maybeWrite : BaseIO Unit := do
   let now ← IO.monoMsNow
   let job? ← stateRef.modifyGet fun
     | some (some s) =>
-      if s.writing || s.pending.isEmpty ||
-          (s.pending.size < minBatch s && now - s.pendingSince < maxWait) then
+      if s.started ≥ maxPacks then
+        (none, some (some { s with pending := #[] }))
+      else if s.writing || s.pending.isEmpty ||
+          (s.pending.size < minBatch s && now - s.pendingSince < maxWait s) then
         (none, some (some s))
       else
         (some (s.dir, s.started, s.pending),
@@ -223,24 +268,28 @@ private def maybeWrite : BaseIO Unit := do
   if let some (dir, i, batch) := job? then
     writePack dir i batch
 
+/-- Removes the packs of the builds of the workspace in `wsDir` whose process ended without removing
+them (interrupted ones). -/
+public def removeEnded (wsDir : FilePath) : BaseIO Unit := do
+  let .ok entries ← (dataDir wsDir / "build").readDir.toBaseIO | return
+  for d in entries do
+    if let some pid := d.fileName.toNat? then
+      unless ← Lean.PaperLean.processAlive pid.toUInt32 do
+        discard <| (removePath d.path).toBaseIO
+
 /-- Decides whether this build packs, and if so, starts using the toolchain's pack (in the
 background) and packs the modules compiled so far. -/
 private def start (wsDir leanLibDir : FilePath) : IO Unit := do
   let disabled := !(← accelerated) || (← IO.getEnv "PAPERLEAN_BUILD_PACKS") == some "0" ||
     (← IO.getEnv dataMarker).isSome || (← explicitDataVars)
   let state? ← if disabled then pure none else do
-    let base := dataDir wsDir / "build"
-    -- the packs of earlier builds whose process ended
-    if ← base.pathExists then
-      for d in ← base.readDir do
-        if let some pid := d.fileName.toNat? then
-          unless ← Lean.PaperLean.processAlive pid.toUInt32 do
-            try IO.FS.removeDirAll d.path catch _ => pure ()
-    let dir := base / toString (← IO.Process.getPID)
+    removeEnded wsDir
+    let name := toString (← IO.Process.getPID)
+    let dir := dataDir wsDir / "build" / name
     let batch? := (← IO.getEnv "PAPERLEAN_BUILD_PACK_BATCH").bind (·.toNat?)
     try
       IO.FS.createDirAll dir
-      pure (some ({ dir, batch? } : State))
+      pure (some ({ wsDir, dir, batch? } : State))
     catch _ => pure none
   let first ← stateRef.modifyGet fun st => if st.isSome then (false, st) else (true, some state?)
   unless first && state?.isSome do return
@@ -294,6 +343,6 @@ public def finish : BaseIO Unit := do
   let st ← stateRef.swap none
   if let some (some s) := st then
     if (← IO.getEnv "PAPERLEAN_BUILD_PACKS_KEEP").isNone then
-      discard <| (IO.FS.removeDirAll s.dir).toBaseIO
+      discard <| (removePath s.dir).toBaseIO
 
 end Lake.PaperLean.BuildData

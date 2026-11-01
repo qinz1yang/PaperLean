@@ -7,6 +7,11 @@ module
 prelude
 public import Init.Prelude
 
+-- (no `SizeOf` instances for PaperLean's types: an instance of a module of `Lean` would be one of
+-- every environment that imports it, which Lean's searches would try)
+set_option genSizeOf false
+set_option genInjectivity false
+
 public section
 
 /-!

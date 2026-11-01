@@ -15,6 +15,7 @@ public import Lean.Meta.Match.MatcherInfo
 public import Lean.Meta.Match.MatchPatternAttr
 public import Lean.Meta.Transform
 import Init.Data.Range.Polymorphic.Iterators
+import Lean.PaperLean.Base
 
 public section
 
@@ -1049,10 +1050,19 @@ def reduceNat? (e : Expr) : MetaM (Option Expr) :=
   else
     return none
 
+/-- PaperLean: records the operation `op` (as in `PaperLean.noteCache`) on the cache of `e` with
+`value` for this thread's recording, counting no heartbeats. -/
+private def noteWhnfCache {α : Type} (op : UInt8) (e : Expr) (value : α) : MetaM Unit := do
+  let heartbeats ← IO.getNumHeartbeats
+  PaperLean.noteCache 3 op (← mkExprConfigCacheKey e) value
+  PaperLean.setHeartbeats heartbeats
+
 private def cache (useCache : Bool) (e r : Expr) : MetaM Expr := do
   if useCache then
     let key ← mkExprConfigCacheKey e
     modify fun s => { s with cache.whnf := s.cache.whnf.insert key r }
+    -- PaperLean: (`Lean.PaperLean.TCCache` repeats a search's operations on the cache)
+    if PaperLean.envRecording e then noteWhnfCache 1 e r
   return r
 
 set_option compiler.ignoreBorrowAnnotation true in
@@ -1060,7 +1070,10 @@ set_option compiler.ignoreBorrowAnnotation true in
 partial def whnfImp (e : Expr) : MetaM Expr :=
   withIncRecDepth <| whnfEasyCases e fun e => do
     let useCache ← useWHNFCache e
-    match (← cached? useCache e) with
+    let found? ← cached? useCache e
+    -- PaperLean: (`Lean.PaperLean.TCCache` repeats a search's operations on the cache)
+    if useCache && PaperLean.envRecording e then noteWhnfCache 0 e found?
+    match found? with
     | some e' => pure e'
     | none    =>
       withTraceNode `Meta.whnf (fun _ => return m!"Non-easy whnf: {e}") do
@@ -1094,3 +1107,4 @@ builtin_initialize
   registerTraceClass `Meta.isDefEq.whnf.reduceBinOp
 
 end Lean.Meta
+-- Modified by PaperLean.

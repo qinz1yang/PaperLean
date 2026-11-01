@@ -59,7 +59,9 @@ Load a `Workspace` for a Lake package by
 elaborating its configuration file and resolving its dependencies.
 If `updateDeps` is true, updates the manifest before resolving dependencies.
 -/
-public def loadWorkspace (config : LoadConfig) : LoggerIO Workspace := do
+-- PaperLean: neither inlined nor specialized, so that code compiled by PaperLean calls it as
+-- official Lean's instead of copying this body, which calls PaperLean's code
+@[noinline, nospecialize] public def loadWorkspace (config : LoadConfig) : LoggerIO Workspace := do
   let {reconfigure, leanOpts, updateDeps, updateToolchain, packageOverrides, ..} := config
   let ws ← loadWorkspaceRoot config
   let ws ← if updateDeps then

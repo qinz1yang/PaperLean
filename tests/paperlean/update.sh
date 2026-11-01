@@ -1,11 +1,14 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests `paperlean update` (`src/lake/Lake/PaperLean/Update.lean`): it predicts the toolchain an
 # update leads to before changing anything (for Git and Reservoir dependencies), updates if a PaperLean
-# release supports the result, keeping the project on official Lean (moving to the official toolchain
-# of a new Lean version), downloads and prepares again, changes nothing otherwise, and restores the
-# previous state if `lake update` fails or does something else.
+# release supports the result (of the origin that `ELAN_TOOLCHAIN` or the toolchain's directory
+# names), keeping the project on official Lean (moving to the official toolchain of a new Lean
+# version, whose commands do not see this toolchain's variables), downloads and prepares again,
+# changes nothing otherwise, and restores the previous state if `lake update` fails or does something
+# else.
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK LEAN_IMPORT_IMAGE PAPERLEAN_NATIVE_LIBS
-unset ELAN_TOOLCHAIN
 export ELAN_HOME="$TMP_DIR/elan"
 mkdir -p "$ELAN_HOME/toolchains"
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
@@ -100,24 +103,39 @@ unchanged "$OFFICIAL"
 (cd "$DEP" && git reset -q --hard "$REV3")
 
 # A PaperLean release for the new Lean (the newest of the installed toolchains of the origin of the
-# running one, which `ELAN_TOOLCHAIN` names as the front end sets it): the project moves to official
-# Lean 4.99.0 and is told which PaperLean to install.
+# running one, which `ELAN_TOOLCHAIN` names when elan runs a PaperLean toolchain for its project):
+# the project moves to official Lean 4.99.0 and is told which PaperLean to install.
 export ELAN_TOOLCHAIN="local/test/paperlean:v0.1.0-lean$LEANVER"
 for tag in v0.1.5-lean4.99.0 v0.2.0-lean4.99.0 v0.3.0-lean4.98.0; do
   mkdir -p "$ELAN_HOME/toolchains/local--test--paperlean---$tag"
 done
-# `lake update` failing or doing something else than predicted: the previous state comes back.
+# `lake update` failing or doing something else than predicted: the previous state comes back. The
+# new toolchain's `lake` runs without the variables of this one (elan would run this one again for
+# its `ELAN_TOOLCHAIN`).
 mkdir -p "$TMP_DIR/fakebin"
-printf '#!/bin/sh\nexit 1\n' > "$TMP_DIR/fakebin/lake"
-chmod +x "$TMP_DIR/fakebin/lake"
+fake_lake() {
+  printf '#!/bin/sh\necho "lake ELAN_TOOLCHAIN=${ELAN_TOOLCHAIN-(unset)}" >> "%s"\nexit %s\n' \
+    "$TMP_DIR/children.log" "$1" > "$TMP_DIR/fakebin/lake"
+  chmod +x "$TMP_DIR/fakebin/lake"
+}
+# the commands that `paperlean update` ran, which must not see `ELAN_TOOLCHAIN`
+children_unset() {
+  for c in "$@"; do grep -q "^$c " "$TMP_DIR/children.log" || fail "update did not run $c"; done
+  ! grep -v "ELAN_TOOLCHAIN=(unset)$" "$TMP_DIR/children.log" ||
+    fail "ELAN_TOOLCHAIN reached the commands of the new toolchain"
+  rm "$TMP_DIR/children.log"
+}
+fake_lake 1
 PATH="$TMP_DIR/fakebin:$PATH" capture_exit 1 "$TC/bin/lake" paperlean update
 check_out_contains "The toolchain changes to leanprover/lean4:v4.99.0"
 check_out_contains "\`lake update\` failed; the previous state is restored"
 unchanged "$OFFICIAL"
-printf '#!/bin/sh\nexit 0\n' > "$TMP_DIR/fakebin/lake"
+children_unset lake
+fake_lake 0
 PATH="$TMP_DIR/fakebin:$PATH" capture_exit 1 "$TC/bin/lake" paperlean update
 check_out_contains "dep moved to $REV2, not to the predicted $REV3; the previous state is restored"
 unchanged "$OFFICIAL"
+children_unset lake
 capture lake paperlean update
 check_out_contains "The toolchain changes to leanprover/lean4:v4.99.0"
 check_out_contains "elan toolchain install local/test/paperlean:v0.2.0-lean4.99.0"
@@ -125,6 +143,36 @@ check_out_contains "dep cache: [get]"
 check_out_contains "Prepared"
 [ "$(git -C .lake/packages/dep rev-parse HEAD)" = "$REV3" ] || fail "the dependency did not move"
 [ "$(cat lean-toolchain)" = "leanprover/lean4:v4.99.0" ] || fail "the toolchain is not official Lean 4.99.0"
+# Under the front end, which gives `ELAN_TOOLCHAIN` the project's own toolchain, the origin comes from
+# the directory that elan installed the running toolchain in: here one with copies of this one's
+# `lake` and `lean` (the running `lake` finds its toolchain with links resolved), and GitHub out of
+# reach. Neither the new toolchain's `lake update` nor its `paperlean` sees `ELAN_TOOLCHAIN`.
+cp "$TMP_DIR/manifest.before" lake-manifest.json
+echo "$OFFICIAL" > lean-toolchain
+run lake resolve-deps
+[ "$(git -C .lake/packages/dep rev-parse HEAD)" = "$REV2" ] || fail "the dependency did not move back"
+REL="$ELAN_HOME/toolchains/testowner--PaperLean---v0.1.0-lean$LEANVER"
+mkdir -p "$REL/bin"
+for d in lib include share; do [ ! -e "$TC/$d" ] || ln -s "$TC/$d" "$REL/$d"; done
+for f in "$TC"/bin/*; do
+  case "${f##*/}" in lake|lean) cp "$f" "$REL/bin/" ;; *) ln -s "$f" "$REL/bin/" ;; esac
+done
+for tag in v0.1.5-lean4.99.0 v0.2.0-lean4.99.0 v0.3.0-lean4.98.0; do
+  mkdir -p "$ELAN_HOME/toolchains/testowner--PaperLean---$tag"
+done
+mkdir -p "$TMP_DIR/wrapbin"
+printf '#!/bin/sh\nexit 7\n' > "$TMP_DIR/wrapbin/curl"
+for c in lake paperlean; do
+  printf '#!/bin/sh\necho "%s ELAN_TOOLCHAIN=${ELAN_TOOLCHAIN-(unset)}" >> "%s"\nexec "%s" "$@"\n' \
+    "$c" "$TMP_DIR/children.log" "$TC/bin/$c" > "$TMP_DIR/wrapbin/$c"
+done
+chmod +x "$TMP_DIR/wrapbin"/*
+PATH="$TMP_DIR/wrapbin:$PATH" ELAN_TOOLCHAIN="$OFFICIAL" capture "$REL/bin/lake" paperlean update
+check_out_contains "The toolchain changes to leanprover/lean4:v4.99.0"
+check_out_contains "elan toolchain install testowner/PaperLean:v0.2.0-lean4.99.0"
+check_out_contains "Prepared"
+[ "$(git -C .lake/packages/dep rev-parse HEAD)" = "$REV3" ] || fail "the dependency did not move"
+children_unset lake paperlean
 unset ELAN_TOOLCHAIN
 
 # A Reservoir dependency (a local registry): its revision comes from Reservoir's data.

@@ -34,7 +34,7 @@ object * persistent_imports(b_obj_arg env) {
 }
 
 bool find_shared_symbol(b_obj_arg env, b_obj_arg fn, shared_symbol & s) {
-    if (import_legacy_mode() || lean_heartbeats_mode()) return false;
+    if (import_legacy_mode()) return false;
     uncounted_heartbeats uncounted;
     object * h = persistent_imports(env);
     if (!h) return false;
@@ -51,7 +51,7 @@ bool find_shared_symbol(b_obj_arg env, b_obj_arg fn, shared_symbol & s) {
 
 void share_symbol(b_obj_arg env, b_obj_arg fn, shared_symbol const & s) {
     // the entry is used on any thread, so its declaration must not be reference counted
-    if (import_legacy_mode() || lean_heartbeats_mode() || lean_is_scalar(s.decl) || !lean_is_persistent(s.decl)) return;
+    if (import_legacy_mode() || lean_is_scalar(s.decl) || !lean_is_persistent(s.decl)) return;
     uncounted_heartbeats uncounted;
     object * h = persistent_imports(env);
     if (!h) return;

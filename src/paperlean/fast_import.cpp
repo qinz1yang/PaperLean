@@ -41,11 +41,6 @@ uint8 read_import_mode() {
     return 0;
 }
 uint8 g_import_mode = read_import_mode();
-// `PAPERLEAN_HEARTBEATS=lean`: no optimization that lowers heartbeat counts while elaborating
-bool g_lean_heartbeats = [] {
-    char const * h = getenv("PAPERLEAN_HEARTBEATS");
-    return h && strcmp(h, "lean") == 0;
-}();
 
 struct timing_point { double wall_ms, cpu_ms; long minflt; };
 timing_point timing_now() {
@@ -56,7 +51,8 @@ timing_point timing_now() {
 #else
     timespec w, c;
     clock_gettime(CLOCK_MONOTONIC, &w);
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c);
+    // (of the process: the marks come from several threads, and have one baseline)
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c);
     rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     return { w.tv_sec * 1e3 + w.tv_nsec / 1e6, c.tv_sec * 1e3 + c.tv_nsec / 1e6, ru.ru_minflt };
@@ -106,8 +102,6 @@ bool import_legacy_mode() { return g_import_mode == 1; }
 
 bool import_check_mode() { return g_import_mode == 2; }
 
-bool lean_heartbeats_mode() { return g_lean_heartbeats; }
-
 void import_timing_add(import_counter c, uint64_t ns) {
     g_counter_ns[c] += ns;
     g_counter_calls[c]++;
@@ -117,6 +111,22 @@ void import_timing_add(import_counter c, uint64_t ns) {
 extern "C" LEAN_EXPORT obj_res lean_paperlean_uncounted_heartbeats(obj_arg act) {
     uncounted_heartbeats uncounted;
     return apply_1(act, io_mk_world());
+}
+
+/* uncounted5 {α β γ δ ε ζ} (f : @& α → β → γ → δ → ε → ζ) (a : @& α) (b : @& β) (c : @& γ)
+   (d : @& δ) (e : @& ε) : ζ */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_uncounted5(b_obj_arg f, b_obj_arg a, b_obj_arg b,
+                                                         b_obj_arg c, b_obj_arg d, b_obj_arg e) {
+    uncounted_heartbeats uncounted;
+    lean_inc(f); lean_inc(a); lean_inc(b); lean_inc(c); lean_inc(d); lean_inc(e);
+    return lean_apply_5(f, a, b, c, d, e);
+}
+
+/* uncounted {α β γ δ} (f : α → β → γ → δ) (a : α) (b : β) (c : γ) : δ */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_uncounted(obj_arg f, obj_arg a, obj_arg b,
+                                                        obj_arg c) {
+    uncounted_heartbeats uncounted;
+    return apply_3(f, a, b, c);
 }
 
 /* importTimingMark (phase : @& String) : BaseIO Unit
@@ -510,138 +520,3 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_build_public_constant_map(b_obj_ar
     return mk_some(pm.sync());
 }
 }
-
-/*
-A sampling profiler for development: with `PAPERLEAN_PROFILE=<file>`, the process records the
-program counter and the call stack every millisecond of its CPU time (user and system, so that time
-in page faults and system calls is charged to the instruction that caused it), and writes the
-samples and its memory map to `<file>.<pid>` at exit. The samples are symbolized offline.
-*/
-#if defined(__linux__) && defined(__x86_64__)
-#include <algorithm>
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <csignal>
-#include <csetjmp>
-#include <ucontext.h>
-#include <unwind.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-namespace {
-// Each sample: the interrupted program counter, then the return addresses found by unwinding from the
-// signal handler (which include the handler's own frames), 0-terminated.
-constexpr size_t g_sample_words = 128;
-constexpr size_t g_max_samples = 1 << 17;
-uintptr_t * g_samples = nullptr;
-std::atomic<size_t> g_num_samples{0};
-char const * g_out = nullptr;
-
-struct backtrace_state { uintptr_t * out; size_t n, max; };
-
-_Unwind_Reason_Code on_frame(_Unwind_Context * ctx, void * arg) {
-    backtrace_state * s = static_cast<backtrace_state *>(arg);
-    if (s->n >= s->max) return _URC_END_OF_STACK;
-    s->out[s->n++] = _Unwind_GetIP(ctx);
-    return _URC_NO_REASON;
-}
-
-// The unwinder can fault on frames whose unwind information does not describe every instruction.
-// Such a fault happens after it has looked up the frame's information (and released its locks), so
-// the sample is dropped by jumping back out of the handler; other faults go to the previous handler
-// (Lean's stack overflow detection).
-__thread __attribute__((tls_model("initial-exec"))) bool g_in_sample = false;
-__thread __attribute__((tls_model("initial-exec"))) sigjmp_buf g_sample_jmp;
-struct sigaction g_prev_segv, g_prev_bus;
-
-void on_fault(int sig, siginfo_t * info, void * ctx) {
-    if (g_in_sample) siglongjmp(g_sample_jmp, 1);
-    struct sigaction & prev = sig == SIGSEGV ? g_prev_segv : g_prev_bus;
-    if (prev.sa_flags & SA_SIGINFO) {
-        if (prev.sa_sigaction) { prev.sa_sigaction(sig, info, ctx); return; }
-    } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) {
-        prev.sa_handler(sig);
-        return;
-    }
-    // the default action: let the faulting instruction fault again without this handler
-    sigaction(sig, &prev, nullptr);
-}
-
-// (Re)installs `on_fault`, which Lean's initialization may have replaced, remembering the handler it
-// replaces.
-void install_fault_handler(int sig, struct sigaction & prev) {
-    struct sigaction cur;
-    if (sigaction(sig, nullptr, &cur) != 0 || ((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == on_fault)) return;
-    struct sigaction sa = {};
-    sa.sa_sigaction = on_fault;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    prev = cur;
-    sigaction(sig, &sa, nullptr);
-}
-
-void on_sample(int, siginfo_t *, void * ctx) {
-    install_fault_handler(SIGSEGV, g_prev_segv);
-    install_fault_handler(SIGBUS, g_prev_bus);
-    size_t i = g_num_samples.fetch_add(1, std::memory_order_relaxed);
-    if (i >= g_max_samples) return;
-    uintptr_t * out = g_samples + i * g_sample_words;
-    out[0] = static_cast<uintptr_t>(static_cast<ucontext_t *>(ctx)->uc_mcontext.gregs[REG_RIP]);
-    out[1] = 0;
-    if (sigsetjmp(g_sample_jmp, 1) != 0) {
-        // the unwinder faulted: keep the program counter only
-        g_in_sample = false;
-        out[1] = 0;
-        return;
-    }
-    g_in_sample = true;
-    backtrace_state s { out + 1, 0, g_sample_words - 2 };
-    _Unwind_Backtrace(on_frame, &s);
-    out[1 + s.n] = 0;
-    g_in_sample = false;
-}
-
-void write_samples() {
-    itimerval stop = {};
-    setitimer(ITIMER_PROF, &stop, nullptr);
-    char path[4096];
-    snprintf(path, sizeof(path), "%s.%d", g_out, static_cast<int>(getpid()));
-    FILE * f = fopen(path, "w");
-    if (!f) return;
-    if (FILE * maps = fopen("/proc/self/maps", "r")) {
-        char line[4096];
-        while (fgets(line, sizeof(line), maps)) fprintf(f, "map %s", line);
-        fclose(maps);
-    }
-    size_t n = std::min(g_num_samples.load(), g_max_samples);
-    for (size_t i = 0; i < n; i++) {
-        uintptr_t * sample = g_samples + i * g_sample_words;
-        fprintf(f, "pc %lx", static_cast<unsigned long>(sample[0]));
-        for (size_t j = 1; j < g_sample_words && sample[j]; j++) fprintf(f, " %lx", static_cast<unsigned long>(sample[j]));
-        fprintf(f, "\n");
-    }
-    fclose(f);
-}
-
-struct sample_profiler {
-    sample_profiler() {
-        g_out = getenv("PAPERLEAN_PROFILE");
-        if (!g_out || !*g_out) return;
-        g_samples = static_cast<uintptr_t *>(calloc(g_max_samples * g_sample_words, sizeof(uintptr_t)));
-        if (!g_samples) return;
-        struct sigaction sa = {};
-        sa.sa_sigaction = on_sample;
-        sa.sa_flags = SA_SIGINFO | SA_RESTART;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGPROF, &sa, nullptr);
-        itimerval t = {};
-        t.it_interval.tv_usec = 1000;
-        t.it_value.tv_usec = 1000;
-        setitimer(ITIMER_PROF, &t, nullptr);
-        atexit(write_samples);
-    }
-} g_sample_profiler;
-}
-#endif

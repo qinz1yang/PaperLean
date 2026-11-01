@@ -142,6 +142,33 @@ private def exportIREntries (env : Environment) : Array (Name × Array EnvExtens
 def findEnvDecl (env : Environment) (declName : Name) : Option Decl :=
   Compiler.LCNF.findExtEntry? env declMapExt declName findAtSorted? (·.2.find?)
 
+private unsafe def sameObj? {α : Type} (a b : Option α) : Bool :=
+  match a, b with
+  | some x, some y => ptrEq x y
+  | none, none => true
+  | _, _ => false
+
+private unsafe def findLocalRecordedCore (env : Environment) (declName : Name) (_ _ _ : Unit) :
+    Option Decl :=
+  let find? (env : Environment) :=
+    PaperLean.envWithoutRecording fun _ => declMapExt.getState env |>.find? declName
+  let r := find? env
+  PaperLean.envRecord (.extPart declMapExt.toEnvExtension.idx declName) (unsafeCast
+    fun (env' : Environment) (_ : Name) (_ : NonScalar) => sameObj? (find? env') r) r
+
+-- (counting no heartbeats)
+private unsafe def findLocalRecordedImpl (env : @& Environment) (declName : @& Name) :
+    Option Decl :=
+  PaperLean.uncounted5 findLocalRecordedCore env declName () () ()
+
+/-- PaperLean: `declMapExt.getState env |>.find? declName` while this thread records environment
+accesses (`Lean.PaperLean.EnvDeps`), recorded as the declaration found, which declarations of other
+names keep the same object. -/
+-- (its parameters are borrowed, so that the callers' inferred calling conventions stay upstream's)
+@[implemented_by findLocalRecordedImpl, noinline]
+private def findLocalRecorded (env : @& Environment) (declName : @& Name) : Option Decl :=
+  declMapExt.getState env |>.find? declName
+
 @[export lean_ir_find_env_decl]
 private def findInterpDecl (env : Environment) (declName : Name) : Option Decl :=
   -- This function is never used in `leanir`, so no need for `findExtEntry?`
@@ -151,7 +178,9 @@ private def findInterpDecl (env : Environment) (declName : Name) : Option Decl :
     findAtSorted? (declMapExt.getModuleIREntries env modIdx) declName <|>
     -- (closure of) `meta def`; will report `.extern`s for other `def`s so needs to come second
     findAtSorted? (declMapExt.getModuleEntries env modIdx) declName
-  | none => declMapExt.getState env |>.find? declName
+  | none =>
+    if PaperLean.envRecording declName then findLocalRecorded env declName else
+    declMapExt.getState env |>.find? declName
 
 /-- Like ``findInterpDecl env (declName ++ `_boxed)`` but with optimized negative lookup. -/
 @[export lean_ir_find_env_decl_boxed]
@@ -167,7 +196,9 @@ private def findInterpDeclBoxed (env : Environment) (declName : Name) : Option D
   | some modIdx =>
     findAtSorted? (declMapExt.getModuleIREntries env modIdx) boxed <|>
     findAtSorted? (declMapExt.getModuleEntries env modIdx) boxed
-  | none => declMapExt.getState env |>.find? boxed
+  | none =>
+    if PaperLean.envRecording boxed then findLocalRecorded env boxed else
+    declMapExt.getState env |>.find? boxed
 
 @[export lean_has_compile_error]
 private def hasCompileError (env : Environment) (constName : Name) : Bool :=
@@ -175,7 +206,9 @@ private def hasCompileError (env : Environment) (constName : Name) : Bool :=
   | some _ => false  -- Compile errors in imports would have stopped the build before this point
   -- TODO: do we need to store failures as a separate state? Not if we make sure to only ever
   -- evaluate constants previously called `compileDecl` on.
-  | none => !(declMapExt.getState env |>.contains constName)
+  | none =>
+    if PaperLean.envRecording constName then (findLocalRecorded env constName).isNone else
+    !(declMapExt.getState env |>.contains constName)
 
 def findDecl (n : Name) : CompilerM (Option Decl) :=
   return findEnvDecl (← getEnv) n
@@ -234,3 +267,4 @@ private def getIRExtraConstNames (env : Environment) (level : OLeanLevel) (inclu
 
 end IR
 end Lean
+-- Modified by PaperLean.

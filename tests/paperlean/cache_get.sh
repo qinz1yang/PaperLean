@@ -1,9 +1,10 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests `paperlean cache get` (`src/lake/Lake/PaperLean/Cli.lean`): it runs the cache a package
 # provides, or `lake cache get` if none does, and prepares; it says what to do if downloading fails
 # or if several packages provide a cache.
 
-unset PAPERLEAN_IMPORT PAPERLEAN_IMPORT_TIMING LEAN_OLEAN_PACK LEAN_IMPORT_IMAGE PAPERLEAN_NATIVE_LIBS
-unset ELAN_TOOLCHAIN
 WS="$TMP_DIR/ws"
 mkdir -p "$TMP_DIR/a" "$TMP_DIR/b" "$WS"
 cat > "$TMP_DIR/a/lakefile.toml" <<'END'

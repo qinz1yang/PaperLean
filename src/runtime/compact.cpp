@@ -7,6 +7,7 @@ Modified by PaperLean.
 */
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <cstring>
 #include <lean/lean.h>
@@ -64,6 +65,9 @@ struct max_sharing_eq {
 
 struct object_compactor::max_sharing_table {
     lean::unordered_set<max_sharing_key, max_sharing_hash, max_sharing_eq> m_table;
+    // The offsets of the bignums by their values: their bytes hold a pointer to their digits, which
+    // `m_table` would compare.
+    std::unordered_map<std::string, size_t> m_mpz_table;
     max_sharing_table(object_compactor * manager):
         m_table(LEAN_MAX_SHARING_TABLE_INITIAL_SIZE, max_sharing_hash(manager), max_sharing_eq(manager)) {
     }
@@ -196,6 +200,17 @@ object_offset object_compactor::save_max_sharing(object * o, object * new_o, siz
         new_o = reinterpret_cast<lean_object*>(reinterpret_cast<char*>(m_begin) + it->m_offset);
     } else {
         m_max_sharing_table->m_table.insert(k);
+    }
+    return save(o, new_o);
+}
+
+object_offset object_compactor::save_max_sharing_mpz(object * o, object * new_o, bool neg, void const * digits, size_t digits_sz) {
+    std::string value(reinterpret_cast<char const *>(digits), digits_sz);
+    value.push_back(neg ? '-' : '+');
+    auto r = m_max_sharing_table->m_mpz_table.insert({std::move(value), static_cast<size_t>(reinterpret_cast<char*>(new_o) - reinterpret_cast<char*>(m_begin))});
+    if (!r.second) {
+        m_end = new_o;
+        new_o = reinterpret_cast<lean_object*>(reinterpret_cast<char*>(m_begin) + r.first->second);
     }
     return save(o, new_o);
 }
@@ -429,7 +444,7 @@ object_offset object_compactor::insert_mpz(object * o) {
     memcpy(data, m._mp_d, data_sz);
     m._mp_d = reinterpret_cast<mp_limb_t *>(reinterpret_cast<char *>(data) - reinterpret_cast<char *>(m_begin) + reinterpret_cast<ptrdiff_t>(m_base_addr));
     m._mp_alloc = nlimbs;
-    return save(o, (lean_object*)new_o);
+    return save_max_sharing_mpz(o, (lean_object*)new_o, m._mp_size < 0, data, data_sz);
 #else
     size_t data_sz = lean_usize_mul_checked(sizeof(mpn_digit), to_mpz(o)->m_value.m_size);
     size_t sz      = lean_usize_add_checked(sizeof(mpz_object), data_sz);
@@ -444,7 +459,7 @@ object_offset object_compactor::insert_mpz(object * o) {
     void * data = reinterpret_cast<char*>(new_o) + sizeof(mpz_object);
     memcpy(data, to_mpz(o)->m_value.m_digits, data_sz);
     new_o->m_value.m_digits = reinterpret_cast<mpn_digit *>(reinterpret_cast<char *>(data) - reinterpret_cast<char *>(m_begin) + reinterpret_cast<ptrdiff_t>(m_base_addr));
-    return save(o, (lean_object*)new_o);
+    return save_max_sharing_mpz(o, (lean_object*)new_o, new_o->m_value.m_sign, data, data_sz);
 #endif
 }
 

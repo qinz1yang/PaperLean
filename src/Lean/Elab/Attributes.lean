@@ -33,12 +33,17 @@ instance : ToFormat Attribute where
   attrKind := leading_parser optional («scoped» <|> «local»)
   ```
 -/
-def toAttributeKind (attrKindStx : Syntax) : MacroM AttributeKind := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def toAttributeKind (attrKindStx : Syntax) : MacroM AttributeKind := do
   if attrKindStx[0].isNone then
     return AttributeKind.global
   else if attrKindStx[0][0].getKind == ``Lean.Parser.Term.scoped then
     if (← Macro.getCurrNamespace).isAnonymous then
       throw <| Macro.Exception.error (← getRef) "Scoped attributes must be used inside namespaces"
+    -- PaperLean: a recording of environment accesses does not record the read of the current
+    -- namespace (`Lean.PaperLean.EnvDeps`)
+    if PaperLean.envRecording attrKindStx then
+      return PaperLean.envMarkUnusable "a scoped attribute" AttributeKind.scoped
     return AttributeKind.scoped
   else
     return AttributeKind.local
@@ -90,3 +95,4 @@ def elabDeclAttrs [Monad m] [MonadEnv m] [MonadResolveName m] [MonadError m] [Mo
   elabAttrs stx[1].getSepArgs
 
 end Lean.Elab
+-- Modified by PaperLean.

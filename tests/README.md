@@ -94,6 +94,15 @@ tests/with_stage1_test_env.sh path/to/test/directory/run_test.sh
 tests/with_stage1_test_env.sh path/to/test/pile/run_test.sh testfile
 ```
 
+PaperLean reuses results only when a `paperlean` command asks for it, so these runs say nothing about reuse, but for the tests in `paperlean`.
+`paperlean/reuse_suite.sh`, part of the suite, runs the test files of the elaboration and compilation piles with reuse and its oracle on, and compares messages, `.olean`, `.ilean` and `.c` with a run that reuses nothing (`paperlean/reuse_suite.py` runs one pile or file).
+Run the whole suite with reuse on, where the expected outputs are the check, using
+
+```sh
+PAPERLEAN_REUSE=1 PAPERLEAN_REUSE_ORACLE=1 CTEST_PARALLEL_LEVEL="$(nproc)" CTEST_OUTPUT_ON_FAILURE=1 \
+make -C build/release/stage1 -j "$(nproc)" test
+```
+
 ## How to run the bench suite?
 
 Run the full benchmark suite using

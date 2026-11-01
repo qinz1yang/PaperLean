@@ -9,6 +9,7 @@ prelude
 public import Lean.Data.LBool
 public import Lean.Meta.Basic
 import Init.Data.Range.Polymorphic.Iterators
+import Lean.PaperLean.Base
 
 public section
 
@@ -234,8 +235,14 @@ because it overrides unrelated configurations.
       withConfig (fun cfg => { cfg with beta := true, iota := true, zeta := true, zetaHave := true, zetaDelta := true, proj := .yesWithDelta, etaStruct := .all }) x
 
 set_option compiler.ignoreBorrowAnnotation true in
-@[export lean_infer_type]
+/-- PaperLean: `inferTypeImp` while this thread records environment accesses (below). -/
+@[extern "lean_paperlean_infer_type_recorded"]
+private opaque inferTypeRecorded (e : Expr) : MetaM Expr
+
+set_option compiler.ignoreBorrowAnnotation true in
+@[export lean_infer_type, noinline]
 def inferTypeImp (e : Expr) : MetaM Expr :=
+  (PaperLean.recordingPath e).select (inferTypeRecorded e) <|
   let rec infer (e : Expr) :  MetaM Expr := do
     match e with
     | .const c []    => inferConstType c []
@@ -251,6 +258,50 @@ def inferTypeImp (e : Expr) : MetaM Expr :=
     | .forallE ..    => checkInferTypeCache e (inferForallType e)
     | .lam ..        => checkInferTypeCache e (inferLambdaType e)
     | .letE ..       => checkInferTypeCache e (inferLambdaType e)
+  withIncRecDepth <| withInferTypeConfig (infer e)
+
+/-- PaperLean: `k`, `checkInferTypeCache e`, with its lookup of `e` in the cache and its insertion
+recorded for this thread's recording (`PaperLean.noteCache`), counting no heartbeats for that. -/
+private def noteInferTypeCache (e : Expr) (k : MetaM Expr) : MetaM Expr := do
+  if !(← read).cacheInferType || e.hasMVar then
+    return (← k)
+  let heartbeats ← IO.getNumHeartbeats
+  let key ← mkExprConfigCacheKey e
+  let found? := (← get).cache.inferType.find? key
+  PaperLean.noteCache 0 0 key found?
+  PaperLean.setHeartbeats heartbeats
+  let type ← k
+  if found?.isNone then
+    let heartbeats ← IO.getNumHeartbeats
+    if let some type := (← get).cache.inferType.find? key then
+      PaperLean.noteCache 0 1 key type
+    PaperLean.setHeartbeats heartbeats
+  return type
+
+/-- PaperLean: `checkInferTypeCache e k`, recorded while this thread records environment accesses
+(`Lean.PaperLean.TCCache` repeats a search's operations on the cache when it reuses the search). -/
+@[inline] private def checkInferTypeCacheNoted (e : Expr) (k : MetaM Expr) : MetaM Expr :=
+  if PaperLean.envRecording e then noteInferTypeCache e (checkInferTypeCache e k)
+  else checkInferTypeCache e k
+
+set_option compiler.ignoreBorrowAnnotation true in
+@[export lean_paperlean_infer_type_recorded]
+private def inferTypeRecordedImpl (e : Expr) : MetaM Expr :=
+  let rec infer (e : Expr) :  MetaM Expr := do
+    match e with
+    | .const c []    => inferConstType c []
+    | .const c us    => checkInferTypeCacheNoted e (inferConstType c us)
+    | .proj n i s    => checkInferTypeCacheNoted e (inferProjType n i s)
+    | .app f ..      => checkInferTypeCacheNoted e (inferAppType f.getAppFn e.getAppArgs)
+    | .mvar mvarId   => inferMVarType mvarId
+    | .fvar fvarId   => inferFVarType fvarId
+    | .bvar bidx     => throwError "unexpected bound variable {mkBVar bidx}"
+    | .mdata _ e     => infer e
+    | .lit v         => return v.type
+    | .sort lvl      => return mkSort (mkLevelSucc lvl)
+    | .forallE ..    => checkInferTypeCacheNoted e (inferForallType e)
+    | .lam ..        => checkInferTypeCacheNoted e (inferLambdaType e)
+    | .letE ..       => checkInferTypeCacheNoted e (inferLambdaType e)
   withIncRecDepth <| withInferTypeConfig (infer e)
 
 /--
@@ -409,13 +460,101 @@ Remark: `type` can be a dependent arrow.
 private def isArrowProposition (e : Expr) (n : Nat) : MetaM LBool :=
   return (← isArrowProposition' e n).toLBool
 
+/-! PaperLean: `isArrowProposition` decided on the type of a constant with its universe parameters,
+where that decides it for every instantiation of them, which saves instantiating them. The functions
+below are those above on such a type (and on the types of the constants in it), with `none` where
+the answer may depend on the levels; elsewhere they take the steps of those above, as instantiating
+universe parameters keeps the structure of a type, and give their answers: of a level that
+`isAlwaysZero`, `Level.isZero` or `Level.isNeverZero` holds for, it holds for every instantiation,
+and of one without parameters (or metavariables), nothing changes. -/
+
+private def isAlwaysZeroRaw (u : Level) : Option LBool :=
+  if isAlwaysZero u then some .true
+  else if u.hasParam || u.hasMVar then none
+  else some .false
+
+private partial def isArrowPropRaw : Expr → Nat → Option LBool
+  | .sort u,          0   => isAlwaysZeroRaw u
+  | .forallE ..,      0   => some .false
+  | .forallE _ _ b _, n+1 => isArrowPropRaw b n
+  | .letE _ _ _ b _,  n   => isArrowPropRaw b n
+  | .mdata _ e,       n   => isArrowPropRaw e n
+  | _,                _   => some .undef
+
+/-- `isArrowPropRaw` of the type of constant `c` with levels `lvls`; `none` where
+`inferConstType` fails. -/
+private def constArrowPropRaw (env : Environment) (c : Name) (lvls : List Level) (n : Nat) :
+    Option LBool := do
+  let cinfo ← env.findConstVal? c
+  guard (cinfo.levelParams.length == lvls.length)
+  isArrowPropRaw cinfo.type n
+
+private partial def isPropQuickAppRaw (env : Environment) : Expr → Nat → Option LBool
+  | .const c lvls,   arity   => constArrowPropRaw env c lvls arity
+  | .fvar ..,        _       => none
+  | .mvar ..,        _       => none
+  | .app f ..,       arity   => isPropQuickAppRaw env f (arity+1)
+  | .mdata _ e,      arity   => isPropQuickAppRaw env e arity
+  | .letE _ _ _ b _, arity   => isPropQuickAppRaw env b arity
+  | .lam ..,         0       => some .false
+  | .lam _ _ b _,    arity+1 => isPropQuickAppRaw env b arity
+  | _,               _       => some .undef
+
+private partial def isPropQuickRaw (env : Environment) : Expr → Option LBool
+  | .bvar ..          => some .undef
+  | .lit ..           => some .false
+  | .sort ..          => some .false
+  | .lam ..           => some .false
+  | .letE _ _ _ b _   => isPropQuickRaw env b
+  | .proj ..          => some .undef
+  | .forallE _ _ b _  => isPropQuickRaw env b
+  | .mdata _ e        => isPropQuickRaw env e
+  | .const c lvls     => constArrowPropRaw env c lvls 0
+  | .fvar ..          => none
+  | .mvar ..          => none
+  | .app f ..         => isPropQuickAppRaw env f 1
+
+private partial def isArrowPropositionRaw' (env : Environment) : Expr → Nat → Option ArrowPropResult
+  | .forallE _ t b _, n+1 => processResult (isArrowPropositionRaw' env b n) t
+  | .letE _ t _ b _,  n   => processResult (isArrowPropositionRaw' env b n) t
+  | .mdata _ e,       n   => isArrowPropositionRaw' env e n
+  | .bvar idx,        0   => some (.bvar idx)
+  | type,             0   => toArrowPropResult <$> isPropQuickRaw env type
+  | _,                _   => some .undef
+where
+  processResult : Option ArrowPropResult → Expr → Option ArrowPropResult
+    -- (`checkProp` is `undef` for a sort whose level decides nothing yet)
+    | some (.bvar 0), t => match isArrowProposition'.checkProp t with
+      | .undef => none
+      | r => some r
+    | some r, t => some (isArrowProposition'.processResult r t)
+    | none, _ => none
+
+/-- `isArrowProposition type n` for the type `type` of a constant, as `isArrowProposition` gives it
+for every instantiation of its universe parameters, if it does not depend on them. -/
+private def isArrowPropositionRaw (env : Environment) (type : Expr) (n : Nat) : Option LBool :=
+  (·.toLBool) <$> isArrowPropositionRaw' env type n
+
+/-- `isArrowProposition (← inferConstType c lvls) n`, decided without instantiating `lvls` where
+that decides it (`isArrowPropositionRaw`). -/
+private def isArrowPropositionConst (c : Name) (lvls : List Level) (n : Nat) : MetaM LBool := do
+  let cinfo ← getConstVal c
+  if cinfo.levelParams.length == lvls.length then
+    -- (the decision counts no heartbeats: if it gives up, Lean's work follows)
+    if PaperLean.nativeAvailable cinfo then
+      if let some r := PaperLean.uncounted isArrowPropositionRaw (← getEnv) cinfo.type n then
+        return r
+    isArrowProposition (← instantiateTypeLevelParams cinfo lvls) n
+  else
+    throwIncorrectNumberOfLevels c lvls
+
 mutual
 /--
 `isProofQuickApp f n` is an "approximate" predicate which returns `LBool.true` if `f` applied to
 `n` arguments is a proof.
 -/
 private partial def isProofQuickApp : Expr → Nat → MetaM LBool
-  | .const c lvls,   arity   => do let constType ← inferConstType c lvls; isArrowProposition constType arity
+  | .const c lvls,   arity   => isArrowPropositionConst c lvls arity
   | .fvar fvarId,    arity   => do let fvarType  ← inferFVarType fvarId;  isArrowProposition fvarType arity
   | .mvar mvarId,    arity   => do let mvarType  ← inferMVarType mvarId;  isArrowProposition mvarType arity
   | .app f _,        arity   => isProofQuickApp f (arity+1)
@@ -437,7 +576,7 @@ partial def isProofQuick : Expr → MetaM LBool
   | .proj ..          => return LBool.undef
   | .forallE ..       => return LBool.false
   | .mdata _ e        => isProofQuick e
-  | .const c lvls     => do let constType ← inferConstType c lvls; isArrowProposition constType 0
+  | .const c lvls     => isArrowPropositionConst c lvls 0
   | .fvar fvarId      => do let fvarType  ← inferFVarType fvarId;  isArrowProposition fvarType 0
   | .mvar mvarId      => do let mvarType  ← inferMVarType mvarId;  isArrowProposition mvarType 0
   | .app f ..         => isProofQuickApp f 1
@@ -578,3 +717,4 @@ def inferArgumentTypesN (n : Nat) (e : Expr) : MetaM (Array Expr) := do
   arrowDomainsN n (← inferType e)
 
 end Lean.Meta
+-- Modified by PaperLean.

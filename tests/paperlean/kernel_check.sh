@@ -1,3 +1,6 @@
+# Copyright (c) 2026 PaperLean contributors.
+# Released under Apache 2.0 license as described in the file LICENSE.
+#
 # Tests that declarations are checked by the kernel against the environment Lean checks them
 # against: the messages and results are Lean 4.35.0-rc3's (the expected outputs below are official
 # Lean's) for a declaration the kernel rejects, which is then an axiom that later declarations use,

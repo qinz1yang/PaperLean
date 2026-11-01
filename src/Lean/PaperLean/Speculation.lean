@@ -6,84 +6,157 @@ module
 
 prelude
 public import Init.System.IO
-import Init.System.Platform
+public import Lean.PaperLean.Base
+public import Std.Data.HashMap.Basic
+import Init.Data.ToString.Macro
+import Init.Data.ToString.Name
+
+-- (no `SizeOf` instances for PaperLean's types: an instance of a module of `Lean` would be one of
+-- every environment that imports it, which Lean's searches would try)
+set_option genSizeOf false
+set_option genInjectivity false
 
 public section
 
 /-!
-Speculative elaboration by `lean` on the command line, with a fallback.
+The switches of reuse.
 
-Some elaboration is done speculatively and checked: with `PAPERLEAN_REUSE_ORACLE`, each reuse of
-section variables (`Lean.PaperLean.SectionVars`) is compared in the background with Lean's own
-elaboration. If a check fails, `lean` runs again from the start with speculation off
-(`PAPERLEAN_EXACT=1`), so that the module's results and messages are then those of Lean's own
-elaboration; the messages of a run that speculates are therefore held back until every check has
-passed. The run again repeats the side effects of the first, e.g. of `#eval`.
+`lean` reuses results (`Lean.PaperLean.TCCache`, `Lean.PaperLean.SectionVars`) only when a `paperlean`
+command asks for it (`reuse`), and only on the threads that elaborate commands in order
+(`onElabThread`), for the module of the process: its first frontend. A further frontend in the process,
+which a command or a program started, turns reuse and the oracle off with a message
+(`noteFrontend`). A plain `lean`, as under a plain `lake build`, runs Lean's path.
+
+With `PAPERLEAN_REUSE_ORACLE`, a testing switch, each reuse of a typeclass result
+(`Lean.PaperLean.TCCache`) is compared with Lean's own search, and each reuse of section variables
+(`Lean.PaperLean.SectionVars`) with Lean's elaboration. A difference is a defect of PaperLean:
+`lean` says what differs and fails at once (`fail`).
 -/
 
 namespace Lean.PaperLean.Speculation
 
-private builtin_initialize enabledRef : IO.Ref Bool ← IO.mkRef false
-private builtin_initialize failureRef : IO.Ref (Option String) ← IO.mkRef none
-private builtin_initialize checksRef : IO.Ref (Array (Task Unit)) ← IO.mkRef #[]
+/-- Whether this `lean` reuses results: a `paperlean` command asked for it (`PAPERLEAN_REUSE=1`, which
+`Lake.PaperLean.BuildEnv.leanEnv` sets for the `lean` processes of its builds), and not
+`PAPERLEAN_EXACT`. -/
+builtin_initialize reuse : Bool ← do
+  return (← IO.getEnv "PAPERLEAN_REUSE") == some "1" && (← IO.getEnv "PAPERLEAN_EXACT").isNone
 
-/-- Whether this process speculates. -/
-def isEnabled : BaseIO Bool :=
-  enabledRef.get
+/-- Whether each reuse is also compared with Lean's own elaboration (`PAPERLEAN_REUSE_ORACLE`, for
+testing). -/
+builtin_initialize reuseOracle : Bool ← do
+  return reuse && (← IO.getEnv "PAPERLEAN_REUSE_ORACLE").isSome
 
-/-- Turns speculation on for this process if a speculative feature is on (for now only the oracle of
-`Lean.PaperLean.SectionVars`, `PAPERLEAN_REUSE_ORACLE`), unless this is the run after a failed check
-(`PAPERLEAN_EXACT`) or the platform cannot run `lean` again (Windows). Returns whether it is on. -/
-def enable : BaseIO Bool := do
-  if System.Platform.isWindows || (← IO.getEnv "PAPERLEAN_EXACT").isSome ||
-      (← IO.getEnv "PAPERLEAN_REUSE_ORACLE").isNone then
-    return false
-  enabledRef.set true
-  return true
+/-- A fault asked for, for testing the oracles (`PAPERLEAN_REUSE_FAULT`: `stale-cache` keeps the entries
+of Lean's caches under their earlier keys when a reuse of section variables renames these,
+`stale-fun-info` those of the cache of `funInfo`, `tc-names` counts one name too many for a reuse of a
+typeclass result). -/
+private builtin_initialize faultAsked : String ← return (← IO.getEnv "PAPERLEAN_REUSE_FAULT").getD ""
 
-/-- Records that a speculation differs from Lean's elaboration; `finish` then reports it. -/
-def fail (reason : String) : BaseIO Unit :=
-  failureRef.modify fun r? => r? <|> some reason
+/-- The fault to put in a reuse: none unless the oracle that is to find it runs. -/
+def fault : String :=
+  if reuseOracle then faultAsked else ""
 
-/-- Adds a background check, which `finish` waits for. -/
-def addCheck (t : Task Unit) : BaseIO Unit :=
-  checksRef.modify (·.push t)
+/-- Sets whether this thread elaborates commands in order (`onElabThread`). -/
+@[extern "lean_paperlean_set_elab_thread"]
+opaque setElabThread (on : Bool) : BaseIO Unit
 
-/-- Waits for every check, also those added meanwhile, and returns the first failure, if any. -/
-partial def finish : BaseIO (Option String) := do
-  let checks ← checksRef.modifyGet fun cs => (cs, #[])
-  if checks.isEmpty then
-    return (← failureRef.get)
-  for t in checks do
-    discard <| IO.wait t
-  finish
+/-- Whether this thread elaborates commands in order and may use the caches of reuse, unlike the
+tasks that it starts, e.g. of linters, whose order is not that of the commands. Only where
+`nativeAvailable`. -/
+@[extern "lean_paperlean_elab_thread"]
+opaque onElabThread : BaseIO Bool
 
-/-- Replaces this process by a run of `lean` with the same arguments and reuse off. Returns only if
-that is not possible. -/
-@[extern "lean_paperlean_reexec_exact"]
-opaque reexecExact : BaseIO Bool
+/-- Runs `act`, in which this thread uses no caches of reuse: for the oracles' run of Lean's own
+elaboration. -/
+def withoutReuse [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
+  let on ← onElabThread
+  setElabThread false
+  try act finally setElabThread on
 
-/--
-Runs `act`, the elaboration and reporting of the module `fileName` by `lean`. With reuse on, its
-standard output is held back until the checks have passed; if one fails, `lean` runs again without
-reuse (and with `PAPERLEAN_REUSE_LOG` set, appends the file and the reason to that file).
--/
-def withChecks (enabled : Bool) (fileName : String) (act : IO α) : IO α := do
-  unless enabled do
-    return (← act)
-  let buf ← IO.mkRef ({} : IO.FS.Stream.Buffer)
-  let out ← IO.setStdout (.ofBuffer buf)
-  let a ← try act finally discard <| IO.setStdout out
-  if let some reason ← finish then
-    if (← IO.getEnv "PAPERLEAN_DEBUG_REUSE").isSome then
-      IO.eprintln ("PaperLean: running again without reuse: " ++ reason)
-    -- (to count the runs again of a build)
-    if let some log ← IO.getEnv "PAPERLEAN_REUSE_LOG" then
-      IO.FS.withFile log .append (·.putStrLn (fileName ++ ": " ++ reason))
-    if !(← reexecExact) then
-      throw <| .userError ("PaperLean: could not run again without reuse (" ++ reason ++ ")")
-  out.write (← buf.get).data
-  out.flush
-  return a
+/-- Why computations were not kept or results not reused, of one kind of reuse: the number of each
+reason, and the position of the first (`line:column`). -/
+abbrev Reasons := IO.Ref (Std.HashMap String (Nat × String))
+
+/-- Counts `why`, with the position that `pos` gives if it is the first of its reason. -/
+def Reasons.note (r : Reasons) (why : String) (pos : Unit → String) : BaseIO Unit := do
+  let m ← r.get
+  match m[why]? with
+  | some (n, p) => r.set (m.insert why (n + 1, p))
+  | none => r.set (m.insert why (1, pos ()))
+
+/-- The reasons as `PAPERLEAN_REUSE_STATS` writes them: `why=count@position`. -/
+def Reasons.render (r : Reasons) : BaseIO (List String) := do
+  let m ← r.get
+  return m.toList.map fun (why, n, pos) => s!"{why}={n}@{pos}"
+
+/-- A way for a search or an elaboration to be left out of reuse altogether, whatever an earlier one
+did, in the order of `exclusions`. -/
+abbrev Exclusion := UInt8
+
+/-- What the exclusions say, of typeclass results (the first `numTcExclusions`) and of section
+variables. -/
+private def exclusions : Array String := #[
+  "not on the thread that elaborates commands in order, e.g. in a proof",
+  "trace options or diagnostics",
+  "a custom unfolding predicate",
+  "tracked or chosen let-variables",
+  "metavariables in the problem or in its context",
+  "in `grind`, under a name generator that starts again",
+  "not on the thread that elaborates commands in order",
+  "trace options or diagnostics",
+  "in the elaboration of a declaration in the background",
+  "the state is not that of the start of a command"]
+
+private def numTcExclusions := 6
+
+@[extern "lean_paperlean_note_exclusion"]
+private opaque noteExclusionCore (kind : Exclusion) : BaseIO Bool
+
+@[extern "lean_paperlean_exclusions"]
+private opaque exclusionCount (kind : Exclusion) : BaseIO Nat
+
+/-- The position of the first of each exclusion that happened, `line:column`. -/
+private builtin_initialize exclusionPosRef : IO.Ref (List (UInt8 × String)) ← IO.mkRef []
+
+/-- Counts a search or an elaboration left out in the way `kind`, on any thread, with the position
+that `pos` gives if it is the first. -/
+def noteExclusion (kind : Exclusion) (pos : Unit → String) : BaseIO Unit := do
+  if ← noteExclusionCore kind then
+    exclusionPosRef.modify (List.cons (kind, pos ()))
+
+/-- The exclusions as `PAPERLEAN_REUSE_STATS` writes them (`Reasons.render`), of typeclass results if
+`tc`, else of section variables. -/
+def renderExclusions (tc : Bool) : BaseIO (List String) := do
+  let pos ← exclusionPosRef.get
+  let mut out := []
+  let mut i := 0
+  for what in exclusions do
+    if (i < numTcExclusions) == tc then
+      let n ← exclusionCount i.toUInt8
+      if n > 0 then
+        let p := (pos.lookup i.toUInt8).getD "0:0"
+        out := s!"not eligible: {what}={n}@{p}" :: out
+    i := i + 1
+  return out
+
+/-- Says that a reuse differs from Lean's elaboration and ends the process with a failure. -/
+@[extern "lean_paperlean_speculation_fail"]
+opaque fail (reason : @& String) : BaseIO Unit
+
+@[extern "lean_paperlean_note_frontend"]
+private opaque noteFrontendCore (fileName : @& String) : BaseIO Unit
+
+/-- Notes a frontend run of `fileName`: from the second of the process on, nothing is reused any more,
+which it says on the standard error. -/
+@[noinline] def noteFrontend (fileName : String) : BaseIO Unit := do
+  if reuse then noteFrontendCore fileName
+
+/-- Stops a registration of a builtin (`KeyedDeclsAttribute.addBuiltin`) other than while `initializing`
+(`Lean.initializing`: also the initializers of imported modules, e.g. of Lake's builtin elaborators in
+a precompiled module), which is not normal code. -/
+@[noinline] def checkBuiltinRegistration (declName : Name) (initializing : Bool) : IO Unit := do
+  if nativeAvailable declName && reuse && !initializing then
+    throw <| .userError s!"PaperLean does not support registering a builtin at run time \
+      ({declName}); build this file with `lake build`"
 
 end Lean.PaperLean.Speculation

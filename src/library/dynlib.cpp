@@ -3,6 +3,7 @@ Copyright (c) 2021 Microsoft Corporation. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 
 Author: Leonardo de Moura, Mac Malone
+Modified by PaperLean.
 */
 #include "util/io.h"
 #include "runtime/io.h"
@@ -10,6 +11,7 @@ Author: Leonardo de Moura, Mac Malone
 #include "runtime/sstream.h"
 #include "runtime/exception.h"
 #include "library/dynlib.h"
+#include "paperlean/native_libs.h"
 
 #ifdef LEAN_WINDOWS
 #include <windows.h>
@@ -69,6 +71,7 @@ static inline void * symbol_ptr(b_obj_arg sym) {
 /* Dynlib.load : System.FilePath -> IO Dynlib */
 extern "C" LEAN_EXPORT obj_res lean_dynlib_load(b_obj_arg path) {
 #ifdef LEAN_WINDOWS
+    note_dynlib_load();
     HMODULE h = LoadLibrary(string_cstr(path));
     if (!h) {
         return io_result_mk_error((sstream()
@@ -82,6 +85,7 @@ extern "C" LEAN_EXPORT obj_res lean_dynlib_load(b_obj_arg path) {
     // In either case, loading the same symbol twice (and thus e.g. running initializers
     // manipulating global `IO.Ref`s twice) should be avoided; the common module
     // should instead be factored out into a separate shared library
+    note_dynlib_load();
     void *h = dlopen(string_cstr(path), RTLD_LAZY | RTLD_GLOBAL);
     if (!h) {
         return io_result_mk_error((sstream()

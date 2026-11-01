@@ -474,7 +474,7 @@ mutual
   -/
   partial def runTactic (mvarId : MVarId) (tacticCode : Syntax) (kind : TacticMVarKind) (report := true) : TermElabM Unit := withoutAutoBoundImplicit do
     -- PaperLean: tactics are not recorded (`Lean.PaperLean.EnvDeps`)
-    if PaperLean.envRecording mvarId then PaperLean.envMarkUnusableIO "a tactic"
+    PaperLean.noteTactic
     let wasExporting := (← getEnv).isExporting
     -- exit exporting context if entering proof
     let isNoLongerExporting ← pure (wasExporting && !(← backward.proofsInPublic.getM)) <&&> do

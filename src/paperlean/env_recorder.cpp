@@ -4,7 +4,11 @@ Released under Apache 2.0 license as described in the file LICENSE.
 */
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include <vector>
+#include "runtime/alloc.h"
 #include "runtime/object.h"
 
 // Part of the runtime (`src/runtime/CMakeLists.txt`), as tasks report to it.
@@ -18,9 +22,11 @@ struct env_recorder {
     std::vector<object *> m_checks;
     // why the recording is unusable, if it is
     char const * m_unusable = nullptr;
+    // the other reasons, distinct, for debugging (`PAPERLEAN_DEBUG_REUSE`)
+    std::vector<char const *> m_more_reasons;
 };
 
-// the number of threads recording, so that other threads do not read their thread-local slot
+// the number of recordings, so that threads that do not record do not read their thread-local slot
 static std::atomic<unsigned> g_env_recorders{0};
 static thread_local std::vector<env_recorder *> * t_env_recorders = nullptr;
 
@@ -71,29 +77,60 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_env_record(obj_arg access, obj_arg
     return r;
 }
 
-static void mark_unusable(char const * why) {
-    if (env_recorder * rec = current_env_recorder())
-        if (!rec->m_unusable) rec->m_unusable = why;
+/* Called when a recording becomes unusable (not inlined, so that a debugger can stop there to find
+   what made it so) */
+extern "C" LEAN_EXPORT __attribute__((noinline)) void lean_paperlean_env_became_unusable(
+    char const ** unusable, char const * why) {
+    *unusable = why;
+}
+
+static constexpr size_t g_max_more_reasons = 16;
+
+static void add_reason(env_recorder * rec, char const * why) {
+    if (!rec->m_unusable) {
+        lean_paperlean_env_became_unusable(&rec->m_unusable, why);
+        return;
+    }
+    if (rec->m_more_reasons.size() >= g_max_more_reasons || strcmp(rec->m_unusable, why) == 0)
+        return;
+    for (char const * r : rec->m_more_reasons)
+        if (strcmp(r, why) == 0) return;
+    rec->m_more_reasons.push_back(why);
+}
+
+// `why` kept for the rest of the process, once for each text: a recording below may take it over
+static char const * keep_reason(char const * why) {
+    static std::mutex mutex;
+    static auto * reasons = new std::unordered_set<std::string>();
+    std::lock_guard<std::mutex> lock(mutex);
+    return reasons->insert(why).first->c_str();
 }
 
 /* markUnusable (why : @& String) (r : α) : α -- the recording cannot be checked (e.g. the whole
-   constant map was read); `why` must be a literal (it is kept without a reference) */
+   constant map was read); `why` is copied */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_env_mark_unusable(b_obj_arg why, obj_arg r) {
-    mark_unusable(lean_string_cstr(why));
+    if (env_recorder * rec = current_env_recorder())
+        add_reason(rec, keep_reason(lean_string_cstr(why)));
     return r;
 }
 
 /* markUnusableIO (why : @& String) : BaseIO Unit (`BaseIO` functions take no world and return their
-   value); as `markUnusable`, but `why` is copied */
+   value); as `markUnusable` */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_env_mark_unusable_io(b_obj_arg why) {
     if (env_recorder * rec = current_env_recorder())
-        if (!rec->m_unusable) rec->m_unusable = strdup(lean_string_cstr(why));
+        add_reason(rec, keep_reason(lean_string_cstr(why)));
+    return box(0);
+}
+
+/* setHeartbeats (count : @& Nat) : BaseIO Unit -- `IO.setNumHeartbeats` with a borrowed count */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_set_heartbeats(b_obj_arg count) {
+    set_heartbeats(lean_uint64_of_nat(count));
     return box(0);
 }
 
 /* Called when a task is created: work of a recording thread done by another thread is not recorded. */
 extern "C" LEAN_EXPORT void lean_paperlean_env_note_task() {
-    mark_unusable("a task");
+    if (env_recorder * rec = current_env_recorder()) add_reason(rec, "a task");
 }
 
 /* recordAll (accesses : @& Array EnvAccess) (checks : @& Array NonScalar) : BaseIO Unit -- records the
@@ -122,7 +159,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_env_start_recording() {
 }
 
 /* stop : BaseIO (Array NonScalar × Array NonScalar × String) -- the accesses, their checks, and why
-   the recording is unusable (empty if it is usable); ends the recording started last on this thread */
+   the recording is unusable (its reasons, separated by `; `; empty if it is usable); ends the
+   recording started last on this thread */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_env_stop_recording() {
     lean_assert(t_env_recorders && !t_env_recorders->empty());
     env_recorder * rec = t_env_recorders->back();
@@ -138,7 +176,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_env_stop_recording() {
                 below->m_accesses.push_back(rec->m_accesses[i]);
                 below->m_checks.push_back(rec->m_checks[i]);
             }
-            if (rec->m_unusable && !below->m_unusable) below->m_unusable = rec->m_unusable;
+            if (rec->m_unusable) add_reason(below, rec->m_unusable);
+            for (char const * r : rec->m_more_reasons) add_reason(below, r);
         }
     }
     object * accesses = lean_alloc_array(rec->m_accesses.size(), rec->m_accesses.size());
@@ -147,7 +186,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_env_stop_recording() {
         lean_array_set_core(accesses, i, rec->m_accesses[i]);
         lean_array_set_core(checks, i, rec->m_checks[i]);
     }
-    object * why = lean_mk_string(rec->m_unusable ? rec->m_unusable : "");
+    std::string reasons = rec->m_unusable ? rec->m_unusable : "";
+    for (char const * r : rec->m_more_reasons) reasons = reasons + "; " + r;
+    object * why = lean_mk_string(reasons.c_str());
     delete rec;
     object * inner = lean_alloc_ctor(0, 2, 0);
     lean_ctor_set(inner, 0, checks);

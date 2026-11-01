@@ -11,6 +11,7 @@ public import Lake.Config.Monad
 public import Lake.Util.JsonObject
 public import Lake.Util.IO
 public import Lake.Build.Actions
+import Lake.PaperLean.HashCache
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -398,10 +399,13 @@ not exist, it will be created with a newly computed hash.
 
 If `text := true`, `file` is hashed as a text file rather than a binary file.
 -/
-public def fetchFileHash (file : FilePath) (text := false) : JobM Hash := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def fetchFileHash (file : FilePath) (text := false) : JobM Hash := do
   let hashFile := FilePath.mk <| file.toString ++ ".hash"
   if (← getTrustHash) then
-    if let some hash ← Hash.load? hashFile then
+    -- PaperLean: as `Hash.load?`, but under `paperlean build` without reading a file that is
+    -- unchanged since an earlier build read it (`Lake.PaperLean.HashCache`)
+    if let some hash ← PaperLean.HashCache.load? hashFile then
       return hash
   let hash ← computeFileHash file text
   createParentDirs hashFile
@@ -1127,3 +1131,4 @@ public def buildLeanExe
   (Job.collectArray linkLibs "linkLibs").mapM fun libs => do
     addPureTrace traceArgs "traceArgs"
     buildLeanExeSync exeFile objs libs (weakArgs ++ traceArgs) sharedLean macosxDeploymentTarget?
+-- Modified by PaperLean.

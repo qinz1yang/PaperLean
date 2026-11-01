@@ -1,0 +1,2 @@
+This test imports all of Lean in an interpreted program, which takes over 3 GB of memory at its
+peak; run alone, it does not add to the memory of other tests.

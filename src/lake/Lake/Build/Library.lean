@@ -13,6 +13,7 @@ import Lake.Build.Job.Register
 import Lake.Build.Target.Fetch
 import Lake.Build.Infos
 import Lake.Util.Proc
+import Lake.PaperLean.Env
 
 /-! # Library Facet Builds
 Build function definitions for a library's builtin facets.
@@ -29,18 +30,29 @@ private structure ModuleCollection where
   modSet : ModuleSet := ∅
   hasErrors : Bool := false
 
+/-- PaperLean: `mods`, after starting to read their headers under `paperlean build`, before the walk
+of the local modules walks into the first of them. -/
+@[noinline] private def PaperLean.fetchHeaders (mods : Array Module) : FetchM (Array Module) := do
+  if ← PaperLean.accelerated then
+    for mod in mods do discard <| mod.imports.fetch
+  return mods
+
+/-- PaperLean: under `paperlean build`, starts reading the headers of the modules among `mods` that
+are of the library `self`, before the walk of the local modules walks into the first of them. -/
+@[noinline] private def PaperLean.fetchLocalHeaders (self : LeanLib) (mods : Array Module) : FetchM Unit := do
+  if ← PaperLean.accelerated then
+    for mod in mods do if mod.lib.name = self.name then discard <| mod.imports.fetch
+
 /--
 Collect the local modules of a library.
 That is, the modules from `getModuleArray` plus their local transitive imports.
 -/
-partial def LeanLib.recCollectLocalModules
+-- PaperLean: (not inlined: PaperLean's body calls specializations that official Lean does not have)
+@[noinline] partial def LeanLib.recCollectLocalModules
   (self : LeanLib) : FetchM (Job (Array Module))
 := ensureJob do
   let mut col : ModuleCollection := {}
-  let roots ← self.getModuleArray
-  -- PaperLean: start reading the roots' headers before walking into the first of them
-  for mod in roots do discard <| mod.imports.fetch
-  for mod in roots do
+  for mod in (← PaperLean.fetchHeaders (← self.getModuleArray)) do
     col ← go mod col (viaImport := false)
   if col.hasErrors then
     -- This is not considered a fatal error because we want the modules
@@ -57,8 +69,7 @@ where
       let some imps ← (← root.imports.fetch).waitUnlessCanceled?
         | let col' := {col with hasErrors := true}
           return if viaImport then col' else {col' with mods := col'.mods.push root}
-      -- PaperLean: start reading the imports' headers before walking into the first of them
-      for mod in imps do if mod.lib.name = self.name then discard <| mod.imports.fetch
+      PaperLean.fetchLocalHeaders self imps
       for mod in imps do
         if mod.lib.name = self.name then
           col ← go mod col (viaImport := true)

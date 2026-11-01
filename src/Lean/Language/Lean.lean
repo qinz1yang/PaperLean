@@ -15,6 +15,7 @@ public import Lean.Language.Util
 public import Lean.Language.Lean.Types
 public import Lean.Language.Lean.Util
 public import Lean.Elab.Import
+import Lean.PaperLean.Speculation
 
 public section
 
@@ -764,12 +765,15 @@ where
       snap?        := if internal.cmdlineSnapshots.get scope.opts then none else snap
       cancelTk?    := some cancelTk
     }
+    -- PaperLean: this thread elaborates the commands in order, unlike the tasks that it starts
+    PaperLean.Speculation.setElabThread true
     let (output, _) ←
       IO.FS.withIsolatedStreams (isolateStderr := Core.stderrAsMessages.get scope.opts) do
         EIO.toBaseIO do
           withLoggingExceptions
             (getResetInfoTrees *> Elab.Command.elabCommandTopLevel stx cmds)
             cmdCtx cmdStateRef
+    PaperLean.Speculation.setElabThread false
     let cmdState ← cmdStateRef.get
     let mut messages := cmdState.messages
     if !output.isEmpty then
@@ -848,3 +852,4 @@ def truncateToHeader (snap : InitialSnapshot) : InitialSnapshot := Id.run do
       processedSnap := .finished none newProcessed } }
 
 end Lean
+-- Modified by PaperLean.

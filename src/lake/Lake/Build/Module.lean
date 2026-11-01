@@ -16,6 +16,8 @@ import Lake.Build.Common
 import Lake.Build.Target
 import Init.Omega
 import Lake.PaperLean.BuildData
+import Lake.PaperLean.Schedule
+import Lake.PaperLean.Env
 
 /-! # Module Build Definitions -/
 
@@ -38,9 +40,31 @@ def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async 
     return ⟨imp, (← findModule? imp.module)⟩
   return {path, header, imports, trace}
 
+/-- PaperLean: `recFetchInput`, the facet's build function, with the import graph noted. -/
+def PaperLean.recFetchInputNoted (mod : Module) : FetchM (Job ModuleInput) := Job.async do
+  let path := mod.leanFile
+  let contents ← IO.FS.readFile path
+  let trace := {caption := path.toString, mtime := ← getMTime path, hash := .ofText contents}
+  setTrace trace
+  let header ← Lean.parseImports' contents path.toString
+  let imports ← header.imports.mapM fun imp => do
+    return ⟨imp, (← findModule? imp.module)⟩
+  -- PaperLean: under `paperlean build`, the import graph for the order of compiles
+  -- (`Lake.PaperLean.Schedule`), and the imports' headers read meanwhile, which the build otherwise
+  -- reads one at a time as it walks into the imports (`Module.importInfoFacetConfig`); an import
+  -- cycle that this runs into is left to the walk to report, as without this
+  PaperLean.Schedule.noteModule mod imports (·.module?) contents.utf8ByteSize
+  if ← PaperLean.accelerated then
+    for imp in imports do
+      if let some m := imp.module? then
+        let s ← get
+        try discard <| m.header.fetch catch _ => set s
+  return {path, header, imports, trace}
+
 /-- The `ModuleFacetConfig` for the builtin `inputFacet`. -/
-public def Module.inputFacetConfig : ModuleFacetConfig inputFacet :=
-  mkFacetJobConfig recFetchInput (buildable := false)
+-- PaperLean: (not inlined: its body refers to PaperLean's code)
+@[noinline] public def Module.inputFacetConfig : ModuleFacetConfig inputFacet :=
+  mkFacetJobConfig PaperLean.recFetchInputNoted (buildable := false)
 
 /-- The `ModuleFacetConfig` for the builtin `leanFacet`. -/
 public def Module.leanFacetConfig : ModuleFacetConfig leanFacet :=
@@ -991,9 +1015,13 @@ def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
 public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
-def Module.buildLean
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup)
-: JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
+: JobM ModuleOutputArtifacts := do
+  -- PaperLean: a module that compiles first waits for a slot (`Module.recBuildLean`)
+  if (← PaperLean.Schedule.deferCompile mod) then failure
+  buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← mkModuleSetup mod presetup
@@ -1001,8 +1029,10 @@ def Module.buildLean
   mod.clearOutputArtifacts
   -- PaperLean: packs modules compiled by this build for later ones (`Lake.PaperLean.BuildData`)
   PaperLean.BuildData.compileStarting mod (← getWorkspace).dir (← getLeanInstall).leanLibDir
+  let start ← IO.monoMsNow
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
     (← getLeanPath) (← getLean) (← getLeanir)
+  PaperLean.Schedule.compiled mod ((← IO.monoMsNow) - start)
   mod.clearOutputHashes
   mod.computeArtifacts setup.isModule
 
@@ -1024,7 +1054,6 @@ def Module.recBuildLean (mod : Module) : FetchM (Job ModuleOutputArtifacts) := d
     let arts ← fetchCore presetup
     let arts ← trackOutputsIfEnabled arts
     let arts ← adjustMTime arts
-    PaperLean.BuildData.moduleDone mod
     return arts
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM (ModuleOutputArtifacts ⊕ SavedTrace) := do
@@ -1140,9 +1169,52 @@ where
     | .error e =>
       error s!"failed to retrieve module artifact modification time: {e}"
 
+/-- PaperLean: `recBuildLean`, the facet's build function, with the order of compiles of the build's
+scheduler and the packs of the modules built. -/
+def Module.recBuildLeanScheduled (mod : Module) : FetchM (Job ModuleOutputArtifacts) := do
+  /-
+  Remark: `withRegisterJob` must register `presetupJob` to display module builds
+  in the job monitor. However, it must also include the fetching of the job to
+  ensure all logs end up under its caption in the job monitor.
+  -/
+  withRegisterJob mod.name.toString do
+  let presetupJob ← mod.presetup.fetch
+  -- PaperLean: under `paperlean build`, a module that compiles waits for a slot of the build's
+  -- scheduler (`Lake.PaperLean.Schedule`): its job runs up to its compile (`Module.buildLean`), which
+  -- it then does not do, and runs again once it has a slot; the job is settled when it ends
+  if (← PaperLean.Schedule.active) && !(← getNoBuild) then
+    PaperLean.Schedule.register mod
+    let job ← presetupJob.bindM fun presetup => do
+      let s ← get
+      setTrace presetup.trace
+      PaperLean.Schedule.beginDry mod
+      let r ← try Except.ok <$> run presetup catch e => pure (.error e)
+      unless ← PaperLean.Schedule.endDry mod do
+        match r with
+        | .ok arts => return .ofTask (.pure (.ok arts {trace := ← getTrace}))
+        | .error e => throw e
+      set s
+      let slot ← PaperLean.Schedule.request mod
+      Job.ofTask (slot.map (sync := true) fun _ => .ok () {}) |>.mapM fun _ => do
+        setTrace presetup.trace
+        run presetup
+    PaperLean.Schedule.settleAfter mod (job.task.map (sync := true) (· matches .ok ..))
+    return job
+  presetupJob.mapM fun presetup => do
+    setTrace presetup.trace
+    run presetup
+where
+  run presetup : JobM ModuleOutputArtifacts := do
+    let arts ← recBuildLean.fetchCore mod presetup
+    let arts ← recBuildLean.trackOutputsIfEnabled mod arts
+    let arts ← recBuildLean.adjustMTime mod arts
+    PaperLean.BuildData.moduleDone mod
+    return arts
+
 /-- The `ModuleFacetConfig` for the builtin `leanArtsFacet`. -/
-public def Module.leanArtsFacetConfig : ModuleFacetConfig leanArtsFacet :=
-  mkFacetJobConfig recBuildLean
+-- PaperLean: (not inlined: its body refers to PaperLean's code)
+@[noinline] public def Module.leanArtsFacetConfig : ModuleFacetConfig leanArtsFacet :=
+  mkFacetJobConfig recBuildLeanScheduled
 
 @[inline] def Module.fetchOLeanCore
   (facet : String) (f : ModuleOutputArtifacts → Option Artifact) (errMsg : String) (mod : Module)

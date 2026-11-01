@@ -392,11 +392,16 @@ bool init_trie_empty() {
 //
 // An image refers to the objects of one olean pack by their addresses. Per extension it holds the
 // classes of the names and origins of all entries, the known trie nodes, and per entries array of a
-// packed part the interned entries. All tables are checked when an extension's state is first
-// built: its checksum, and that every index and object lies in range.
+// packed part the interned entries. Its writer checks all tables (`check_image_ext`: their checksum,
+// and that every index and object lies in range), and records the checksums of the file's blocks
+// (`side_file_blocks`). Readers check that the tables lie in the file, and the blocks and the
+// ranges of the indices and objects they use when they first use them; tables found damaged are
+// not used (`image_damaged`).
 
 constexpr char g_image_kind[] = "import-image";
-constexpr uint32 g_image_format = 1;
+constexpr uint32 g_image_format = 4;
+// `image_header::validated` of an image whose writer checked its tables.
+constexpr uint32 g_image_validated = 0x564c4150;
 constexpr uint32 g_none = UINT32_MAX;
 
 struct image_range { uint64 off, num; };
@@ -420,7 +425,16 @@ struct image_header {
     uint64 pack_checksum, pack_base, pack_size;   // the pack the object addresses are in
     uint64 size;
     uint64 exts_off;
+    // The file's modification time, as the writer set it after writing everything else.
+    int64 mtime_sec, mtime_nsec;
+    uint32 validated;                             // `g_image_validated`
+    uint32 unused;
+    // The checksums of the blocks of `[sizeof(image_header), block_sums_off)`, from `block_sums_off`
+    // to the end of the file, and their checksum.
+    uint64 block_sums_off, block_sums_checksum;
 };
+// The seed of the checksum of the table of block checksums.
+constexpr uint64 g_image_block_sums_seed = 0x73756d73ull;
 struct image_node { uint64 key; uint32 first_child, num_children, first_class, num_classes; };
 struct image_root { uint64 hash; uint32 node, unused; };      // sorted by hash
 struct image_name { uint64 hash, rep; };
@@ -440,6 +454,63 @@ static_assert(sizeof(image_entry) == 56, "image_entry is packed");
 template<class T> T const * range_ptr(char const * base, image_range r) { return reinterpret_cast<T const *>(base + r.off); }
 inline size_t slot_of(uint64 h, size_t size) { return (h * 0x9e3779b97f4a7c15ull >> 20) & (size - 1); }
 
+// Thrown when a table of the image in use turns out to be inconsistent while a state is replayed.
+struct image_damaged {};
+[[noreturn]] void damaged() { throw image_damaged(); }
+// The address range of the pack that the image in use describes, where its objects lie.
+uint64 g_image_pack_base = 0, g_image_pack_size = 0;
+// The blocks of the image in use.
+side_file_blocks const * g_image_blocks = nullptr;
+// Whether the `n` bytes at `p`, of the image in use, are as written.
+inline bool image_used(void const * p, uint64 n) { return g_image_blocks && g_image_blocks->ok(p, n); }
+template<class T> inline bool image_used(T const & x) { return image_used(&x, sizeof(T)); }
+inline bool image_obj_ok(uint64 a) { return a % 8 == 0 && a >= g_image_pack_base && a - g_image_pack_base < g_image_pack_size; }
+// keys and names may also be scalars
+inline bool image_key_ok(uint64 a) { return (a & 1) == 1 || image_obj_ok(a); }
+
+// `n` zero-initialized elements of a trivial type; large blocks are mapped, so that the pages that
+// are never written are never touched.
+template<class T> class zeroed_array {
+    T * m_data = nullptr;
+    size_t m_size = 0;
+    bool m_mapped = false;
+    void release() {
+        if (!m_data) return;
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+        if (m_mapped) { munmap(m_data, m_size * sizeof(T)); return; }
+#endif
+        free(m_data);
+    }
+public:
+    zeroed_array() {}
+    zeroed_array(zeroed_array const &) = delete;
+    zeroed_array & operator=(zeroed_array const &) = delete;
+    ~zeroed_array() { release(); }
+    size_t size() const { return m_size; }
+    T & operator[](size_t i) { return m_data[i]; }
+    T const & operator[](size_t i) const { return m_data[i]; }
+    // Grows to at least `n` elements, keeping the existing ones.
+    void grow(size_t n) {
+        if (n <= m_size) return;
+        n = std::max(n, 2 * m_size);
+        T * data = nullptr;
+        bool mapped = false;
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+        if (n * sizeof(T) >= (1u << 20)) {
+            void * m = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m != MAP_FAILED) { data = static_cast<T *>(m); mapped = true; }
+        }
+#endif
+        if (!data) data = static_cast<T *>(calloc(n, sizeof(T)));
+        if (!data) throw std::bad_alloc();
+        if (m_size) memcpy(static_cast<void *>(data), m_data, m_size * sizeof(T));
+        release();
+        m_data = data;
+        m_size = n;
+        m_mapped = mapped;
+    }
+};
+
 // =======================================
 // Classes
 
@@ -456,17 +527,22 @@ public:
         m_img = img; m_img_num = n; m_index = index; m_index_size = index_size;
     }
     size_t size() const { return m_img_num + m_dyn.size(); }
-    uint64 hash(uint32 c) const { return c < m_img_num ? m_img[c].hash : m_dyn[c - m_img_num].hash; }
+    uint64 hash(uint32 c) const { return c < m_img_num ? img(c).hash : m_dyn[c - m_img_num].hash; }
     object * rep(uint32 c) const {
-        return reinterpret_cast<object *>(c < m_img_num ? m_img[c].rep : m_dyn[c - m_img_num].rep);
+        return reinterpret_cast<object *>(c < m_img_num ? img(c).rep : m_dyn[c - m_img_num].rep);
+    }
+    image_name const & img(uint32 c) const {
+        if (!image_used(m_img[c])) damaged();
+        return m_img[c];
     }
     uint32 get(object * n) {
         uint64 h = lean_name_hash(n);
-        if (m_index_size) {
-            for (size_t i = slot_of(h, m_index_size); m_index[i] != 0; i = (i + 1) & (m_index_size - 1)) {
-                uint32 c = m_index[i] - 1;
-                if (m_img[c].hash == h && lean_name_eq(reinterpret_cast<object *>(m_img[c].rep), n)) return c;
-            }
+        size_t probes = 0;
+        for (size_t i = m_index_size ? slot_of(h, m_index_size) : 0; m_index_size && m_index[i] != 0; i = (i + 1) & (m_index_size - 1)) {
+            if (!image_used(m_index[i])) damaged();
+            uint32 c = m_index[i] - 1;
+            if (++probes > m_index_size || c >= m_img_num || !image_key_ok(img(c).rep)) damaged();
+            if (m_img[c].hash == h && lean_name_eq(reinterpret_cast<object *>(m_img[c].rep), n)) return c;
         }
         std::vector<uint32> & cs = m_dyn_by_hash[h];
         for (uint32 c : cs)
@@ -492,12 +568,19 @@ public:
     }
     static uint64 key_of(uint8 kind, uint32 name_class) { return static_cast<uint64>(name_class) << 2 | kind; }
     size_t size() const { return m_img_num + m_dyn.size(); }
-    uint64 hash(uint32 c) const { return c < m_img_num ? m_img[c].hash : m_dyn[c - m_img_num].hash; }
-    uint64 key(uint32 c) const { return c < m_img_num ? m_img[c].key : m_dyn[c - m_img_num].key; }
+    uint64 hash(uint32 c) const { return c < m_img_num ? img(c).hash : m_dyn[c - m_img_num].hash; }
+    uint64 key(uint32 c) const { return c < m_img_num ? img(c).key : m_dyn[c - m_img_num].key; }
+    image_origin const & img(uint32 c) const {
+        if (!image_used(m_img[c])) damaged();
+        return m_img[c];
+    }
     uint32 find(uint64 key) const {
-        if (m_index_size) {
-            for (size_t i = slot_of(key, m_index_size); m_index[i] != 0; i = (i + 1) & (m_index_size - 1))
-                if (m_img[m_index[i] - 1].key == key) return m_index[i] - 1;
+        size_t probes = 0;
+        for (size_t i = m_index_size ? slot_of(key, m_index_size) : 0; m_index_size && m_index[i] != 0; i = (i + 1) & (m_index_size - 1)) {
+            if (!image_used(m_index[i])) damaged();
+            uint32 c = m_index[i] - 1;
+            if (++probes > m_index_size || c >= m_img_num) damaged();
+            if (img(c).key == key) return c;
         }
         auto it = m_dyn_ids.find(key);
         return it == m_dyn_ids.end() ? g_none : it->second;
@@ -521,9 +604,13 @@ class trie_universe {
     image_node const * m_img = nullptr;
     uint32 m_img_num = 0;
     uint32 const * m_img_children = nullptr;
+    uint64 m_img_num_children = 0;
     uint64 const * m_img_classes = nullptr;
+    uint64 m_img_num_classes = 0;
     image_root const * m_img_roots = nullptr;
     size_t m_img_num_roots = 0;
+    // per image node: 1 = its key is checked, 2 = also its children and classes
+    zeroed_array<uint8> m_checked;
     struct node {
         object * key;
         std::vector<uint32> children;
@@ -546,11 +633,39 @@ public:
         size_t size() const { return e - b; }
         uint32 operator[](size_t i) const { return b[i]; }
     };
-    void load(image_node const * nodes, uint32 num, uint32 const * children, uint64 const * classes,
-              image_root const * roots, size_t num_roots) {
-        m_img = nodes; m_img_num = num; m_img_children = children; m_img_classes = classes;
-        m_img_roots = roots; m_img_num_roots = num_roots;
+    void load(image_node const * nodes, uint32 num, uint32 const * children, uint64 num_children,
+              uint64 const * classes, uint64 num_classes, image_root const * roots, size_t num_roots) {
+        m_img = nodes; m_img_num = num; m_img_children = children; m_img_num_children = num_children;
+        m_img_classes = classes; m_img_num_classes = num_classes; m_img_roots = roots; m_img_num_roots = num_roots;
     }
+    uint32 num_img() const { return m_img_num; }
+    // Checks image node `n`: its key, and with `all` its children, which come after it (so the
+    // trie has no cycles), and its value classes; returns `n`.
+    uint32 check(uint32 n, bool all) {
+        if (n >= m_img_num) damaged();
+        uint8 level = all ? 2 : 1;
+        if (m_checked.size() == 0) m_checked.grow(m_img_num);
+        if (m_checked[n] >= level) return n;
+        image_node const & in = m_img[n];
+        if (!image_used(in) || !image_key_ok(in.key)) damaged();
+        if (all) {
+            if (in.first_child > m_img_num_children || in.num_children > m_img_num_children - in.first_child ||
+                in.first_class > m_img_num_classes || in.num_classes > m_img_num_classes - in.first_class ||
+                !image_used(m_img_children + in.first_child, uint64(in.num_children) * sizeof(uint32)) ||
+                !image_used(m_img_classes + in.first_class, uint64(in.num_classes) * sizeof(uint64)))
+                damaged();
+            for (uint32 j = 0; j < in.num_children; j++) {
+                uint32 c = m_img_children[in.first_child + j];
+                if (c >= m_img_num || c <= n) damaged();
+            }
+            for (uint32 j = 0; j < in.num_classes; j++)
+                if (!image_obj_ok(m_img_classes[in.first_class + j])) damaged();
+        }
+        m_checked[n] = level;
+        return n;
+    }
+    // The number of value classes of the checked image node `n`.
+    uint32 img_num_classes(uint32 n) const { return m_img[n].num_classes; }
     size_t size() const { return m_img_num + m_dyn.size(); }
     object * key(uint32 n) const {
         return n < m_img_num ? reinterpret_cast<object *>(m_img[n].key) : m_dyn[n - m_img_num].key;
@@ -568,10 +683,17 @@ public:
         return span { b, b + m_img[n].num_children };
     }
     uint32 root(object * k, uint64 h) {
-        image_root const * it = std::lower_bound(m_img_roots, m_img_roots + m_img_num_roots, h,
-            [](image_root const & r, uint64 x) { return r.hash < x; });
-        for (; it != m_img_roots + m_img_num_roots && it->hash == h; ++it)
-            if (key(it->node) == k || key_beq(key(it->node), k)) return it->node;
+        size_t lo = 0, hi = m_img_num_roots;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (!image_used(m_img_roots[mid])) damaged();
+            if (m_img_roots[mid].hash < h) lo = mid + 1; else hi = mid;
+        }
+        for (image_root const * it = m_img_roots + lo; it != m_img_roots + m_img_num_roots; ++it) {
+            if (!image_used(*it)) damaged();
+            if (it->hash != h) break;
+            if (key(check(it->node, false)) == k || key_beq(key(it->node), k)) return check(it->node, true);
+        }
         std::vector<uint32> & ns = m_dyn_roots[h];
         for (uint32 n : ns)
             if (key(n) == k || key_beq(key(n), k)) return n;
@@ -579,14 +701,18 @@ public:
         ns.push_back(n);
         return n;
     }
+    // The child of `n` (a checked node) with key `k`, checked.
     uint32 child(uint32 n, object * k) {
         span cs = children(n);
+        // the key of a child, checked if it is an image node
+        auto ckey = [&](uint32 c) { return key(c < m_img_num ? check(c, false) : c); };
         size_t lo = 0, hi = cs.size();
         while (lo < hi) {
             size_t mid = (lo + hi) / 2;
-            if (key_lt(key(cs[mid]), k)) lo = mid + 1; else hi = mid;
+            if (key_lt(ckey(cs[mid]), k)) lo = mid + 1; else hi = mid;
         }
-        if (lo < cs.size() && (key(cs[lo]) == k || !key_lt(k, key(cs[lo])))) return cs[lo];
+        if (lo < cs.size() && (ckey(cs[lo]) == k || !key_lt(k, key(cs[lo]))))
+            return cs[lo] < m_img_num ? check(cs[lo], true) : cs[lo];
         uint32 c = add(k);
         if (n >= m_img_num) {
             std::vector<uint32> & v = m_dyn[n - m_img_num].children;
@@ -658,49 +784,6 @@ size_t pushed_capacity(size_t start, size_t size) {
     }
     return cap;
 }
-
-// `n` zero-initialized elements of a trivial type; large blocks are mapped, so that the pages that
-// are never written are never touched.
-template<class T> class zeroed_array {
-    T * m_data = nullptr;
-    size_t m_size = 0;
-    bool m_mapped = false;
-    void release() {
-        if (!m_data) return;
-#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
-        if (m_mapped) { munmap(m_data, m_size * sizeof(T)); return; }
-#endif
-        free(m_data);
-    }
-public:
-    zeroed_array() {}
-    zeroed_array(zeroed_array const &) = delete;
-    zeroed_array & operator=(zeroed_array const &) = delete;
-    ~zeroed_array() { release(); }
-    size_t size() const { return m_size; }
-    T & operator[](size_t i) { return m_data[i]; }
-    T const & operator[](size_t i) const { return m_data[i]; }
-    // Grows to at least `n` elements, keeping the existing ones.
-    void grow(size_t n) {
-        if (n <= m_size) return;
-        n = std::max(n, 2 * m_size);
-        T * data = nullptr;
-        bool mapped = false;
-#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
-        if (n * sizeof(T) >= (1u << 20)) {
-            void * m = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (m != MAP_FAILED) { data = static_cast<T *>(m); mapped = true; }
-        }
-#endif
-        if (!data) data = static_cast<T *>(calloc(n, sizeof(T)));
-        if (!data) throw std::bad_alloc();
-        if (m_size) memcpy(static_cast<void *>(data), m_data, m_size * sizeof(T));
-        release();
-        m_data = data;
-        m_size = n;
-        m_mapped = mapped;
-    }
-};
 
 // The fold's trie, as nodes of a `trie_universe`, and its root map.
 class trie_builder {
@@ -1033,8 +1116,15 @@ struct loaded_image {
     image_ext const * exts = nullptr;
     // per extension: 0 = not yet checked, 1 = usable, 2 = not
     std::unique_ptr<std::atomic<uint8>[]> state;
-    std::unique_ptr<std::mutex[]> check_mutex;
+    side_file_blocks blocks;
 };
+
+// Whether the table of block checksums of `img` lies at the end of the file after the header,
+// covering the rest.
+bool image_blocks_in_range(image_header const & hdr) {
+    return hdr.block_sums_off % 8 == 0 && hdr.block_sums_off >= sizeof(image_header) && hdr.block_sums_off <= hdr.size &&
+        hdr.size - hdr.block_sums_off == 8 * side_file_num_blocks(hdr.block_sums_off - sizeof(image_header));
+}
 
 std::once_flag g_image_once;
 loaded_image * g_image = nullptr;
@@ -1043,12 +1133,12 @@ loaded_image * g_image = nullptr;
 void load_image() {
     char const * fname = getenv("LEAN_IMPORT_IMAGE");
     if (!fname || !*fname) return;
-    auto warn = [&](char const * why) { fprintf(stderr, "warning: ignoring import image '%s': %s\n", fname, why); };
-    int fd = open(fname, O_RDONLY);
+    auto warn = [&](char const * why) { side_file_warning("warning: ignoring import image '%s': %s\n", fname, why); };
+    int fd = open(fname, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) { warn(strerror(errno)); return; }
     struct stat st;
     image_header hdr;
-    if (fstat(fd, &st) != 0 || static_cast<uint64>(st.st_size) < sizeof(hdr) ||
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || static_cast<uint64>(st.st_size) < sizeof(hdr) ||
         pread(fd, &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr))) {
         close(fd); warn("not a PaperLean side file"); return;
     }
@@ -1062,29 +1152,40 @@ void load_image() {
         pack_base != hdr.pack_base || pack_size != hdr.pack_size) {
         close(fd); warn("it belongs to another olean pack than the first of LEAN_OLEAN_PACK"); return;
     }
+    if (!side_file_mtime_is(st, hdr.mtime_sec, hdr.mtime_nsec)) { close(fd); warn("it changed since it was written"); return; }
+    if (hdr.validated != g_image_validated) { close(fd); warn("corrupt"); return; }
     void * m = mmap(nullptr, hdr.size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) { warn(strerror(errno)); return; }
+    char const * sums = static_cast<char const *>(m) + hdr.block_sums_off;
     if (hdr.exts_off % 8 != 0 || hdr.exts_off > hdr.size || hdr.num_exts > (hdr.size - hdr.exts_off) / sizeof(image_ext) ||
-        image_checksum(hdr, static_cast<char const *>(m) + hdr.exts_off, hdr.num_exts * sizeof(image_ext)) != hdr.common.checksum) {
+        image_checksum(hdr, static_cast<char const *>(m) + hdr.exts_off, hdr.num_exts * sizeof(image_ext)) != hdr.common.checksum ||
+        !image_blocks_in_range(hdr) ||
+        side_file_checksum4(sums, hdr.size - hdr.block_sums_off, g_image_block_sums_seed) != hdr.block_sums_checksum) {
         munmap(m, hdr.size); warn("corrupt (checksum mismatch)"); return;
     }
     loaded_image * img = new loaded_image();
+    img->blocks.init(static_cast<char const *>(m) + sizeof(image_header), hdr.block_sums_off - sizeof(image_header),
+                     reinterpret_cast<uint64 const *>(sums));
+    g_image_blocks = &img->blocks;
     img->begin = static_cast<char const *>(m);
     img->hdr = hdr;
     img->exts = reinterpret_cast<image_ext const *>(img->begin + hdr.exts_off);
     img->state.reset(new std::atomic<uint8>[hdr.num_exts]);
-    img->check_mutex.reset(new std::mutex[hdr.num_exts]);
     for (uint32 i = 0; i < hdr.num_exts; i++) img->state[i].store(0);
+    g_image_pack_base = hdr.pack_base;
+    g_image_pack_size = hdr.pack_size;
     g_image = img;
 }
 #else
 void load_image() {}
 #endif
 
-// Whether all tables of `x` are in range and consistent, and its checksum matches.
-bool check_image_ext(loaded_image const & img, image_ext const & x) {
-    uint64 size = img.hdr.size;
+// Whether all tables of `x` lie in the image, its hash tables have a power of two of slots, and, with
+// `checksum`, the checksum of the tables matches.
+bool image_ext_in_range(loaded_image const & img, image_ext const & x, bool checksum) {
+    // the tables lie in the blocks
+    uint64 size = img.hdr.block_sums_off;
     image_range const * ranges[] = { &x.name, &x.trees[0].nodes, &x.trees[0].children, &x.trees[0].classes,
         &x.trees[0].roots, &x.trees[1].nodes, &x.trees[1].children, &x.trees[1].classes, &x.trees[1].roots,
         &x.names, &x.names_index, &x.origins, &x.origins_index, &x.arrays, &x.entries, &x.steps };
@@ -1093,12 +1194,20 @@ bool check_image_ext(loaded_image const & img, image_ext const & x) {
     uint64 h = side_file_checksum(nullptr, 0);
     for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); i++) {
         image_range r = *ranges[i];
-        if (r.off % 8 != 0 || r.off > size || r.num > (size - r.off) / elems[i] || r.num > UINT32_MAX) return false;
-        h = side_file_checksum(img.begin + r.off, r.num * elems[i], h);
+        if (r.off % 8 != 0 || r.off < sizeof(image_header) || r.off > size || r.num > (size - r.off) / elems[i] ||
+            r.num > UINT32_MAX)
+            return false;
+        if (checksum) h = side_file_checksum(img.begin + r.off, r.num * elems[i], h);
     }
-    if (h != x.checksum || x.kind > 1) return false;
+    if ((checksum && h != x.checksum) || x.kind > 1) return false;
     auto pow2 = [](uint64 n) { return n == 0 || (n & (n - 1)) == 0; };
-    if (!pow2(x.names_index.num) || !pow2(x.origins_index.num) || !pow2(x.arrays.num) || x.arrays.num == 0) return false;
+    return pow2(x.names_index.num) && pow2(x.origins_index.num) && pow2(x.arrays.num) && x.arrays.num != 0;
+}
+
+// Whether all tables of `x` are in range and consistent, and its checksum matches, as the writer
+// leaves them.
+bool check_image_ext(loaded_image const & img, image_ext const & x) {
+    if (!image_ext_in_range(img, x, true)) return false;
     // all objects are in the pack the image describes, the first one
     auto obj_ok = [&](uint64 a) { return a % 8 == 0 && a >= img.hdr.pack_base && a - img.hdr.pack_base < img.hdr.pack_size; };
     // keys and names may also be scalars
@@ -1173,12 +1282,18 @@ bool check_image_ext(loaded_image const & img, image_ext const & x) {
                 (e.okind == 0 && e.converse != g_none))
                 return false;
         } else if (e.kind == 1 || e.kind == 2) {
-            if (e.cls >= x.names.num || !key_ok(e.obj) || (e.kind == 2 && !obj_ok(e.value))) return false;
+            if (e.num_steps != 0 || e.cls >= x.names.num || !key_ok(e.obj) || (e.kind == 2 && !obj_ok(e.value))) return false;
         } else if (e.kind == 3) {
             if (e.cls != g_none && (e.cls >= x.names.num || !key_ok(e.obj))) return false;
         }
     }
     return true;
+}
+
+// Marks the image's tables `i` as not usable, with a warning.
+void image_ext_damaged(uint32 i) {
+    if (g_image->state[i].exchange(2, std::memory_order_acq_rel) != 2)
+        side_file_warning("warning: ignoring the import image's tables for an extension: corrupt\n");
 }
 
 // The index of the image's tables for the extension with `extension_name_key` `key`, -1 if none.
@@ -1188,22 +1303,25 @@ int64 find_image_ext(std::string const & key) {
     for (uint32 i = 0; i < g_image->hdr.num_exts; i++) {
         image_ext const & x = g_image->exts[i];
         if (x.name.off > g_image->hdr.size || x.name.num > g_image->hdr.size - x.name.off) continue;
+        if (!image_used(g_image->begin + x.name.off, x.name.num)) {
+            image_ext_damaged(i);
+            continue;
+        }
         if (x.name.num == key.size() && memcmp(g_image->begin + x.name.off, key.data(), key.size()) == 0) return i;
     }
     return -1;
 }
 
-// Whether the image's tables `i` are usable; they are checked the first time, on any thread.
+// Whether the image's tables `i` are usable: they lie in the image (checked the first time, on any
+// thread), and no inconsistency was found in them.
 bool image_ext_usable(uint32 i) {
     uint8 st = g_image->state[i].load(std::memory_order_acquire);
     if (st == 0) {
-        std::lock_guard<std::mutex> lock(g_image->check_mutex[i]);
+        bool ok = image_ext_in_range(*g_image, g_image->exts[i], false);
+        if (!ok) image_ext_damaged(i);
+        uint8 expected = 0;
+        g_image->state[i].compare_exchange_strong(expected, 1, std::memory_order_acq_rel);
         st = g_image->state[i].load(std::memory_order_acquire);
-        if (st == 0) {
-            st = check_image_ext(*g_image, g_image->exts[i]) ? 1 : 2;
-            if (st == 2) fprintf(stderr, "warning: ignoring the import image's tables for an extension: corrupt\n");
-            g_image->state[i].store(st, std::memory_order_release);
-        }
     }
     return st == 1;
 }
@@ -1221,21 +1339,62 @@ void load_interning(interning & in, image_ext const & x) {
     for (unsigned t = 0; t < 2; t++) {
         image_tree const & tr = x.trees[t];
         in.trees[t].load(range_ptr<image_node>(b, tr.nodes), static_cast<uint32>(tr.nodes.num),
-                         range_ptr<uint32>(b, tr.children), range_ptr<uint64>(b, tr.classes),
-                         range_ptr<image_root>(b, tr.roots), tr.roots.num);
+                         range_ptr<uint32>(b, tr.children), tr.children.num, range_ptr<uint64>(b, tr.classes),
+                         tr.classes.num, range_ptr<image_root>(b, tr.roots), tr.roots.num);
     }
     in.names.load(range_ptr<image_name>(b, x.names), x.names.num, range_ptr<uint32>(b, x.names_index), x.names_index.num);
     in.origins.load(range_ptr<image_origin>(b, x.origins), x.origins.num,
                     range_ptr<uint32>(b, x.origins_index), x.origins_index.num);
 }
 
-// The interned entries of an entries array of a packed part, if the image has them.
-image_array const * image_array_of(image_ext const & x, object * a) {
+// The interned entries of an entries array of a packed part, if the image has them (their range is
+// not checked); `damaged` is set if the table is.
+image_array const * image_array_of(image_ext const & x, object * a, bool & damaged) {
     image_array const * arrays = range_ptr<image_array>(g_image->begin, x.arrays);
     uint64 addr = reinterpret_cast<uint64>(a);
-    for (size_t i = slot_of(addr, x.arrays.num); arrays[i].addr != 0; i = (i + 1) & (x.arrays.num - 1))
+    size_t i = slot_of(addr, x.arrays.num);
+    for (size_t probes = 0; probes < x.arrays.num; probes++, i = (i + 1) & (x.arrays.num - 1)) {
+        if (!image_used(arrays[i])) { damaged = true; return nullptr; }
+        if (arrays[i].addr == 0) return nullptr;
         if (arrays[i].addr == addr) return &arrays[i];
+    }
     return nullptr;
+}
+
+// Checks the indices and objects of the image entry `e` of `x`.
+void check_image_entry(interning & in, image_ext const & x, image_entry const & e) {
+    if (e.kind > 3 || (x.kind == 0) == (e.kind == 3)) damaged();
+    if (e.kind == 0 || e.kind == 3) {
+        if (e.tree > (x.kind == 0 ? 1 : 0) || e.num_steps == 0 || e.first_step > x.steps.num ||
+            e.num_steps > x.steps.num - e.first_step || !image_obj_ok(e.value))
+            damaged();
+        image_step const * ss = range_ptr<image_step>(g_image->begin, x.steps) + e.first_step;
+        if (!image_used(ss, uint64(e.num_steps) * sizeof(image_step))) damaged();
+        trie_universe & u = in.trees[e.tree];
+        for (uint32 s = 0; s < e.num_steps; s++) {
+            if (!image_key_ok(ss[s].key)) damaged();
+            u.check(ss[s].node, true);
+        }
+        if (e.vclass >= u.img_num_classes(ss[e.num_steps - 1].node)) damaged();
+    }
+    if (e.kind == 0) {
+        if (e.cls >= x.origins.num || !image_obj_ok(e.obj) || e.okind > 2 ||
+            (e.okind != 0 && (e.converse >= x.origins.num || e.decl >= x.names.num)) ||
+            (e.okind == 0 && e.converse != g_none))
+            damaged();
+    } else if (e.kind == 1 || e.kind == 2) {
+        if (e.num_steps != 0 || e.cls >= x.names.num || !image_key_ok(e.obj) || (e.kind == 2 && !image_obj_ok(e.value)))
+            damaged();
+    } else if (e.cls != g_none && (e.cls >= x.names.num || !image_key_ok(e.obj))) {
+        damaged();
+    }
+    // the classes' records, which the replay reads by these indices
+    if (e.kind == 0) {
+        in.origins.hash(e.cls);
+        if (e.okind != 0) { in.origins.hash(e.converse); in.names.hash(e.decl); }
+    } else if (e.cls != g_none) {
+        in.names.hash(e.cls);
+    }
 }
 
 // =======================================
@@ -1415,21 +1574,38 @@ std::vector<object *> nonempty_arrays(b_obj_arg as) {
 }
 
 // The state that the fold builds from `initial` and the entries arrays `arrays`, with the image's
-// tables `x` if not `nullptr`; `nullptr` if the models do not cover an entry. Calls Lean functions
-// only for the arrays that are not in the image.
+// tables `x` if not `nullptr`; `nullptr` if the models do not cover an entry, or if the tables turn
+// out to be damaged, which marks them unusable. Calls Lean functions only for the arrays that are not
+// in the image.
+object * replay_state_core(state_kind kind, image_ext const * x, object * initial, std::vector<object *> const & arrays);
 object * replay_state(state_kind kind, image_ext const * x, object * initial, std::vector<object *> const & arrays) {
+    try {
+        return replay_state_core(kind, x, initial, arrays);
+    } catch (image_damaged &) {
+        image_ext_damaged(static_cast<uint32>(x - g_image->exts));
+        return nullptr;
+    }
+}
+
+object * replay_state_core(state_kind kind, image_ext const * x, object * initial, std::vector<object *> const & arrays) {
     interning in(kind);
     if (x) load_interning(in, *x);
     std::vector<entry_step> steps;
     auto for_each = [&](auto const & add) -> bool {
         for (object * a : arrays) {
-            if (image_array const * ia = x ? image_array_of(*x, a) : nullptr) {
+            bool bad = false;
+            image_array const * ia = x ? image_array_of(*x, a, bad) : nullptr;
+            if (bad) damaged();
+            if (ia) {
                 if (ia->count != lean_array_size(a)) return false;
+                if (ia->first > x->entries.num || ia->count > x->entries.num - ia->first) damaged();
                 image_entry const * es = range_ptr<image_entry>(g_image->begin, x->entries) + ia->first;
+                if (!image_used(es, uint64(ia->count) * sizeof(image_entry))) damaged();
                 image_step const * ss = range_ptr<image_step>(g_image->begin, x->steps);
                 for (uint32 i = 0; i < ia->count; i++) {
                     image_entry const & e = es[i];
                     if (e.kind == 4) continue;
+                    check_image_entry(in, *x, e);
                     entry_desc d;
                     d.kind = e.kind; d.tree = e.tree; d.okind = e.okind;
                     steps.resize(e.num_steps);
@@ -1519,15 +1695,11 @@ void drop_prefetches(std::vector<std::unique_ptr<prefetch>> & ps) {
 }
 
 // Whether the image's table of entries arrays of `x` can be searched by `image_array_of` before
-// `x` is checked: in range, a power of two in size, with an empty slot.
+// `x` is checked: in range, a power of two in size.
 bool arrays_table_ok(image_ext const & x) {
     image_range r = x.arrays;
-    if (r.off % 8 != 0 || r.off > g_image->hdr.size || r.num > (g_image->hdr.size - r.off) / sizeof(image_array) ||
-        r.num == 0 || (r.num & (r.num - 1)) != 0)
-        return false;
-    image_array const * arrays = range_ptr<image_array>(g_image->begin, r);
-    for (uint64 i = 0; i < r.num; i++) if (arrays[i].addr == 0) return true;
-    return false;
+    return r.off % 8 == 0 && r.off <= g_image->hdr.size && r.num <= (g_image->hdr.size - r.off) / sizeof(image_array) &&
+        r.num != 0 && (r.num & (r.num - 1)) == 0;
 }
 
 // The state of a prefetch for the extension named `ext_name` started with `initial` and the
@@ -1586,7 +1758,13 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_prefetch_imported_state(b_obj_arg 
     // the entries in the image, and the others, which the thread replays by calling Lean functions
     size_t n = 0, others = 0;
     for (object * a : arrays) {
-        if (image_array const * ia = image_array_of(g_image->exts[xi], a)) {
+        bool bad = false;
+        image_array const * ia = image_array_of(g_image->exts[xi], a, bad);
+        if (bad) {
+            image_ext_damaged(static_cast<uint32>(xi));
+            return skip("damaged");
+        }
+        if (ia) {
             if (ia->count != lean_array_size(a)) return skip("badArray");
             n += ia->count;
         } else {
@@ -1677,7 +1855,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_imported_state(b_obj_arg ext_name,
     if (x && x->kind != static_cast<uint32>(kind)) return decline("the image has another kind");
     if (!valid_initial(initial, num_fields(kind))) return decline("unexpected initial state");
     object * r = replay_state(kind, x, initial, nonempty_arrays(as));
-    if (!r) return decline("an entry with no keys");
+    if (!r) return decline(x && !image_ext_usable(static_cast<uint32>(x - g_image->exts)) ? "its image is damaged" : "an entry with no keys");
     return some(r);
 }
 
@@ -1691,6 +1869,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
     hdr.format = g_image_format;
     if (!first_pack_identity(hdr.pack_checksum, hdr.pack_base, hdr.pack_size) || !init_trie_empty())
         return io_result_mk_error("writeImportImage: no olean pack is in use");
+    if (char const * why = first_pack_damaged())
+        return io_result_mk_error(std::string("writeImportImage: the olean pack in use is ") + why);
     std::vector<std::pair<object *, state_kind>> kinds;
     for (size_t i = 0; i < lean_array_size(oexts); i++) {
         object * p = lean_array_get_core(oexts, i);
@@ -1714,16 +1894,38 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
     file += w.data;
     for (image_ext & x : exts) x.checksum = image_ext_checksum(file.data(), x);
     if (!exts.empty()) memcpy(&file[hdr.exts_off], exts.data(), exts.size() * sizeof(image_ext));
+    hdr.block_sums_off = file.size();
+    std::string sums = side_file_block_sums(file.data() + sizeof(image_header), file.size() - sizeof(image_header));
+    hdr.block_sums_checksum = side_file_checksum4(sums.data(), sums.size(), g_image_block_sums_seed);
+    file += sums;
     hdr.size = file.size();
+    // Readers check the bounds of what they use; the blocks' checksums keep it as checked here.
+    loaded_image written;
+    written.begin = file.data();
+    written.hdr = hdr;
+    for (image_ext const & x : exts)
+        if (!check_image_ext(written, x))
+            return io_result_mk_error("writeImportImage: the tables it built are inconsistent");
+    hdr.validated = g_image_validated;
+    hdr.mtime_sec = side_file_mtime_now();
+    hdr.mtime_nsec = 0;
     hdr.common.checksum = image_checksum(hdr, file.data() + hdr.exts_off, hdr.num_exts * sizeof(image_ext));
     memcpy(&file[0], &hdr, sizeof(hdr));
     std::string tmp = out + ".tmp." + std::to_string(getpid());
-    FILE * f = fopen(tmp.c_str(), "wb");
-    if (!f || fwrite(file.data(), 1, file.size(), f) != file.size() || fclose(f) != 0) {
-        std::remove(tmp.c_str());
-        return io_result_mk_error("writeImportImage: failed to write '" + out + "'");
+    // read-only: a tool writing to a mapped image in place fails
+    std::remove(tmp.c_str());
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444);
+    bool ok = fd >= 0;
+    for (size_t off = 0; ok && off < file.size();) {
+        ssize_t n = write(fd, file.data() + off, file.size() - off);
+        if (n < 0 && errno == EINTR) continue;
+        ok = n > 0;
+        if (ok) off += static_cast<size_t>(n);
     }
-    if (std::rename(tmp.c_str(), out.c_str()) != 0) {
+    // the modification time, set last: a write to the file changes it
+    ok = ok && side_file_set_mtime(fd, hdr.mtime_sec) && side_file_sync(fd);
+    if (fd >= 0 && close(fd) != 0) ok = false;
+    if (!ok || std::rename(tmp.c_str(), out.c_str()) != 0) {
         std::remove(tmp.c_str());
         return io_result_mk_error("writeImportImage: failed to write '" + out + "'");
     }
@@ -1731,6 +1933,58 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
 #else
     (void)oout;
     return io_result_mk_error("writeImportImage: not supported on this platform");
+#endif
+}
+
+/* OLeanPack.verifyImportImage (image : @& String) : IO String
+   Why the import image `image` cannot be used, or "" if it can and its tables are as written, which
+   reads all of them. Whether it belongs to the pack in use is not checked. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_import_image_verify(b_obj_arg opath) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    auto result = [](char const * why) { return io_result_mk_ok(mk_string(why)); };
+    int fd = open(lean_string_cstr(opath), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return result(strerror(errno));
+    struct stat st;
+    image_header hdr;
+    std::string file;
+    char const * why = nullptr;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || static_cast<uint64>(st.st_size) < sizeof(hdr) ||
+        pread(fd, &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr)))
+        why = "not a PaperLean side file";
+    else if ((why = check_side_file_header(hdr.common, g_image_kind, sizeof(image_header)))) {}
+    else if (hdr.format != g_image_format) why = "written by a different version";
+    else if (hdr.size != static_cast<uint64>(st.st_size)) why = "its size differs from the recorded one";
+    else if (!side_file_mtime_is(st, hdr.mtime_sec, hdr.mtime_nsec)) why = "it changed since it was written";
+    else if (hdr.validated != g_image_validated) why = "corrupt";
+    else {
+        file.resize(hdr.size);
+        for (size_t off = 0; !why && off < file.size();) {
+            ssize_t n = pread(fd, &file[off], file.size() - off, off);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) why = "cannot be read";
+            else off += static_cast<size_t>(n);
+        }
+    }
+    close(fd);
+    if (why) return result(why);
+    if (hdr.exts_off % 8 != 0 || hdr.exts_off > hdr.size || hdr.num_exts > (hdr.size - hdr.exts_off) / sizeof(image_ext) ||
+        image_checksum(hdr, file.data() + hdr.exts_off, hdr.num_exts * sizeof(image_ext)) != hdr.common.checksum ||
+        !image_blocks_in_range(hdr) ||
+        side_file_checksum4(file.data() + hdr.block_sums_off, hdr.size - hdr.block_sums_off, g_image_block_sums_seed) != hdr.block_sums_checksum)
+        return result("corrupt (checksum mismatch)");
+    if (side_file_block_sums(file.data() + sizeof(image_header), hdr.block_sums_off - sizeof(image_header)) !=
+        file.substr(hdr.block_sums_off))
+        return result("corrupt (block checksums)");
+    loaded_image img;
+    img.begin = file.data();
+    img.hdr = hdr;
+    image_ext const * exts = reinterpret_cast<image_ext const *>(file.data() + hdr.exts_off);
+    for (uint32 i = 0; i < hdr.num_exts; i++)
+        if (!check_image_ext(img, exts[i])) return result("corrupt (its tables' checksum differs or they are inconsistent)");
+    return result("");
+#else
+    (void)opath;
+    return io_result_mk_ok(mk_string("import images are not supported on this platform"));
 #endif
 }
 }

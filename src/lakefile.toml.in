@@ -1,3 +1,4 @@
+# Modified by PaperLean.
 # This file allows lake to build Lean, Init, and Lake as Lean libraries.
 #
 # This is the file used when working with the stage0 compiler on the libraries
@@ -43,13 +44,13 @@ nativeLibDir = "lib/lean"
 # Additional options derived from the CMake configuration
 moreLeanArgs = [${LEAN_EXTRA_OPTS_TOML}]
 # `lake serve` does not forward `moreLeanArgs` to the language server, so pass them explicitly
-moreGlobalServerArgs = [${LEAN_EXTRA_OPTS_TOML}]
+moreGlobalServerArgs = [${LEAN_SERVER_OPTS_TOML}]
 
 # Enable core-only linters
 leanOptions.linter.coreInternal = true
 
-# Uncomment to limit number of reported errors further in case of overwhelming cmdline output
-#weakLeanArgs = ["-DmaxErrors=1"]
+# Add "-DmaxErrors=1" to limit number of reported errors further in case of overwhelming cmdline output
+weakLeanArgs = [${PAPERLEAN_STAGE0_SHIM_OPTS_TOML}]
 
 # CMake's `LEANC_EXTRA_CC_FLAGS`
 moreLeancArgs = [${LEAN_MORE_LEANC_ARGS_TOML}]

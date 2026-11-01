@@ -2,57 +2,60 @@
 Copyright (c) 2026 PaperLean contributors.
 Released under Apache 2.0 license as described in the file LICENSE.
 */
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
-#include <string>
-#include <vector>
-#if defined(__APPLE__)
-#include <crt_externs.h>
-#include <mach-o/dyld.h>
-#endif
-#if !defined(LEAN_WINDOWS)
-#include <unistd.h>
-#endif
 #include "runtime/object.h"
 
-// Re-running `lean` with reuse off, for `Lean.PaperLean.Speculation`.
+// The mark of the threads that elaborate commands in order, the end of reuse in a process with more
+// than one frontend, and the end of a run whose oracle found a difference, for
+// `Lean.PaperLean.Speculation`. Printed with the C stream: Lean's streams of a thread may be held by
+// `IO.FS.withIsolatedStreams`, whose contents this process does not get to print.
 
 namespace lean {
-/* reexecExact : BaseIO Bool
-   Replaces this process by a run of the same executable with the same arguments and `PAPERLEAN_EXACT=1`
-   in its environment. Returns `false` only if that is not possible. */
-extern "C" LEAN_EXPORT uint8 lean_paperlean_reexec_exact() {
-#if defined(LEAN_WINDOWS)
-    return false;
-#else
-    std::vector<std::string> args;
-    std::string exe;
-#if defined(__APPLE__)
-    int argc = *_NSGetArgc();
-    char ** argv = *_NSGetArgv();
-    for (int i = 0; i < argc; i++) args.push_back(argv[i]);
-    uint32_t size = 0;
-    _NSGetExecutablePath(nullptr, &size);
-    std::vector<char> path(size + 1, '\0');
-    if (_NSGetExecutablePath(path.data(), &size) != 0) return false;
-    exe = path.data();
-#else
-    std::ifstream in("/proc/self/cmdline", std::ios::binary);
-    std::string arg;
-    while (std::getline(in, arg, '\0')) args.push_back(arg);
-    exe = "/proc/self/exe";
-#endif
-    if (args.empty()) return false;
-    std::vector<char *> argv2;
-    for (std::string & a : args) argv2.push_back(&a[0]);
-    argv2.push_back(nullptr);
-    if (setenv("PAPERLEAN_EXACT", "1", 1) != 0) return false;
-    fflush(stdout);
-    fflush(stderr);
-    execv(exe.c_str(), argv2.data());
-    unsetenv("PAPERLEAN_EXACT");
-    return false;
-#endif
+static thread_local bool t_elab_thread = false;
+static std::atomic<bool> g_frontend_seen{false};
+static std::atomic<bool> g_reuse_off{false};
+
+/* setElabThread (on : Bool) : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_set_elab_thread(uint8 on) {
+    t_elab_thread = on;
+    return box(0);
+}
+
+/* onElabThread : BaseIO Bool */
+extern "C" LEAN_EXPORT uint8 lean_paperlean_elab_thread() {
+    return t_elab_thread && !g_reuse_off.load(std::memory_order_relaxed);
+}
+
+/* noteFrontendCore (fileName : @& String) : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_note_frontend(b_obj_arg file_name) {
+    if (g_frontend_seen.exchange(true) && !g_reuse_off.exchange(true)) {
+        std::fprintf(stderr, "PaperLean: a further frontend in this process (%s): reuse of results and "
+                     "its oracle are off from here on\n", lean_string_cstr(file_name));
+    }
+    return box(0);
+}
+
+// The number of searches and elaborations left out of reuse in each way, from any thread.
+static constexpr unsigned g_num_exclusions = 16;
+static std::atomic<uint64_t> g_exclusions[g_num_exclusions];
+
+/* noteExclusionCore (kind : UInt8) : BaseIO Bool -- whether it is the first of its kind */
+extern "C" LEAN_EXPORT uint8 lean_paperlean_note_exclusion(uint8 kind) {
+    return g_exclusions[kind % g_num_exclusions].fetch_add(1, std::memory_order_relaxed) == 0;
+}
+
+/* exclusionCount (kind : UInt8) : BaseIO Nat */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_exclusions(uint8 kind) {
+    return lean_uint64_to_nat(g_exclusions[kind % g_num_exclusions].load(std::memory_order_relaxed));
+}
+
+/* fail (reason : @& String) : BaseIO Unit -- does not return */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_speculation_fail(b_obj_arg reason) {
+    std::fflush(stdout);
+    std::fprintf(stderr, "PaperLean: the reuse oracle found a difference: %s\n", lean_string_cstr(reason));
+    std::fflush(stderr);
+    std::_Exit(EXIT_FAILURE);
 }
 }
