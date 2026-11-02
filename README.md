@@ -18,11 +18,15 @@ The kernel is Lean's, unmodified, and build caches are compatible with official 
 
 Apple M5 Max. Mathlib is built whole with `paperlean prepare`: wall time summed over its 8,564 modules, peak memory averaged. `KrullDimension.Field` is an extreme case: two theorems in 26 lines that import about 2,000 modules, so nearly all of its time goes to import.
 
+![](paperlean/imports.svg)
+
+Lean's import time grows with the number of modules imported, so building a library takes time quadratic in its size. Measured on a hypothetical library on Mathlib whose modules each import all earlier ones.
+
 ## How to use
 
 ```bash
-elan toolchain install qinz1yang/PaperLean:v0.2.0-lean4.35.0-rc3
-elan run qinz1yang/PaperLean:v0.2.0-lean4.35.0-rc3 paperlean install
+elan toolchain install qinz1yang/PaperLean:v0.2.1-lean4.35.0-rc3
+elan run qinz1yang/PaperLean:v0.2.1-lean4.35.0-rc3 paperlean install
 ```
 
 In a project on Lean `v4.35.0-rc3`:

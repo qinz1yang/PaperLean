@@ -1029,16 +1029,16 @@ def withSectionVars (varDecls : Array Syntax) (varUIds : Array Name) (opts : Opt
   let heartbeats ← IO.getNumHeartbeats
   let onThread ← Speculation.onElabThread
   let excluded? : Option Speculation.Exclusion :=
-    if !onThread then some 6
-    else if !reusableUnder opts then some 7
-    else if env.asyncPrefix?.isSome then some 8
+    if !onThread then some 7
+    else if !reusableUnder opts then some 8
+    else if env.asyncPrefix?.isSome then some 9
     else none
   if let some kind := excluded? then
     noteExcluded kind
     setHeartbeats heartbeats
     return (← elabVars k)
   let some start ← start? varDecls varUIds |
-    noteExcluded 9
+    noteExcluded 10
     setHeartbeats heartbeats
     return (← elabVars k)
   let ns ← getCurrNamespace

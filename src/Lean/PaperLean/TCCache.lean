@@ -79,7 +79,8 @@ Only the threads that elaborate commands in order use the cache (`Speculation.on
 tasks that they start, e.g. of linters, nor the elaboration of declarations in the background), and
 only for problems without metavariables in them, but in output parameters (which the search replaces),
 and without unassigned (or delayed-assigned) ones in the context they reach, whose assigned ones
-have values without metavariables; not with trace options or diagnostics, nor under a custom
+have values without metavariables, and whose context is small (`maxDecls`, `maxContext`); not with
+trace options or diagnostics, nor under a custom
 unfolding predicate, let-variables to unfold (`Meta.Context.zetaDeltaSet`), the tracking of
 unfolded let-variables (a side effect that a reuse would not repeat), or the name generator of
 `grind`'s theorem instantiation. The search reads the instance index only for the classes of its
@@ -468,31 +469,40 @@ private def usableUnder (opts : Options) : Bool := Id.run do
 `cacheKeyType`, which is no variable of the context. -/
 private def wildcardFVarId : FVarId := { name := `__wild__ }
 
-/-- `e` with its assigned metavariables instantiated, unless some remain; the state is not
-changed. -/
-private def instantiated? (e : Expr) : MetaM (Option Expr) := do
+/-- `e` with its assigned metavariables instantiated in `mctx`, unless some remain, and `mctx` with
+the assignments that this instantiated (so that later instantiations share the terms). -/
+private def instantiated? (mctx : MetavarContext) (e : Expr) : Option Expr × MetavarContext :=
   if !e.hasMVar then
-    return some e
-  let e := (instantiateMVarsCore (← getMCtx) e).1
-  return if e.hasMVar then none else some e
+    (some e, mctx)
+  else
+    let (e, mctx) := instantiateMVarsCore mctx e
+    (if e.hasMVar then none else some e, mctx)
 
-/-- The metavariables and universe metavariables met by `canonRaw`, in order, and its cache. -/
+/-- The metavariables and universe metavariables met by `canonRaw`, in order, with their numbers,
+and its cache. -/
 private structure RawCanon where
   mvars : Array MVarId := #[]
+  mvarNums : Std.HashMap MVarId Nat := {}
   lmvars : Array LMVarId := #[]
+  lmvarNums : Std.HashMap LMVarId Nat := {}
   cache : Std.HashMap USize Expr := {}
+
+/-- The monad of `canonRaw`, which fails with the exclusion of the problem
+(`Speculation.Exclusion`). -/
+private abbrev KeyM := StateT RawCanon (Except Speculation.Exclusion)
 
 /-- The universe level `u` of a problem's context with its assigned universe metavariables replaced
 by their numbers (`RawCanon.lmvars`), if each is assigned a level without metavariables. -/
-private def canonRawLevel (mctx : MetavarContext) (u : Level) : StateT RawCanon Option Level :=
+private def canonRawLevel (mctx : MetavarContext) (u : Level) : KeyM Level :=
   if !u.hasMVar then pure u else
   match u with
   | .mvar id => do
-    let some v := mctx.lAssignment.find? id | failure
-    if v.hasMVar then failure
+    let some v := mctx.lAssignment.find? id | throw 4
+    if v.hasMVar then throw 4
     let s ← get
-    let i := (s.lmvars.idxOf? id).getD s.lmvars.size
-    if i == s.lmvars.size then set { s with lmvars := s.lmvars.push id }
+    let i := s.lmvarNums.getD id s.lmvars.size
+    if i == s.lmvars.size then
+      set { s with lmvars := s.lmvars.push id, lmvarNums := s.lmvarNums.insert id i }
     return .mvar ⟨.num `_paperlean_lmv i⟩
   | .succ v => return u.updateSucc! (← canonRawLevel mctx v)
   | .max a b => return u.updateMax! (← canonRawLevel mctx a) (← canonRawLevel mctx b)
@@ -501,69 +511,90 @@ private def canonRawLevel (mctx : MetavarContext) (u : Level) : StateT RawCanon 
 
 /-- `e`, a type or value of a problem's context as it is, with the free variables `num` replaced by
 their numbers and its assigned metavariables and universe metavariables by their numbers
-(`RawCanon`), if each is assigned a value without metavariables and none is delayed-assigned: the
-search sees the context so, and where a metavariable is decides its steps (e.g. a term with one is
-not cached). -/
-private unsafe def canonRaw (mctx : MetavarContext) (num : Std.HashMap FVarId Nat) (e : Expr) :
-    StateT RawCanon Option Expr := do
+(`RawCanon`), if each is assigned a value without metavariables and none is delayed-assigned, and
+there are at most `maxMVars` of them: the search sees the context so, and where a metavariable is
+decides its steps (e.g. a term with one is not cached). -/
+private unsafe def canonRaw (mctx : MetavarContext) (num : Std.HashMap FVarId Nat) (maxMVars : Nat)
+    (e : Expr) : KeyM Expr := do
   if !e.hasFVar && !e.hasMVar then return e
   let k := ptrAddrUnsafe e
   if let some r := (← get).cache[k]? then return r
+  -- (`pure`, not `return`, in each case: the result is cached, so that the term keeps its sharing)
   let r ← match e with
     | .fvar id =>
       if id == wildcardFVarId then pure e else
-      let some i := num[id]? | failure
+      let some i := num[id]? | throw 4
       pure (canonFVar i)
     | .mvar id => do
-      let some v := mctx.getExprAssignmentCore? id | failure
-      if v.hasMVar || mctx.dAssignment.contains id then failure
+      let some v := mctx.getExprAssignmentCore? id | throw 4
+      if v.hasMVar || mctx.dAssignment.contains id then throw 4
       let s ← get
-      let i := (s.mvars.idxOf? id).getD s.mvars.size
-      if i == s.mvars.size then set { s with mvars := s.mvars.push id }
+      let i := s.mvarNums.getD id s.mvars.size
+      if i == s.mvars.size then
+        if i == maxMVars then throw 6
+        set { s with mvars := s.mvars.push id, mvarNums := s.mvarNums.insert id i }
       pure (.mvar ⟨.num `_paperlean_mv i⟩)
-    | .sort u => return e.updateSort! (← canonRawLevel mctx u)
-    | .const _ us => return e.updateConst! (← us.mapM (canonRawLevel mctx))
-    | .app f a => return e.updateApp! (← canonRaw mctx num f) (← canonRaw mctx num a)
-    | .lam _ t b _ => return e.updateLambdaE! (← canonRaw mctx num t) (← canonRaw mctx num b)
-    | .forallE _ t b _ => return e.updateForallE! (← canonRaw mctx num t) (← canonRaw mctx num b)
-    | .letE _ t v b _ =>
-      return e.updateLetE! (← canonRaw mctx num t) (← canonRaw mctx num v) (← canonRaw mctx num b)
-    | .mdata _ b => return e.updateMData! (← canonRaw mctx num b)
-    | .proj _ _ b => return e.updateProj! (← canonRaw mctx num b)
+    | .sort u => pure (e.updateSort! (← canonRawLevel mctx u))
+    | .const _ us => pure (e.updateConst! (← us.mapM (canonRawLevel mctx)))
+    | .app f a => pure (e.updateApp! (← go f) (← go a))
+    | .lam _ t b _ => pure (e.updateLambdaE! (← go t) (← go b))
+    | .forallE _ t b _ => pure (e.updateForallE! (← go t) (← go b))
+    | .letE _ t v b _ => pure (e.updateLetE! (← go t) (← go v) (← go b))
+    | .mdata _ b => pure (e.updateMData! (← go b))
+    | .proj _ _ b => pure (e.updateProj! (← go b))
     | _ => pure e
   modify fun s => { s with cache := s.cache.insert k r }
   return r
+where
+  go := canonRaw mctx num maxMVars
+
+/-- The most declarations, and declarations and metavariables, that the context of a problem with a
+key reaches. A key costs about as much as the context it holds, and the search for a problem with a
+larger one, as in the binders whose types are chains of `letI`, costs less than its key: it runs as
+Lean's. -/
+private def maxDecls := 24
+private def maxContext := 64
 
 /-- The problem `type` with local instances `localInsts` as a `Key`, and the free variables in the
-order of their numbers, unless the problem has metavariables or the context it reaches has
-unassigned ones (or ones that `canonRaw` does not number). `type` may have `wildcardFVarId` (in
-output parameters). -/
+order of their numbers, unless the problem has metavariables, the context it reaches has unassigned
+ones (or ones that `canonRaw` does not number), or that context is large (`maxDecls`,
+`maxContext`): the exclusion then. `type` may have `wildcardFVarId` (in output parameters). -/
 private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat) :
-    MetaM (Option (Key × Array FVarId)) := do
+    MetaM (Except Speculation.Exclusion (Key × Array FVarId)) := do
   if type.hasMVar then
-    return none
+    return .error 4
   let lctx ← getLCtx
   if lctx.contains wildcardFVarId then
-    return none
+    return .error 4
   -- (the free variables reached, in the order found: one state, so that subterms shared between
   -- declarations are visited once)
   let mut cs : CollectFVars.State := collectFVars {} type
   for li in localInsts do
     if !cs.fvarSet.contains li.fvar.fvarId! then
       cs := cs.add li.fvar.fvarId!
-  -- (each declaration with its type and value instantiated)
+  -- (these are reached: the loop below would find the context large too)
+  if (cs.fvarIds.filter (· != wildcardFVarId)).size > maxDecls then
+    return .error 6
+  -- (each declaration with its type and value instantiated, in one metavariable context, so that
+  -- what the declarations share is instantiated once)
+  let mctx ← getMCtx
+  let mut imctx := mctx
   let mut reached : Array (LocalDecl × Expr × Option Expr) := #[]
   let mut next := 0
   while h : next < cs.fvarIds.size do
     let id := cs.fvarIds[next]
     next := next + 1
     if id == wildcardFVarId then continue
-    let some d := lctx.find? id | return none
-    let some t ← instantiated? d.type | return none
+    if reached.size == maxDecls then
+      return .error 6
+    let some d := lctx.find? id | return .error 4
+    let (some t, m) := instantiated? imctx d.type | return .error 4
+    imctx := m
     cs := collectFVars cs t
     let mut v? := none
     if let some v := d.value? then
-      let some v ← instantiated? v | return none
+      let (some v, m) := instantiated? imctx v | return .error 4
+      imctx := m
       cs := collectFVars cs v
       v? := some v
     reached := reached.push (d, t, v?)
@@ -577,23 +608,34 @@ private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Na
     | _ => none
   let type : ExactExpr := ⟨canon type⟩
   -- (the types and values as they are, with their metavariables numbered)
-  let mctx ← getMCtx
-  let raw? : Option (Array (ExactExpr × Option ExactExpr × LocalDeclKind) × RawCanon) :=
+  let maxMVars := maxContext - decls.size
+  let raw? : Except Speculation.Exclusion
+      (Array (ExactExpr × Option ExactExpr × LocalDeclKind) × RawCanon) :=
     (decls.mapM fun ((d, _, _) : LocalDecl × Expr × Option Expr) => do
-      let t ← unsafe canonRaw mctx num d.type
-      let v? ← d.value?.mapM (unsafe canonRaw mctx num ·)
+      let t ← unsafe canonRaw mctx num maxMVars d.type
+      let v? ← d.value?.mapM (unsafe canonRaw mctx num maxMVars ·)
       return ((⟨t⟩ : ExactExpr), v?.map ExactExpr.mk, d.kind)).run {}
-  let some (decls, rc) := raw? | return none
+  let (decls, rc) ← match raw? with
+    | .ok r => pure r
+    | .error kind => return .error kind
   -- (a value or type with other free variables than those of the problem is not one of the key)
   let ofProblem (e : Expr) : Bool := !e.hasMVar &&
     (!e.hasFVar ||
       (collectFVars {} e).fvarIds.all fun id => id == wildcardFVarId || num.contains id)
-  let some mvars := rc.mvars.mapM fun id => do
-      let v ← mctx.getExprAssignmentCore? id
-      let t := (instantiateMVarsCore mctx (← mctx.findDecl? id).type).1
-      guard (ofProblem v && ofProblem t)
-      return ((⟨canon v⟩ : ExactExpr), (⟨canon t⟩ : ExactExpr)) | return none
-  let some lmvars := rc.lmvars.mapM (mctx.lAssignment.find? ·) | return none
+  -- (the values and types of the metavariables in one term, so that what they share is instantiated,
+  -- checked and renumbered once)
+  let some vs := rc.mvars.mapM mctx.getExprAssignmentCore? | return .error 4
+  let some ts := rc.mvars.mapM fun id => return (← mctx.findDecl? id).type | return .error 4
+  if vs.any (·.hasMVar) then
+    return .error 4
+  let ts := (instantiateMVarsCore imctx (mkAppN (.bvar 0) ts)).1.getAppArgs
+  let all := mkAppN (.bvar 0) (vs ++ ts)
+  unless ofProblem all do
+    return .error 4
+  let all := (canon all).getAppArgs
+  let mvars : Array (ExactExpr × ExactExpr) :=
+    (all.extract 0 vs.size).zip (all.extract vs.size all.size) |>.map fun (v, t) => (⟨v⟩, ⟨t⟩)
+  let some lmvars := rc.lmvars.mapM (mctx.lAssignment.find? ·) | return .error 4
   let synthPendingDepth := (← read).synthPendingDepth
   let configKey := (← getConfigWithKey).key
   let h := decls.foldl (init := mixHash (hash type) (mixHash (hash configKey)
@@ -608,7 +650,7 @@ private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Na
     cacheInferType := (← read).cacheInferType
     opts := ← getOptions
     isExporting := (← getEnv).isExporting }
-  return some (key, fvars)
+  return .ok (key, fvars)
 
 /-- The free variables `fvars` replaced by their numbers in `e` (which has no other ones). -/
 private def canonExpr (num : Std.HashMap FVarId Nat) (e : Expr) : Expr :=
@@ -1209,10 +1251,12 @@ def withCache (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat)
     noteExcluded kind
     setHeartbeats heartbeats
     return (← search)
-  let some (key, fvars) ← key? localInsts type maxResultSize |
-    noteExcluded 4
-    setHeartbeats heartbeats
-    return (← search)
+  let (key, fvars) ← match ← key? localInsts type maxResultSize with
+    | .ok k => pure k
+    | .error kind =>
+      noteExcluded kind
+      setHeartbeats heartbeats
+      return (← search)
   let entries ← finished env key ((← entriesRef.get).findD key #[])
   let ns ← getCurrNamespace
   let openDecls ← getOpenDecls

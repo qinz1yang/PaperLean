@@ -102,12 +102,13 @@ private def exclusions : Array String := #[
   "tracked or chosen let-variables",
   "metavariables in the problem or in its context",
   "in `grind`, under a name generator that starts again",
+  "a large context",
   "not on the thread that elaborates commands in order",
   "trace options or diagnostics",
   "in the elaboration of a declaration in the background",
   "the state is not that of the start of a command"]
 
-private def numTcExclusions := 6
+private def numTcExclusions := 7
 
 @[extern "lean_paperlean_note_exclusion"]
 private opaque noteExclusionCore (kind : Exclusion) : BaseIO Bool

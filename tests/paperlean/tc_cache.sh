@@ -15,7 +15,8 @@
 # has assigned metavariables, or with metavariables only in output parameters, are reused; and that
 # a search's lookups in Lean's caches whose value is a function of the key need not find what they
 # found. And that linters, which run in tasks with the command's environment, neither use nor fill
-# the caches of typeclass results and section variables.
+# the caches of typeclass results and section variables. And that a key keeps the sharing of the
+# context that it holds, and that a problem with a large context has none and is searched as Lean's.
 
 export PAPERLEAN_REUSE=1
 
@@ -453,3 +454,75 @@ PAPERLEAN_REUSE_STATS=no_linter.stats lean NoLinter.lean > no_linter.out 2>&1 ||
   fail "NoLinter.lean failed: $(cat no_linter.out)"
 [ "$(cut -f6-8 sv_linter.stats)" = "$(cut -f6-8 no_linter.stats)" ] ||
   fail "a linter used the section variables' entries: $(cat sv_linter.stats no_linter.stats)"
+# a key keeps the sharing of the context that it holds: a local instance whose type is a sum of
+# depth 16 with both summands shared at each level (2^17 objects unshared) gives a key of a few dozen
+# objects; and a problem whose context has more than `maxDecls` declarations, or more than
+# `maxContext` declarations and metavariables, has no key (`key?`, read with `import all`)
+cat > Keys.lean <<'EOF2'
+module
+public import Lean
+import all Lean.PaperLean.TCCache
+open Lean Meta PaperLean.TCCache
+class Big (n : Nat) : Prop where
+/-- The number of distinct objects among the subterms of `es`. -/
+unsafe def objects (es : Array Expr) : Nat := Id.run do
+  let mut seen : Std.HashSet USize := {}
+  let mut todo := es.toList
+  while true do
+    let e :: rest := todo | break
+    todo := rest
+    if seen.contains (ptrAddrUnsafe e) then continue
+    seen := seen.insert (ptrAddrUnsafe e)
+    match e with
+    | .app f a => todo := f :: a :: todo
+    | .forallE _ t b _ | .lam _ t b _ => todo := t :: b :: todo
+    | _ => pure ()
+  return seen.size
+/-- `k` with the local instances `Big (x + i)` for `i < n`. -/
+def withInsts (x : Expr) : Nat → MetaM Unit → MetaM Unit
+  | 0, k => k
+  | n + 1, k => withLocalDecl `inst .instImplicit (mkApp (mkConst ``Big) (mkNatAdd x (mkNatLit n)))
+      fun _ => withInsts x n k
+/-- What `key?` gives for `Big x`: the number of objects of its context, or the exclusion. -/
+def keyOf (x : Expr) : MetaM String := do
+  match ← key? (← getLocalInstances) (mkApp (mkConst ``Big) x) 0 with
+  | .ok (key, _) => return s!"key of {unsafe objects (key.decls.map (·.1.expr))} objects"
+  | .error kind => return s!"excluded {kind}"
+run_meta withLocalDeclD `x (mkConst ``Nat) fun x => do
+  let mut e := x
+  for _ in [0:16] do
+    e := mkNatAdd e e
+  withLocalDecl `inst .instImplicit (mkApp (mkConst ``Big) e) fun _ => do
+    logInfo m!"shared: {← keyOf x}"
+  withInsts x (maxDecls - 1) do logInfo m!"declarations at the limit: {← keyOf x}"
+  withInsts x maxDecls do logInfo m!"declarations over the limit: {← keyOf x}"
+  for (n, what) in [(maxContext - 2, "at"), (maxContext - 1, "over")] do
+    let mut sum := x
+    for _ in [0:n] do
+      let m ← mkFreshExprMVar (mkConst ``Nat)
+      m.mvarId!.assign (mkNatLit 0)
+      sum := mkNatAdd sum m
+    withLocalDecl `inst .instImplicit (mkApp (mkConst ``Big) sum) fun _ => do
+      let r ← keyOf x
+      logInfo m!"metavariables {what} the limit: {if r.startsWith "key" then "key" else r}"
+EOF2
+lean Keys.lean 2>&1 | sed 's/^.*info: //' > keys.out || fail "Keys.lean failed: $(cat keys.out)"
+N=$(sed -n 's/^shared: key of \([0-9]*\) objects$/\1/p' keys.out)
+[ -n "$N" ] && [ "$N" -le 100 ] || fail "a key does not keep the sharing of its context: $(cat keys.out)"
+grep -qx "declarations at the limit: key of [0-9]* objects" keys.out &&
+  grep -qx "declarations over the limit: excluded 6" keys.out &&
+  grep -qx "metavariables at the limit: key" keys.out &&
+  grep -qx "metavariables over the limit: excluded 6" keys.out ||
+  fail "the limits of a key's context do not hold: $(cat keys.out)"
+# a problem with a large context is searched as Lean's, and the statistics say why it was left out
+{ echo "class D (α : Type) where"
+  for i in $(seq 0 30); do echo "class C$i (α : Type) : Prop where"; done
+  echo "section"
+  printf 'variable {α : Type} [D α]'; for i in $(seq 0 30); do printf ' [C%s α]' $i; done; echo
+  echo "example : D α := inferInstance"
+  echo "example : D α := inferInstance"
+  echo "end"
+} > Large.lean
+PAPERLEAN_REUSE_STATS=large.stats lean Large.lean > large.out 2>&1 || fail "Large.lean failed: $(cat large.out)"
+[ ! -s large.out ] || fail "Large.lean printed: $(cat large.out)"
+grep -q "not eligible: a large context=[1-9]" large.stats || fail "no problem was left out for a large context: $(cat large.stats)"

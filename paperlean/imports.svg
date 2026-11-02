@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="356" viewBox="0 0 880 356" font-family="Helvetica, Arial, sans-serif" font-size="13">
+<style>.t{fill:#111111}.m{fill:#6b6b6b}.lean{fill:#e8590c}.pl{fill:#0ca678}.leans{stroke:#e8590c}.pls{stroke:#0ca678}.ref{stroke:#9a9a9a}.ax{stroke:#d0d0d0}.g{stroke:#ececec}.sep{stroke:#c8c8c8}@media (prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.lean{fill:#ff8c42}.pl{fill:#20c997}.leans{stroke:#ff8c42}.pls{stroke:#20c997}.ref{stroke:#6b6b6b}.ax{stroke:#3a3a3a}.g{stroke:#262626}.sep{stroke:#4a4a4a}}</style>
+<rect class="lean" x="290" y="336" width="10" height="10"/><text class="m" x="306" y="345">Lean v4.35.0-rc3</text>
+<rect class="pl" x="452" y="336" width="10" height="10"/><text class="pl" x="468" y="345">PaperLean v0.2.0</text>
+<line class="g" x1="58.0" y1="268.0" x2="416.0" y2="268.0"/>
+<text class="m" x="52.0" y="272.0" text-anchor="end" font-size="11">0</text>
+<line class="g" x1="58.0" y1="211.0" x2="416.0" y2="211.0"/>
+<text class="m" x="52.0" y="215.0" text-anchor="end" font-size="11">2</text>
+<line class="g" x1="58.0" y1="154.0" x2="416.0" y2="154.0"/>
+<text class="m" x="52.0" y="158.0" text-anchor="end" font-size="11">4</text>
+<line class="g" x1="58.0" y1="97.0" x2="416.0" y2="97.0"/>
+<text class="m" x="52.0" y="101.0" text-anchor="end" font-size="11">6</text>
+<line class="g" x1="58.0" y1="40.0" x2="416.0" y2="40.0"/>
+<text class="m" x="52.0" y="44.0" text-anchor="end" font-size="11">8</text>
+<text class="m" x="58.0" y="284" text-anchor="middle" font-size="11">0</text>
+<text class="m" x="147.5" y="284" text-anchor="middle" font-size="11">10,000</text>
+<text class="m" x="237.0" y="284" text-anchor="middle" font-size="11">20,000</text>
+<text class="m" x="326.5" y="284" text-anchor="middle" font-size="11">30,000</text>
+<text class="m" x="416.0" y="284" text-anchor="middle" font-size="11">40,000</text>
+<line class="ax" x1="58.0" y1="268.5" x2="416.0" y2="268.5"/>
+<text class="m" x="237.0" y="302" text-anchor="middle">Modules it imports besides Mathlib</text>
+<text class="t" x="237.0" y="26" text-anchor="middle" font-size="14">One file: time to compile (s)</text>
+<polyline class="leans" fill="none" stroke-width="2" points="67.0,176.9 75.9,174.6 84.8,171.6 93.8,169.4 102.8,167.3 111.7,163.7 120.7,161.2 129.6,158.8 138.6,155.8 147.5,152.9 156.4,150.2 165.4,145.8 174.3,143.4 183.3,140.8 192.2,138.0 201.2,134.1 210.2,131.6 219.1,128.6 228.1,125.6 237.0,122.2 245.9,118.3 254.9,114.2 263.9,111.9 272.8,107.8 281.8,103.7 290.7,98.6 299.6,95.0 308.6,92.3 317.6,88.2 326.5,86.2 335.4,82.1 344.4,77.5 353.4,71.3 362.3,68.7 371.2,64.4 380.2,61.8 389.1,57.0 398.1,53.8 407.1,48.8 416.0,40.9"/>
+<text class="lean" x="418.0" y="32.9" text-anchor="end" font-size="12">8.0 s</text>
+<polyline class="pls" fill="none" stroke-width="2" points="67.0,253.2 75.9,252.4 84.8,251.5 93.8,250.3 102.8,249.3 111.7,248.3 120.7,247.2 129.6,246.0 138.6,244.6 147.5,242.8 156.4,237.2 165.4,235.2 174.3,233.9 183.3,232.2 192.2,230.7 201.2,229.1 210.2,227.3 219.1,225.1 228.1,223.5 237.0,221.9 245.9,219.1 254.9,218.2 263.9,215.9 272.8,214.1 281.8,212.0 290.7,209.3 299.6,207.6 308.6,205.6 317.6,203.6 326.5,202.6 335.4,200.0 344.4,198.1 353.4,195.7 362.3,193.4 371.2,191.0 380.2,189.7 389.1,186.7 398.1,184.6 407.1,182.4 416.0,180.2"/>
+<text class="pl" x="418.0" y="172.2" text-anchor="end" font-size="12">3.1 s</text>
+<line class="g" x1="498.0" y1="268.0" x2="856.0" y2="268.0"/>
+<text class="m" x="492.0" y="272.0" text-anchor="end" font-size="11">0</text>
+<line class="g" x1="498.0" y1="230.0" x2="856.0" y2="230.0"/>
+<text class="m" x="492.0" y="234.0" text-anchor="end" font-size="11">10</text>
+<line class="g" x1="498.0" y1="192.0" x2="856.0" y2="192.0"/>
+<text class="m" x="492.0" y="196.0" text-anchor="end" font-size="11">20</text>
+<line class="g" x1="498.0" y1="154.0" x2="856.0" y2="154.0"/>
+<text class="m" x="492.0" y="158.0" text-anchor="end" font-size="11">30</text>
+<line class="g" x1="498.0" y1="116.0" x2="856.0" y2="116.0"/>
+<text class="m" x="492.0" y="120.0" text-anchor="end" font-size="11">40</text>
+<line class="g" x1="498.0" y1="78.0" x2="856.0" y2="78.0"/>
+<text class="m" x="492.0" y="82.0" text-anchor="end" font-size="11">50</text>
+<line class="g" x1="498.0" y1="40.0" x2="856.0" y2="40.0"/>
+<text class="m" x="492.0" y="44.0" text-anchor="end" font-size="11">60</text>
+<text class="m" x="498.0" y="284" text-anchor="middle" font-size="11">0</text>
+<text class="m" x="587.5" y="284" text-anchor="middle" font-size="11">10,000</text>
+<text class="m" x="677.0" y="284" text-anchor="middle" font-size="11">20,000</text>
+<text class="m" x="766.5" y="284" text-anchor="middle" font-size="11">30,000</text>
+<text class="m" x="856.0" y="284" text-anchor="middle" font-size="11">40,000</text>
+<line class="ax" x1="498.0" y1="268.5" x2="856.0" y2="268.5"/>
+<text class="m" x="677.0" y="302" text-anchor="middle">Modules in the library besides Mathlib</text>
+<text class="t" x="677.0" y="26" text-anchor="middle" font-size="14">Whole library on Mathlib: total (h)</text>
+<polyline class="ref" fill="none" stroke-width="1.5" stroke-dasharray="5 4" points="498.0,268.0 856.0,131.8"/>
+<text class="m" x="858.0" y="147.8" text-anchor="end" font-size="11">linear growth</text>
+<polyline class="leans" fill="none" stroke-width="2" points="498.0,268.0 506.9,264.5 515.9,261.0 524.9,257.4 533.8,253.6 542.8,249.8 551.7,245.9 560.6,241.8 569.6,237.7 578.5,233.5 587.5,229.1 596.5,224.7 605.4,220.1 614.4,215.5 623.3,210.7 632.2,205.7 641.2,200.7 650.1,195.5 659.1,190.2 668.0,184.9 677.0,179.4 686.0,173.8 694.9,168.1 703.9,162.2 712.8,156.1 721.8,150.0 730.7,143.7 739.6,137.2 748.6,130.7 757.5,123.9 766.5,117.1 775.5,110.2 784.4,103.0 793.4,95.8 802.3,88.3 811.2,80.7 820.2,73.0 829.1,65.1 838.1,57.1 847.0,48.9 856.0,40.5"/>
+<text class="lean" x="858.0" y="32.5" text-anchor="end" font-size="12">59.9 h</text>
+<polyline class="pls" fill="none" stroke-width="2" points="498.0,268.0 506.9,267.4 515.9,266.7 524.9,266.0 533.8,265.3 542.8,264.5 551.7,263.7 560.6,262.8 569.6,261.9 578.5,261.0 587.5,260.0 596.5,258.8 605.4,257.6 614.4,256.2 623.3,254.8 632.2,253.3 641.2,251.8 650.1,250.2 659.1,248.6 668.0,246.9 677.0,245.1 686.0,243.2 694.9,241.3 703.9,239.3 712.8,237.2 721.8,235.0 730.7,232.8 739.6,230.5 748.6,228.1 757.5,225.7 766.5,223.1 775.5,220.6 784.4,217.9 793.4,215.1 802.3,212.3 811.2,209.4 820.2,206.4 829.1,203.3 838.1,200.2 847.0,196.9 856.0,193.6"/>
+<text class="pl" x="858.0" y="185.6" text-anchor="end" font-size="12">19.6 h</text>
+</svg>
