@@ -3,12 +3,14 @@ Copyright (c) 2026 PaperLean contributors.
 Released under Apache 2.0 license as described in the file LICENSE.
 -/
 import Lean.PaperLean.NativeLibs
+import Lean.PaperLean.OLeanPack
 
 /-!
 What the tests of native libraries need beyond what `paperlean prepare` does, for `lean --run` (the
 modules are found in `LEAN_PATH`):
 - `manifest <out> <library> <directory of the .c files> <module>...` writes the manifest of a library
-  compiled by the test: its modules are analysed in this process, and the `.c` files are the modules'.
+  compiled by the test: its modules are analysed and their files hashed in this process, and the `.c`
+  files are the modules'.
 - `check <module>...` prints those of the modules that are not known to be pure, with the reason.
 - `unread` does that for a module that cannot be read.
 -/
@@ -32,12 +34,17 @@ def impurities (modules : Array (Name × System.FilePath)) : IO (Array (System.F
 files of the modules are found in the search path, as importing them finds them, and must be those the
 `.c` files were generated with. -/
 def writeManifest (out lib : String) (modules : Array (Name × String)) : IO Unit := do
+  let record : System.FilePath := s!"{out}.hashes"
   let mods ← modules.mapM fun (m, c) => do
     let olean ← findOLean m
     let paths ← (moduleFiles olean).mapM fun f => return if ← f.pathExists then f.toString else ""
     let parts := #[olean] ++ (#[1, 2].filterMap fun i =>
       if paths[i]! != "" then some (moduleFiles olean)[i]! else none)
-    return { name := m, cFile := c, files := paths, data := ← moduleNativeData parts : NativeManifestModule }
+    let hashes ← paths.mapM fun p => do
+      if p.isEmpty then return ""
+      return (← OLeanPack.hashFiles #[p] #[] record 1)[0]!.2
+    return { name := m, cFile := c, hashes, data := ← moduleNativeData parts : NativeManifestModule }
+  if ← record.pathExists then IO.FS.removeFile record
   let oleans ← modules.mapM (findOLean ·.1)
   let verdicts ← evalVerdicts (modules.map (·.1) |>.zip oleans)
   -- as they are now, which is what the manifest records

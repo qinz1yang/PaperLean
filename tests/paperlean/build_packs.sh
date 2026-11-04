@@ -62,14 +62,14 @@ for f in $(outputs); do mkdir -p "$TMP_DIR/ref/$(dirname "$f")"; cp "$TMP_DIR/$f
 clean
 run env PAPERLEAN_BUILD_PACKS=1 lake build
 [ -z "$(packdirs)" ] || fail "plain lake wrote packs: $(packdirs)"
-[ ! -e "$XDG_CACHE_HOME/paperlean" ] || fail "plain lake packed the toolchain's library"
+[ ! -e "$PAPERLEAN_CACHE_DIR" ] || fail "plain lake packed the toolchain's library"
 export PAPERLEAN_ACCELERATE=1
 
 # A small build does not pack.
 clean
 run lake build
 [ -z "$(packdirs)" ] || fail "a small build wrote packs: $(packdirs)"
-[ ! -e "$XDG_CACHE_HOME/paperlean" ] || fail "a small build packed the toolchain's library"
+[ ! -e "$PAPERLEAN_CACHE_DIR" ] || fail "a small build packed the toolchain's library"
 
 # `PAPERLEAN_BUILD_PACKS=0` packs nothing in a build large enough to pack, which does without it.
 mkdir "$TMP_DIR/many"
@@ -80,12 +80,12 @@ mkdir Many
 for i in $(seq 1 33); do echo "def m$i : Nat := $i" > Many/M$i.lean; echo "import Many.M$i" >> Many.lean; done
 run env PAPERLEAN_BUILD_PACKS=0 PAPERLEAN_BUILD_PACK_BATCH=3 PAPERLEAN_BUILD_PACKS_KEEP=1 lake build
 [ -z "$(packdirs)" ] || fail "PAPERLEAN_BUILD_PACKS=0 wrote packs: $(packdirs)"
-[ ! -e "$XDG_CACHE_HOME/paperlean" ] || fail "PAPERLEAN_BUILD_PACKS=0 packed the toolchain's library"
+[ ! -e "$PAPERLEAN_CACHE_DIR" ] || fail "PAPERLEAN_BUILD_PACKS=0 packed the toolchain's library"
 rm -rf .lake/build
 run env PAPERLEAN_BUILD_PACK_BATCH=3 PAPERLEAN_BUILD_PACKS_KEEP=1 lake build
 [ -n "$(packdirs)" ] || fail "a build of 34 modules wrote no packs"
 popd > /dev/null
-rm -rf "$XDG_CACHE_HOME/paperlean"
+rm -rf "$PAPERLEAN_CACHE_DIR"
 
 # Packing (forced), three modules per pack (of different directories), packs kept: the same files.
 clean
@@ -97,7 +97,7 @@ done
 dir=$(packdirs)
 [ "$(echo "$dir" | wc -w | tr -d ' ')" = 1 ] || fail "expected one directory of packs: $dir"
 [ "$(ls "$dir"/pack-*.paperlean 2>/dev/null | wc -l)" -ge 1 ] || fail "no module was packed: $(ls "$dir")"
-tc="$XDG_CACHE_HOME/paperlean/toolchain-packs"
+tc="$PAPERLEAN_CACHE_DIR/toolchain-packs"
 lib=$(ls "$tc"/lib-*.paperlean 2>/dev/null)
 [ "$(echo "$lib" | wc -w | tr -d ' ')" = 1 ] || fail "expected one pack of the toolchain's library: $(ls "$tc")"
 # (the pack and the record of its identity)

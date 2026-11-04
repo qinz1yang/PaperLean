@@ -1,0 +1,16 @@
+ok: legacy, axiom-to-theorem then later proof, earliest owner
+ok: legacy, theorem retained after weaker axiom
+ok: module import all, public axiom/private theorem separation
+ok: module public table upgrades axiom to theorem
+ok: module exported-only constants
+ok: module non-exported import stays private
+ok: server level
+ok: legacy root importing modern modules
+ok: persistent marking occurs after helper join
+ok: empty tables
+ok: mismatched arrays retain zipped traversal
+ok: duplicate preserves earlier IR-extra owner
+ok: later IR-extra name cannot alter earlier conflict
+ok: first conflict follows original constant iteration order
+All constant table tests passed.
+Repeated parallel import/free completed.

@@ -12,15 +12,21 @@ import Init.Data.String.TakeDrop
 import Init.Meta.Defs
 import Init.System.Platform
 public import Lean.PaperLean.System
+import Lean.PaperLean.OLeanPack
 import Lean.Data.Json.Parser
 import Lean.Data.Json.Printer
 
 /-!
-PaperLean's prepared data of a workspace (`paperlean prepare`): olean packs, an import image and
-native libraries of packages in `.lake/paperlean/`, listed by `env.json`. When a `paperlean` command
+PaperLean's prepared data of a workspace (`paperlean prepare`), listed by `.lake/paperlean/env.json`:
+the packs and native libraries of its dependency packages, which are entries of the cache that the
+workspaces of a user share (`Lake.PaperLean.Cache`), each pack read through a binding of the workspace
+in `.lake/paperlean/bind/`; the pack of Lean's library; an import image of these packs; and packs of
+the root package. When a `paperlean` command
 runs Lake (`accelerated`), Lake lets every `lean` it starts for the workspace use them through the
 environment variables `LEAN_OLEAN_PACK`, `LEAN_IMPORT_IMAGE` and `PAPERLEAN_NATIVE_LIBS`
-(`useWorkspaceData`), which enter neither Lake's traces nor its hashes. Plain `lake` commands do not.
+(`useWorkspaceData`), which enter neither Lake's traces nor its hashes. Plain `lake` commands do not;
+any Lake reads the imports of the configuration files it elaborates from the data
+(`usePreparedImports`).
 -/
 
 open System Lean
@@ -34,12 +40,28 @@ public def dataDir (wsDir : FilePath) : FilePath := wsDir / ".lake" / "paperlean
 public def dataVars : Array String := #["LEAN_OLEAN_PACK", "LEAN_IMPORT_IMAGE", "PAPERLEAN_NATIVE_LIBS"]
 
 /-- The format of `env.json`. -/
-public def dataFormat : Nat := 2
+public def dataFormat : Nat := 3
 
-/-- A native library of prepared data; paths relative to the data directory. -/
+/-- A dependency package's pack: an entry of the cache, and the workspace's binding of it. -/
+public structure PreparedPackage where
+  /-- `Package.baseName`. -/
+  pkg : String
+  /-- The pack's entry (`pack/<name>`), relative to the cache directory; `""` for a package without
+  built modules. -/
+  pack : String
+  /-- The binding, relative to the data directory; `""` for a package without built modules. -/
+  binding : String
+  deriving ToJson, FromJson, Inhabited
+
+/-- The pack of the entry `entry` (`PreparedPackage.pack`), relative to the cache directory. -/
+public def packFile (entry : String) : String := s!"{entry}/pack.paperlean"
+
+/-- A native library of prepared data; paths relative to the cache directory. -/
 public structure PreparedNative where
   /-- Its package (`Package.baseName`). -/
   pkg : String
+  /-- Its entry of the cache (`native/<name>`), if it has files. -/
+  entry : String := ""
   manifest : String
   lib : String
   /-- The number of modules compiled into it; none if the package has no built modules or `failed`. -/
@@ -70,7 +92,8 @@ public structure PreparedNative where
   outdated : Array String := #[]
   deriving ToJson, FromJson, Inhabited
 
-/-- `env.json`: the prepared data and what it was prepared for; paths relative to the data directory. -/
+/-- `env.json`: the prepared data and what it was prepared for; paths relative to the data directory,
+or to the cache directory `cache` where said. -/
 public structure PreparedData where
   format : Nat := dataFormat
   /-- `Lean.PaperLean.version` of the writer. -/
@@ -81,17 +104,23 @@ public structure PreparedData where
   githash : String
   /-- `System.Platform.target` of the writer. -/
   platform : String
-  /-- Olean packs; the import image describes the first. -/
+  /-- The cache directory (`Cache.root?`) of the entries. -/
+  cache : String := ""
+  /-- The pack of Lean's library, relative to `cache`. -/
+  toolchain? : Option String := none
+  /-- The packs of the dependency packages, with every package they depend on, dependencies first. -/
+  deps : Array PreparedPackage := #[]
+  /-- The root package's packs (`root-<n>/...`), in the order in which they are read. -/
   packs : Array String := #[]
+  /-- The import image of the packs of `toolchain?` and `deps`. -/
   image? : Option String := none
-  /-- Manifests of native libraries, dependencies first. -/
+  /-- The packs that `image?` describes (as `imagePacks` gives them). -/
+  imagePacks : Array String := #[]
+  /-- Manifests of native libraries, relative to `cache`, dependencies first. -/
   native : Array String := #[]
   /-- What was prepared, for `paperlean status`. -/
   summary : Array String := #[]
-  /-- The dependency packages (`Package.baseName`) whose modules the dependency pack holds, with every
-  package they depend on. -/
-  packages : Array String := #[]
-  /-- The native libraries of `native`, by package. -/
+  /-- The native libraries of the dependency packages, by package. -/
   libs : Array PreparedNative := #[]
   deriving ToJson, FromJson
 
@@ -103,7 +132,10 @@ public def PreparedData.empty : PreparedData := {
 
 /-- Whether `d` holds no data. -/
 public def PreparedData.isEmpty (d : PreparedData) : Bool :=
-  d.packs.isEmpty && d.image?.isNone && d.native.isEmpty
+  d.packs.isEmpty && d.deps.isEmpty && d.toolchain?.isNone && d.image?.isNone && d.native.isEmpty
+
+/-- The dependency packages (`Package.baseName`) that `d` holds data of. -/
+public def PreparedData.packages (d : PreparedData) : Array String := d.deps.map (·.pkg)
 
 /-- Why the data cannot be used by this build of PaperLean, if it cannot. -/
 public def PreparedData.mismatch? (d : PreparedData) : Option String :=
@@ -117,19 +149,28 @@ public def PreparedData.mismatch? (d : PreparedData) : Option String :=
   else if d.platform != System.Platform.target then some s!"it was prepared on {d.platform}"
   else none
 
+/-- The packs (and bindings) of `d` in the data directory `dir`, in the order in which Lean reads them. -/
+public def PreparedData.packFiles (d : PreparedData) (dir : FilePath) : Array FilePath :=
+  let inCache (f : String) : FilePath := (d.cache : FilePath) / f
+  d.packs.map (fun (f : String) => dir / f) ++ (d.deps.filter (!·.binding.isEmpty)).map (dir / ·.binding) ++
+    d.toolchain?.toArray.map inCache
+
 /-- The values of `dataVars` for the data in `dir`. -/
 public def PreparedData.vars (d : PreparedData) (dir : FilePath) : Array (String × String) :=
-  let list (fs : Array String) := String.intercalate ":" (fs.map fun (f : String) => (dir / f).toString).toList
-  let vars := if d.packs.isEmpty then #[] else #[("LEAN_OLEAN_PACK", list d.packs)]
+  let list (fs : Array FilePath) := String.intercalate ":" (fs.map (·.toString)).toList
+  let packs := d.packFiles dir
+  let vars := if packs.isEmpty then #[] else #[("LEAN_OLEAN_PACK", list packs)]
   let vars := match d.image? with
-    | some image => if d.packs.isEmpty then vars else vars.push ("LEAN_IMPORT_IMAGE", (dir / image).toString)
+    | some image => if packs.isEmpty then vars else vars.push ("LEAN_IMPORT_IMAGE", (dir / image).toString)
     | none => vars
-  if d.native.isEmpty then vars else vars.push ("PAPERLEAN_NATIVE_LIBS", list d.native)
+  if d.native.isEmpty then vars else
+    vars.push ("PAPERLEAN_NATIVE_LIBS", list (d.native.map fun (f : String) => (d.cache : FilePath) / f))
 
 /-- Whether `name` is that of a directory that `paperlean prepare` writes in the data directory:
-`deps-<n>`, `root-<n>` or `native-<n>` for a number `n`. -/
+`bind`, or `image-<n>` or `root-<n>` for a number `n` (and `deps-<n>` and `native-<n>`, which earlier
+versions wrote). -/
 public def isDataDirName (name : String) : Bool :=
-  ["deps-", "root-", "native-"].any fun p =>
+  name == "bind" || ["deps-", "root-", "native-", "image-"].any fun p =>
     (name.dropPrefix? p).any fun n => !n.isEmpty && n.all Char.isDigit
 
 /-- Whether `p`, a path of `env.json` relative to the data directory, is one that `paperlean prepare`
@@ -139,14 +180,23 @@ public def isDataPath (p : String) : Bool :=
   | [d, f] => isDataDirName d && !f.isEmpty && f != "." && f != ".." && !f.contains '\\'
   | _ => false
 
-/-- `d` if every path that it holds is one that `paperlean prepare` writes (`isDataPath`); otherwise
-it is damaged. -/
+/-- Whether `p`, a path of `env.json` relative to the cache, is one of the cache: below a directory of
+it, without `.` or `..` components. -/
+public def isCachePath (p : String) : Bool :=
+  let parts := p.split '/' |>.toStringList
+  parts.length ≥ 2 && parts.all fun c => !c.isEmpty && c != "." && c != ".." && !c.contains '\\'
+
+/-- `d` if every path that it holds is one that `paperlean prepare` writes: in the data directory
+(`isDataPath`), or in the cache (`isCachePath`), which is absolute; otherwise it is damaged. -/
 def PreparedData.checkPaths (d : PreparedData) : Except String PreparedData := do
   -- (a library without modules has no files)
   let libPaths := d.libs.flatMap fun l =>
-    #[l.manifest, l.lib].filter (l.modules > 0 || !·.isEmpty)
-  for p in d.packs ++ d.image?.toArray ++ d.native ++ libPaths do
+    #[l.manifest, l.lib, l.entry].filter (l.modules > 0 || !·.isEmpty)
+  for p in d.packs ++ d.image?.toArray ++ (d.deps.map (·.binding)).filter (!·.isEmpty) do
     unless isDataPath p do throw s!"'{p}' is not a path of prepared data"
+  for p in d.toolchain?.toArray ++ (d.deps.map (·.pack)).filter (!·.isEmpty) ++ d.native ++ libPaths do
+    unless isCachePath p do throw s!"'{p}' is not a path of the cache"
+  unless d.isEmpty || (d.cache : FilePath).isAbsolute do throw s!"'{d.cache}' is not an absolute path"
   return d
 
 /-- The first line of `e`, without the line that names the file. -/
@@ -265,6 +315,25 @@ public def useWorkspaceData (wsDir : FilePath) : BaseIO Unit := do
   for name in dataVars do
     Lean.PaperLean.setEnv name ((vars.find? (·.1 == name)).map (·.2))
   Lean.PaperLean.setEnv dataMarker (if vars.isEmpty then none else some dir.toString)
+
+/--
+Has this process read its own imports (those of the configuration files that loading the workspace in
+`wsDir` elaborates) from the workspace's packs, among them the pack of Lean's library, and its import
+image, if none of `dataVars` is set and the data is for this build (`OLeanPack.useForProcess`): no
+other process inherits that, and every packed file is checked against its identity before it is
+served, as for any `lean`. Only for a process that writes no pack: it would map the new pack where the
+data is mapped.
+-/
+public def usePreparedImports (wsDir : FilePath) : BaseIO Unit := do
+  if (← IO.getEnv dataMarker).isSome || (← dataVars.anyM fun v => return (← IO.getEnv v).isSome) then
+    return
+  let some (.ok d) ← readPreparedData wsDir | return
+  if d.mismatch?.isSome then return
+  let some toolchain := d.toolchain? | return
+  unless (← Lean.PaperLean.OLeanPack.whyIgnored ((d.cache : FilePath) / toolchain).toString).isEmpty do return
+  let vars := d.vars (dataDir wsDir)
+  Lean.PaperLean.OLeanPack.useForProcess ((vars.find? (·.1 == "LEAN_OLEAN_PACK")).map (·.2) |>.getD "")
+    ((vars.find? (·.1 == "LEAN_IMPORT_IMAGE")).map (·.2) |>.getD "")
 
 /-- The file whose lock guards the prepared data in `dir`, a side file
 (`.lake/paperlean-lock.paperlean`). It lies next to `dir`, so that deleting the data leaves it, and it

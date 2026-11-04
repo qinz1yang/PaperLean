@@ -11,6 +11,7 @@ public import Lean.PaperLean.GraphDiff
 public import Lean.PaperLean.OLeanPack
 public import Lean.PaperLean.Import
 public import Lean.PaperLean.ImportState
+public import Lean.PaperLean.Linters
 public import Lean.PaperLean.NativeLibs
 public import Lean.PaperLean.SectionVars
 public import Lean.PaperLean.Speculation

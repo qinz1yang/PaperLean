@@ -115,10 +115,16 @@ def tag (ext : TagDeclarationExtension) (env : Environment) (declName : Name) : 
     assert! env.getModuleIdxFor? declName |>.isNone -- See comment at `TagDeclarationExtension`
     ext.addEntry (asyncDecl := declName) env declName
 
-def isTagged (ext : TagDeclarationExtension) (env : Environment) (declName : Name)
+-- PaperLean: keep the native lookup cache out of compiled importers.
+@[noinline] def isTagged (ext : TagDeclarationExtension) (env : Environment) (declName : Name)
     (asyncMode := ext.toEnvExtension.asyncMode) : Bool :=
-  match env.getModuleIdxFor? declName with
-  | some modIdx => (ext.getModuleEntries env modIdx).binSearchContains declName Name.quickLt
+  -- PaperLean: (for an imported name, the answer through this thread's cache of lookups)
+  let imported? (_ : Unit) := env.getModuleIdxFor? declName |>.map fun modIdx =>
+    (ext.getModuleEntries env modIdx).binSearchContains declName Name.quickLt
+  match (PaperLean.nativePath env).select
+      (PaperLean.cachedLookup 2 env.importedModuleIdxs (ext.getImportedEntries env) declName imported?)
+      (imported? ()) with
+  | some tagged => tagged
   | none        => (ext.getState (asyncMode := asyncMode) (asyncDecl := declName) env).contains declName
 
 end TagDeclarationExtension

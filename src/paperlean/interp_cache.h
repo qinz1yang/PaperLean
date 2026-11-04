@@ -19,8 +19,11 @@ struct shared_symbol {
 // symbol (which the interpreter's process-wide native symbol cache already shares). Only for imports
 // whose module data is persistent, which is never freed.
 
-// The entry of `fn` that an interpreter of an environment with the same imports as `env` found.
-bool find_shared_symbol(b_lean_obj_arg env, b_lean_obj_arg fn, shared_symbol & s);
-// Shares `s` for `fn` if `fn` is an imported declaration of `env`.
-void share_symbol(b_lean_obj_arg env, b_lean_obj_arg fn, shared_symbol const & s);
+// What identifies the imports of `env` for the entries that its interpreters share: a persistent
+// object, or `nullptr` if they share none.
+lean_object * shared_symbols_key(b_lean_obj_arg env);
+// The entry of `fn` that an interpreter of an environment whose imports `key` identifies found.
+bool find_shared_symbol(lean_object * key, b_lean_obj_arg fn, shared_symbol & s);
+// Shares `s` for `fn` if `fn` is an imported declaration of `env`, whose imports `key` identifies.
+void share_symbol(lean_object * key, b_lean_obj_arg env, b_lean_obj_arg fn, shared_symbol const & s);
 }

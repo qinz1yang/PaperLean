@@ -36,6 +36,8 @@ WellFounded.opaqueFix₃._at_._private.Lean.Environment.0.Lean.setImportedEntrie
 WellFounded.opaqueFix₃._at_._private.Lean.Meta.FunInfo.0.Lean.Meta.getFunInfoAux.spec_4
 _private.Init.Data.Array.Basic.0.Array.foldlMUnsafe.fold._at_.Array.filterMapM._at_.Lean.Meta.SynthInstance.getInstances.spec_8.spec_11
 _private.Init.Data.Array.Basic.0.Array.foldlMUnsafe.fold._at_._private.Lake.Build.Run.0.Lake.reportResult.spec_0
+_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop._at_.Lean.Elab.Command.runLinters.spec_4
+_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop._at_.Lean.Elab.Command.runLinters.spec_5
 EOF2
 $DIFF hooked only.official || fail "specializations of official Lean that PaperLean does not reuse"
 $DIFF hooked only.paperlean || fail "specializations that official Lean does not have; PaperLean's own \

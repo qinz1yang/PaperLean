@@ -3,10 +3,10 @@
 #
 # Tests `paperlean prepare` and `paperlean clean` of named packages (`Lake.PaperLean.Prepare`): a name
 # is a package's or a library's (exact, else in any case); preparing a package adds it and the
-# packages it depends on that are not prepared yet, builds the native libraries of the named packages
-# and of those that depend on them, and keeps the data of the other packages (their libraries are not
-# compiled again and stay where they are, also when a library built now is linked against them);
-# cleaning a package deletes its data and that of the prepared packages that depend on it.
+# packages it depends on that are not prepared yet, prepares the named packages and those that depend
+# on them from their files now (their libraries come from the cache unless their files changed), and
+# keeps the data of the other packages (their libraries stay, also when a library built now is linked
+# against them); cleaning a package deletes its data and that of the prepared packages that depend on it.
 # Workspace: root requires b (which requires a) and c (library Cee).
 
 WS="$(cd "$TMP_DIR" && pwd -P)/ws"
@@ -48,7 +48,7 @@ status_of() {
   capture lake paperlean status
   check_out_contains "package a: $1"; check_out_contains "package b: $2"; check_out_contains "package c: $3"
 }
-lib_of() { grep -o "\"native-[0-9]*/$1\.[a-z]*\"" .lake/paperlean/env.json | grep -v paperlean || true; }
+lib_of() { grep -o "\"prepared/[^\"]*/native/[^\"/]*/$1\.[a-z]*\"" .lake/paperlean/env.json | grep -v '\.paperlean"' || true; }
 native_used() {
   capture env PAPERLEAN_IMPORT_TIMING=1 PAPERLEAN_ACCELERATE=1 lake lean Root/Main.lean
   # (the program's output, without the timing lines, which may contain the same digits)
@@ -80,13 +80,21 @@ compiled c || fail "prepare cee did not compile c's library"
 compiled a && fail "prepare cee compiled a's library"
 compiled b && fail "prepare cee compiled b's library"
 [ "$(lib_of a)" = "$LIB_A" ] && [ "$(lib_of b)" = "$LIB_B" ] || fail "prepare cee moved the libraries of a or b"
-[ -f ".lake/paperlean/$(echo $LIB_A | tr -d '"')" ] || fail "a's library is gone"
+[ -f "$PAPERLEAN_CACHE_DIR/$(echo $LIB_A | tr -d '"')" ] || fail "a's library is gone"
 status_of prepared prepared prepared
 native_used 3
 
-# Preparing b again compiles only b's library, linked against a's, which stays in the directory of
-# an earlier run; c keeps its data.
+# Preparing b again takes its library from the cache.
+capture lake paperlean prepare b
+check_out_contains "b: 1 modules (from the cache)"
+compiled b && fail "prepare b compiled b's library, which did not change"
+[ "$(lib_of b)" = "$LIB_B" ] || fail "prepare b of the same files gave another library"
+
+# Once b changed, preparing b again compiles only b's library, linked against a's, which stays; c keeps
+# its data.
 LIB_C=$(lib_of c)
+echo 'def bExtra : Nat := 1' >> "$TMP_DIR/b/B.lean"
+run lake build
 capture lake paperlean prepare b
 compiled b || fail "prepare b did not compile b's library"
 compiled a && fail "prepare b compiled a's library"
@@ -95,7 +103,9 @@ compiled c && fail "prepare b compiled c's library"
 [ "$(lib_of b)" != "$LIB_B" ] || fail "prepare b did not write b's library anew"
 native_used 3
 
-# Preparing a again compiles a's library and b's, which depends on it; c keeps its data.
+# Once a changed, preparing a again compiles a's library and b's, which depends on it; c keeps its data.
+echo 'def aExtra : Nat := 2' >> "$TMP_DIR/a/A.lean"
+run lake build
 capture lake paperlean prepare A
 compiled a || fail "prepare A did not compile a's library"
 compiled b || fail "prepare A did not compile b's library"
@@ -121,7 +131,7 @@ native_used 1
 capture lake paperlean clean c
 check_out_contains "Deleted the prepared data of c"
 status_of "not prepared" "not prepared" "not prepared"
-ls -d .lake/paperlean/deps-* .lake/paperlean/native-* 2> /dev/null && fail "clean c kept files of the dependencies"
+ls -d .lake/paperlean/bind/* .lake/paperlean/image-* 2> /dev/null && fail "clean c kept files of the dependencies"
 native_used 0
 capture lake paperlean clean c
 check_out_contains "c: not prepared; nothing was deleted"
@@ -129,7 +139,7 @@ check_out_contains "c: not prepared; nothing was deleted"
 # A failure after `env.json` was written (here: a stale directory that cannot be deleted) keeps the
 # data that `env.json` refers to, in `prepare` and in `clean`.
 refs_exist() {
-  for f in $(grep -o '"\(deps\|native\|root\)-[0-9]*/[^"]*"' .lake/paperlean/env.json | tr -d '"'); do
+  for f in $(grep -o '"\(bind/\|\(image\|root\)-[0-9]*/\)[^"]*"' .lake/paperlean/env.json | tr -d '"'); do
     [ -e ".lake/paperlean/$f" ] || fail "$1 deleted $f, which env.json refers to"
   done
 }

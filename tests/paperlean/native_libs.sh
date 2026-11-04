@@ -136,11 +136,13 @@ check_out_matches "paperlean-timing native libs=1 .*verified=[1-9]"
 { grep -v "^paperlean-" "$CAPTURED.out.produced" || true; } > "$TMP_DIR/N2.out"
 [ "$(cat "$TMP_DIR/N2.out")" = 207 ] || fail "N2 in the library, not the one being compiled, ran: $(cat "$TMP_DIR/N2.out")"
 
-# After a change of N1, the library no longer matches and is not used.
+# After a change of N1, the library no longer matches and is not used. (A manifest knows files by
+# their contents, which compiling them again with the same source does not change.)
+perl -pi -e 's/n \* 3 \+ 1/n * 3 + 2/' N1.lean
 compile N1 N2
 pack
 capture env LEAN_PATH="$LIB" lean UseN.lean
-check_out_contains "116"
+check_out_contains "117"
 cp "$CAPTURED.out.produced" "$TMP_DIR/UseN.changed"
 capture env LEAN_PATH="$LIB" "${NATIVE[@]}" lean UseN.lean
 check_out_contains "paperlean-timing native libs=0 modules=0"
@@ -148,7 +150,8 @@ expect_output UseN "$TMP_DIR/UseN.changed" "with a stale native library"
 
 # Module files: all native code of a module imported for compile time (`meta import`), whose runtime
 # initializer runs too, is used; only its `meta` code if it is imported for run time only. A changed
-# IR file disables the library for the module.
+# IR file (here that of another version of the module, whose `.olean` file stays) disables the library
+# for the module.
 cat > MA.lean <<'END'
 module
 public def ma (n : Nat) : Nat := n + 7
@@ -181,11 +184,17 @@ expect_output UseM "$TMP_DIR/UseM.expected" "with the native library"
 capture env LEAN_PATH="$LIB" "${NATIVE_M[@]}" lean UseR.lean
 check_out_contains "paperlean-timing native libs=1 modules=0 meta=1"
 expect_output UseR "$TMP_DIR/UseR.expected" "with the native library"
-touch "$LIB/MA.ir"
+mkdir "$TMP_DIR/ma2"
+sed 's/n + 7/n + 8/' MA.lean > "$TMP_DIR/ma2/MA.lean"
+run env LEAN_PATH="$LIB" lean -R "$TMP_DIR/ma2" -Dcompiler.postponeCompile=false -o "$TMP_DIR/ma2/MA.olean" \
+  -i "$TMP_DIR/ma2/MA.ilean" "$TMP_DIR/ma2/MA.lean"
+cp "$TMP_DIR/ma2/MA.ir" "$LIB/MA.ir"
 pack
+capture env LEAN_PATH="$LIB" lean UseM.lean
+cp "$CAPTURED.out.produced" "$TMP_DIR/UseM.changed"
 capture env LEAN_PATH="$LIB" "${NATIVE_M[@]}" lean UseM.lean
 check_out_contains "paperlean-timing native libs=0 modules=0 meta=0"
-expect_output UseM "$TMP_DIR/UseM.expected" "with a changed IR file"
+expect_output UseM "$TMP_DIR/UseM.changed" "with a changed IR file"
 
 # `meta` code can use declarations that the compiler generates, which belong to both phases and which
 # the runtime initializer initializes (here a boxed character of `dein`): the `meta` code of a module

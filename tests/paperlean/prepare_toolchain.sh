@@ -71,7 +71,8 @@ ln -s "$TC" "$ELAN_HOME/toolchains/me--PaperLean---v0.1.0-lean$LEANVER"
 # prepare <PATH> [variables]: what it prints, and the native modules that `lean` then uses
 prepare() {
   local path=$1; shift
-  rm -rf .lake/paperlean
+  # (decided anew each time, not taken from the cache)
+  rm -rf .lake/paperlean "$PAPERLEAN_CACHE_DIR/prepared"
   capture env PATH="$path" "$@" sh "$ELAN_HOME/bin/paperlean" prepare -j 2
   check_out_contains "Prepared"
   grep -E '^ +dep: |^ +e\.g\. ' "$CAPTURED.out.produced" | sed 's/ ([0-9ms]*)$//' > "$ROOT/decided"

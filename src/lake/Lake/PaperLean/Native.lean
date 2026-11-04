@@ -16,16 +16,23 @@ import Lake.Build.Trace
 import Lake.Config.LeanLib
 import Lake.Config.Module
 import Lake.Util.NativeLib
+import Lake.PaperLean.Cache
 import Init.System.Platform
 import Lean.Data.NameMap
 public import Lean.PaperLean.NativeLibs
+import Lean.PaperLean.OLeanPack
 import Lean.PaperLean.System
+import Lake.PaperLean.Env
 import Std.Data.HashSet
+public import Std.Data.HashMap
 
 /-!
 Native libraries of package modules, built with the workspace toolchain for `paperlean prepare`.
 A module's native code is compiled only when its `.c`, `.ir`, `.ir.sig` and existing `.olean` parts are
-bound to one Lake module trace (`Lake/Build/Common.lean`, `Lake/Build/ModuleArtifacts.lean`).
+bound to one Lake module trace (`Lake/Build/Common.lean`, `Lake/Build/ModuleArtifacts.lean`). Modules are
+compiled in units of several, whose objects the cache keeps (`Lake.PaperLean.Cache`) by their `.c`
+files and compiler arguments; a unit ends at modules picked by their names, so that a changed module
+changes only the object of its unit.
 -/
 
 open System Lean
@@ -77,7 +84,7 @@ public structure VerifiedModule where
   irSig? : Option FilePath
   ir? : Option FilePath
   files : Array CheckedFile
-  obj : FilePath
+  obj : FilePath := ""
 
 /-- The metadata of a regular file, or `none` if it is missing or not a regular file. -/
 def statFile (file : FilePath) : BaseIO (Option FileStamp) := do
@@ -108,8 +115,8 @@ def checkArtifact (kind : String) (file : FilePath) (descr? : Option ArtifactDes
     return .error s!"{kind} does not match the trace"
   return .ok { path := file, stamp := after }
 
-/-- Verify a module's files against its Lake trace and give it an object path below `outDir`. -/
-def verifyModule (outDir : FilePath) (mod : Module) : LoggerIO (Except String VerifiedModule) := do
+/-- Verify a module's files against its Lake trace. -/
+def verifyModule (mod : Module) : LoggerIO (Except String VerifiedModule) := do
   let c? ← statFile mod.cFile
   if c?.isNone then return .error "no .c"
   let trace ← readTraceFile mod.traceFile
@@ -149,7 +156,6 @@ def verifyModule (outDir : FilePath) (mod : Module) : LoggerIO (Except String Ve
     irSig? := opt 4 mod.irSigFile
     ir? := opt 5 mod.irFile
     files := files
-    obj := mod.filePath (outDir / "obj" / mod.pkg.prettyName) "o"
   }
 
 /-- The C compiler arguments Lake uses for an exporting object (`Lake/Build/Common.lean`,
@@ -158,12 +164,36 @@ def objectArgs (lean : LeanInstall) (mod : Module) : Array String :=
   #["-I", lean.includeDir.toString] ++ lean.ccFlags ++
     mod.weakLeancArgs ++ mod.leancArgs ++ #["-DLEAN_EXPORTING"]
 
-/-- Compile one verified module, capturing the compiler log instead of logging from the task. -/
-def compileToObject (lean : LeanInstall) (vm : VerifiedModule) : BaseIO (Bool × Log) := do
-  let action : LoggerIO Unit := liftM <|
-    compileO vm.obj vm.c (moreArgs := objectArgs lean vm.mod) (compiler := lean.cc)
+/-- The content hashes of files (`Lean.PaperLean.OLeanPack.hashFiles`), by path, with the identity
+that each was hashed with. -/
+public abbrev FileHashes := Std.HashMap String (ByteArray × String)
+
+/-- The content hash of `f` if it was hashed with the identity `stamp`. -/
+def FileHashes.of? (hashes : FileHashes) (f : FilePath) (stamp : FileStamp) : Option String :=
+  match hashes[f.toString]? with
+  | some (id, h) => if id.data == stamp.identity then some h else none
+  | none => none
+
+/-- Compiles `c` with the arguments for `mod` into the object in `objects` that its key names, unless it
+is there (then the compiler's log is empty): the key of the compiler, the arguments, and the content
+hashes `cFiles` of the `.c` files that `c` is (`unit` false) or includes in this order, as
+`compileNativeUnit` writes it. Without the hash of a file (`""`: it changed since the files were
+hashed), into `tmp`. -/
+def compileCached (lean : LeanInstall) (objects tmp : FilePath) (mod : Module) (c : FilePath) (unit : Bool)
+    (cFiles : Array String) : BaseIO (Option FilePath × Log) := do
+  let args := objectArgs lean mod
+  let shape := #[lean.cc.toString, toString unit] ++ args
+  let obj := if cFiles.any (·.isEmpty) then tmp / s!"{Cache.key (shape.push c.toString)}.o"
+    else objects / s!"{Cache.key (shape ++ cFiles)}.o"
+  if ← obj.pathExists then return (some obj, {})
+  let tmp := obj.addExtension s!"tmp.{← IO.Process.getPID}"
+  let action : LoggerIO Unit := liftM <| compileO tmp c (moreArgs := args) (compiler := lean.cc)
   let (ok?, log) ← Lake.LoggerIO.captureLog action
-  return (ok?.isSome, log)
+  if ok?.isNone then return (none, log)
+  -- (another prepare may have compiled the same object meanwhile; either is as good)
+  match ← (IO.FS.rename tmp obj).toBaseIO with
+  | .ok _ => return (some obj, log)
+  | .error _ => discard <| (IO.FS.removeFile tmp).toBaseIO; return (none, log)
 
 /-- The first checked file whose identity is no longer the recorded one. -/
 def changedFile? (files : Array CheckedFile) : BaseIO (Option FilePath) := do
@@ -196,7 +226,7 @@ public def builtModules (pkg : Package) : IO (Array Module) := do
 
 /-- Whether `mod` lies in a library that `lake build` of its package builds, which a native library
 holds. -/
-def inDefaultLib (mod : Module) : Bool :=
+public def inDefaultLib (mod : Module) : Bool :=
   mod.pkg.defaultTargets.isEmpty || mod.pkg.defaultTargets.contains mod.lib.name
 
 public def libraryModules (pkg : Package) : IO (Array Module) :=
@@ -235,11 +265,12 @@ def evalSeconds : Nat := 10
 def evalMebibytes : Nat := 4096
 
 /-- The verdicts of `Lean.PaperLean.evalImpuritiesMain` on the library modules of `pkgs`, in processes
-of their own: with `pack` as the olean pack, as they map everything they read, and evaluate constants
-of packages. A module whose constants take too long or too much memory, or end the process, is impure
+of their own: with the olean packs `packs` (`LEAN_OLEAN_PACK`), as they map everything they read, and
+evaluate constants of packages. A module whose constants take too long or too much memory, or end the process, is impure
 too, and the others are done by another process. `dir` is a directory for their files;
-`PAPERLEAN_EVAL_SECONDS` and `PAPERLEAN_EVAL_MEMORY` (in mebibytes) replace the limits, for tests. -/
-public def evalImpurities (ws : Workspace) (pkgs : Array Package) (pack : FilePath) (dir : FilePath) :
+`PAPERLEAN_EVAL_SECONDS` and `PAPERLEAN_EVAL_MEMORY` (in mebibytes) replace the limits, for tests, and
+the events of the processes are appended to the file `PAPERLEAN_EVAL_EVENTS` if it is set. -/
+public def evalImpurities (ws : Workspace) (pkgs : Array Package) (packs : String) (dir : FilePath) :
     IO Lean.PaperLean.EvalVerdicts := do
   IO.FS.createDirAll dir
   let program := dir / "Eval.lean"
@@ -257,7 +288,7 @@ public def evalImpurities (ws : Workspace) (pkgs : Array Package) (pack : FilePa
       cmd := ws.lakeEnv.lean.lean.toString
       args := #["--run", program.toString, (dir / "modules.txt").toString, (dir / "events.txt").toString,
         toString seconds, toString mebibytes]
-      env := #[("LEAN_OLEAN_PACK", some pack.toString), ("LEAN_IMPORT_IMAGE", none),
+      env := #[("LEAN_OLEAN_PACK", some packs), ("LEAN_IMPORT_IMAGE", none),
         ("PAPERLEAN_NATIVE_LIBS", none), ("LEAN_PATH", some ws.augmentedLeanPath.toString),
         ("LEAN_ABORT_ON_PANIC", none), ("LEAN_BACKTRACE", some "0")]
       stdin := .null
@@ -267,6 +298,9 @@ public def evalImpurities (ws : Workspace) (pkgs : Array Package) (pack : FilePa
     let exitCode ← child.wait
     let events : Array String ← do
       if ← (dir / "events.txt").pathExists then IO.FS.lines (dir / "events.txt") else pure #[]
+    if let some copy ← IO.getEnv "PAPERLEAN_EVAL_EVENTS" then
+      let h ← IO.FS.Handle.mk copy .append
+      for e in events do h.putStrLn e
     let mut started? : Option FilePath := none
     let mut finished := false
     let before := decided.size
@@ -302,7 +336,8 @@ opaque cObjectNames (c : @& String) : IO (Array String × Array String × Array 
 
 /-- The modules of a package's native library, and the units in which `prepare` compiles them:
 ranges `[start, stop)` of `modules`, of consecutive modules with the same compiler arguments whose
-`.c` files can be one translation unit. -/
+`.c` files can be one translation unit, which end after a module whose name's hash is a multiple of
+`unitCut` (so that adding or changing a module changes few units) unless they get too large. -/
 public structure NativePlan where
   pkg : Package
   modules : Array Module
@@ -314,6 +349,7 @@ public structure NativePlan where
 files costs much less than one per file, but its memory grows with their size). -/
 def unitSize : Nat := 64
 def unitBytes : Nat := 4000000
+def unitCut : UInt64 := 32
 
 /-- The `NativePlan` of `pkg`, reading the `.c` files of its modules on `jobs` tasks (a module whose
 `.c` file cannot be read is in a unit of its own, and its verification fails). -/
@@ -351,6 +387,13 @@ public def planNativeLib (lean : LeanInstall) (pkg : Package) (jobs : Nat) : IO 
     exts := exts.insertMany e
     consts := consts.insertMany c
     exported := exported.insertMany x
+    if hash mod.name % unitCut == 0 then
+      units := units.push (start, i + 1)
+      start := i + 1
+      bytes := 0
+      exts := {}
+      consts := {}
+      exported := {}
   if start < modules.size then units := units.push (start, modules.size)
   return { pkg, modules, others, units }
 
@@ -358,63 +401,67 @@ public def planNativeLib (lean : LeanInstall) (pkg : Package) (jobs : Nat) : IO 
 its object, or why it is left out, and the log. -/
 public abbrev ModuleResult := Nat × Module × Except String VerifiedModule × Log
 
-/-- Checks the result of compiling `vm` (into `vm.obj`). -/
-def checkCompiled (vm : VerifiedModule) (ok : Bool) : BaseIO (Except String VerifiedModule) := do
-  if !ok then return .error "compile failed"
+/-- Checks the result of compiling `vm` into `obj?`. -/
+def checkCompiled (vm : VerifiedModule) (obj? : Option FilePath) : BaseIO (Except String VerifiedModule) := do
+  let some obj := obj? | return .error "compile failed"
   if let some path ← changedFile? vm.files then return .error s!"changed during compilation: {path}"
-  if (← statFile vm.obj).isNone then return .error "no object produced"
-  return .ok vm
+  if (← statFile obj).isNone then return .error "no object produced"
+  return .ok { vm with obj }
 
 /--
-Verifies the modules of the unit `[start, stop)` of `plan` and compiles them into objects below
-`outDir`: those verified in one translation unit (whose `.c` file includes theirs, with the static
-variables that the files of all modules have renamed), unless there is one or that fails to compile;
-then each on its own, as Lake compiles them.
+Verifies the modules of the unit `[start, stop)` of `plan` and compiles them into objects in `objects`
+(where they may be already: `compileCached`, with the content hashes `hashes` of the `.c` files),
+writing temporary files to `tmp`: those verified in one translation unit (whose `.c` file includes
+theirs, with the static variables that the files of all modules have renamed), unless there is one or
+that fails to compile; then each on its own, as Lake compiles them.
 -/
-public def compileNativeUnit (lean : LeanInstall) (outDir : FilePath) (plan : NativePlan)
-    (start stop : Nat) : BaseIO (Array ModuleResult) := do
+public def compileNativeUnit (lean : LeanInstall) (objects tmp : FilePath) (hashes : FileHashes)
+    (plan : NativePlan) (start stop : Nat) : BaseIO (Array ModuleResult) := do
   let mut results : Array ModuleResult := #[]
   let mut verified : Array (Nat × VerifiedModule × Log) := #[]
   for i in [start:stop] do
     let some mod := plan.modules[i]? | continue
-    let (result?, log) ← Lake.LoggerIO.captureLog (verifyModule outDir mod)
+    let (result?, log) ← Lake.LoggerIO.captureLog (verifyModule mod)
     match result?.getD (.error "cannot read the module's files") with
     | .ok vm => verified := verified.push (i, vm, log)
     | .error e => results := results.push (i, mod, .error e, log)
+  -- the content hash of a verified `.c` file, which `verifyModule` read
+  let cHash (vm : VerifiedModule) : String :=
+    ((vm.files.find? (·.path == vm.c)).bind fun f => hashes.of? vm.c f.stamp).getD ""
   if h : verified.size > 1 then
     let first := verified[0].2.1
-    let base := outDir / "obj" / plan.pkg.prettyName / s!"unit-{start}"
-    let unitC := base.addExtension "c"
-    let unitO := base.addExtension "o"
+    let unitC := tmp / s!"{plan.pkg.prettyName}-unit-{start}.c"
     -- `EmitC.lean`'s initialization flags (`_G_*initialized`) are the only static variables whose
     -- names all files have
     let flags := #["_G_initialized", "_G_runtime_initialized", "_G_meta_initialized"]
-    let text := verified.foldl (init := "") fun t (i, vm, _) =>
-      t ++ String.join (flags.toList.map fun f => s!"#define {f} {f}_{i}\n") ++
-        s!"#include \"{vm.c}\"\n" ++ String.join (flags.toList.map fun f => s!"#undef {f}\n")
-    let written ← (do IO.FS.createDirAll (base.parent.getD outDir); IO.FS.writeFile unitC text; pure true).catchExceptions
+    let text := verified.foldl (init := ("", 0)) (fun (t, j) (_, vm, _) =>
+      (t ++ String.join (flags.toList.map fun f => s!"#define {f} {f}_{j}\n") ++
+        s!"#include \"{vm.c}\"\n" ++ String.join (flags.toList.map fun f => s!"#undef {f}\n"), j + 1)) |>.1
+    let written ← (do IO.FS.createDirAll tmp; IO.FS.writeFile unitC text; pure true).catchExceptions
       fun _ => pure false
+    let cFiles := verified.map fun (_, vm, _) => cHash vm
     if written then
-      let action : LoggerIO Unit := liftM <|
-        compileO unitO unitC (moreArgs := objectArgs lean first.mod) (compiler := lean.cc)
-      let (ok?, clog) ← Lake.LoggerIO.captureLog action
-      if ok?.isSome && (← statFile unitO).isSome then
+      -- (the `.c` files' paths in the text do not change the object)
+      let (obj?, clog) ← compileCached lean objects tmp first.mod unitC true cFiles
+      discard <| (IO.FS.removeFile unitC).toBaseIO
+      if obj?.isSome then
         -- (the compiler's log once)
         let mut unitLog := clog
         for (i, vm, log) in verified do
-          results := results.push (i, vm.mod, ← checkCompiled { vm with obj := unitO } true, log ++ unitLog)
+          results := results.push (i, vm.mod, ← checkCompiled vm obj?, log ++ unitLog)
           unitLog := {}
         return results.qsort (·.1 < ·.1)
   for (i, vm, log) in verified do
-    let (ok, clog) ← compileToObject lean vm
-    results := results.push (i, vm.mod, ← checkCompiled vm ok, log ++ clog)
+    let (obj?, clog) ← compileCached lean objects tmp vm.mod vm.c false #[cHash vm]
+    results := results.push (i, vm.mod, ← checkCompiled vm obj?, log ++ clog)
   return results.qsort (·.1 < ·.1)
 
 /--
 Links into `outDir`, a directory that no prepared data refers to yet, the native library of the
 package of `plan` of `ws` from the results of compiling its units (`compileNativeUnit`), linked
 against the native libraries `deps` of the packages it depends on (already built), and writes its
-manifest, reading the modules' data on `jobs` tasks. Fails with a message if the library cannot be
+manifest, which knows the modules' files by their content hashes `hashes`, reading the modules' data
+on `jobs` tasks. Fails with a message if the library cannot be
 linked or loaded; a module whose files cannot be verified or compiled is left out, and one that
 refers to a symbol that nothing defines, such as a specialization that an official Lean's library has
 and this toolchain's does not. Their importers stay in the library, which holds their code but does
@@ -424,7 +471,7 @@ or that it says nothing about, is taken not to. An `@[export]` of a symbol of Le
 that it is linked against is not supported: the library's calls of that symbol would run the export.
 -/
 public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array ModuleResult)
-    (deps : Array NativeLib) (outDir : FilePath) (jobs : Nat)
+    (deps : Array NativeLib) (outDir : FilePath) (jobs : Nat) (hashes : FileHashes)
     (verdicts : Lean.PaperLean.EvalVerdicts) : LoggerIO NativeLib := do
   let pkg := plan.pkg
   let lean := ws.lakeEnv.lean
@@ -437,13 +484,24 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
     match result with
     | .ok vm => compiled := compiled.push vm
     | .error e => excluded := excluded.push (mod.name, e)
+  -- The manifest knows the modules' files by the hashes of the files that were verified, which are
+  -- hashed now if they changed since `prepare` hashed them.
+  let unhashed := compiled.flatMap fun vm =>
+    (vm.files.filter fun f => (hashes.of? f.path f.stamp).isNone).map (·.path.toString)
+  let hashes ← if unhashed.isEmpty then pure hashes else do
+    let record := outDir / "hashes.paperlean"
+    let found ← Lean.PaperLean.OLeanPack.hashFiles unhashed #[] record jobs
+    removePath record
+    pure <| (unhashed.zip found).foldl (init := hashes) fun m (f, r) => if r.2.isEmpty then m else m.insert f r
   -- Later compilations must not invalidate an earlier module before it is linked.
   let mut stable : Array VerifiedModule := #[]
   for vm in compiled do
     let changed? ← changedFile? vm.files
     match changed? with
     | some path => excluded := excluded.push (vm.mod.name, s!"changed before linking: {path}")
-    | none => stable := stable.push vm
+    | none =>
+      if vm.files.all fun f => (hashes.of? f.path f.stamp).isSome then stable := stable.push vm
+      else excluded := excluded.push (vm.mod.name, "its files changed while it was prepared")
   compiled := stable
   -- Output names, with Lake's extension (`Lake/Util/NativeLib.lean`).
   let libName := s!"{pkg.prettyName}.{sharedLibExt}"
@@ -506,6 +564,7 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
   let stubC := outDir / "obj" / s!"{pkg.prettyName}-stubs.c"
   let stubO := outDir / "obj" / s!"{pkg.prettyName}-stubs.o"
   unless missing.isEmpty do
+    IO.FS.createDirAll (outDir / "obj")
     IO.FS.writeFile stubC <| String.join <| missing.toList.map fun s =>
       s!"__attribute__((weak, visibility(\"hidden\"))) char {s}[8];\n"
     compileO stubO stubC (moreArgs := #["-fPIC"]) (compiler := lean.cc)
@@ -549,14 +608,12 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
     match verdicts.certified[vm.olean]? with
     | some ids => if ids == checked then none else some "its files changed after they were analysed"
     | none => some "there is no verdict about it"
+  let hashOf (vm : VerifiedModule) (f? : Option FilePath) : String :=
+    (f?.bind fun f => (vm.files.find? (·.path == f)).bind fun file => hashes.of? f file.stamp).getD ""
   let manifestModules : Array Lean.PaperLean.NativeManifestModule := compiled.mapIdx fun i vm => {
     name := vm.mod.name, cFile := vm.c.toString
     data := { data[i]! with differs := data[i]!.differs || (notPure vm).isSome }
-    files := #[vm.olean.toString,
-      (vm.oleanServer?.map (·.toString)).getD "",
-      (vm.oleanPrivate?.map (·.toString)).getD "",
-      (vm.irSig?.map (·.toString)).getD "",
-      (vm.ir?.map (·.toString)).getD ""] }
+    hashes := #[some vm.olean, vm.oleanServer?, vm.oleanPrivate?, vm.irSig?, vm.ir?].map (hashOf vm) }
   let manifestWhy ← Lean.PaperLean.writeNativeManifestFiles manifestFile.toString libFile.toString
     (deps.map (·.manifest.toString)) manifestModules (depData.flatMap (·.metaSymbols))
   -- The manifest records the files as they are now, the library holds them as they were verified.

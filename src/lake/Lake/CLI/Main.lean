@@ -31,6 +31,8 @@ import Lake.CLI.Actions
 import Lake.CLI.Translate
 import Lake.CLI.Serve
 import Lake.PaperLean.Cli
+import Lake.PaperLean.Env
+import Lake.PaperLean.HashCache
 public import Lake.CLI.BuiltinLint
 import Init.Data.String.Modify
 
@@ -1467,9 +1469,17 @@ def lakeCli : (cmd : String) → CliM PUnit
   else
     throw <| CliError.unknownCommand cmd
 
-/-- PaperLean: `lakeCli`, and the `paperlean` command, which only PaperLean's Lake has. -/
-private def lakeCliPaperLean (cmd : String) : CliM PUnit :=
-  if cmd == "paperlean" then lake.paperlean else lakeCli cmd
+/-- PaperLean: `lakeCli`, and the `paperlean` command, which only PaperLean's Lake has. The other
+commands write no pack in this process, whose imports then read prepared data
+(`PaperLean.usePreparedImports`); a build reads its record of `.hash` files while the workspace loads
+(`PaperLean.HashCache.prefetch`). -/
+private def lakeCliPaperLean (cmd : String) : CliM PUnit := do
+  if cmd == "paperlean" then return ← lake.paperlean
+  if let some wsDir ← resolvePath? (← getThe LakeOptions).rootDir then
+    PaperLean.usePreparedImports wsDir
+    -- (`LoadConfig.pkgDir` of the root package, which the record is found by)
+    if cmd == "build" && (← PaperLean.accelerated) then PaperLean.HashCache.prefetch (wsDir / ".")
+  lakeCli cmd
 
 -- PaperLean: (not inlined: its body calls PaperLean's code)
 @[noinline] def lake : CliM PUnit := do

@@ -2438,6 +2438,17 @@ inductive DefEqCacheKind where
   | transient -- problem has mvars or is using nonstandard configuration, we should use transient cache
   | permanent -- problem does not have mvars and we are using standard config, we can use one persistent cache.
 
+/-- PaperLean: whether `instantiateMVars e` leaves `e` and the metavariable context as they are
+(`src/paperlean/mvars_probe.cpp`). -/
+@[extern "lean_paperlean_mvars_instantiated"]
+opaque _root_.Lean.PaperLean.mvarsInstantiated (mctx : @& MetavarContext) (e : @& Expr) : Bool
+
+/-- PaperLean: `instantiateMVars e`, skipped where it would change nothing. -/
+private def instantiateMVarsAtDefEq (e : Expr) : MetaM Expr := do
+  if e.hasMVar && PaperLean.nativeAvailable e && PaperLean.mvarsInstantiated (← getMCtx) e then
+    return e
+  instantiateMVars e
+
 private def getDefEqCacheKind (t s : Expr) : MetaM DefEqCacheKind := do
   if t.hasMVar || s.hasMVar || (← read).customCanUnfoldPredicate?.isSome then
     return .transient
@@ -2474,7 +2485,7 @@ private def cacheResult (keyInfo : DefEqCacheKeyInfo) (result : Bool) : MetaM Un
     Otherwise, the key is invalid after the assignment is "backtracked".
     See issue #1870 for an example.
     -/
-    let key ← mkDefEqCacheKey (← instantiateMVars key.lhs) (← instantiateMVars key.rhs)
+    let key ← mkDefEqCacheKey (← instantiateMVarsAtDefEq key.lhs) (← instantiateMVarsAtDefEq key.rhs)
     modifyDefEqTransientCache fun c => c.insert key result
 
 private def whnfCoreAtDefEq (e : Expr) : MetaM Expr := do
@@ -2542,8 +2553,8 @@ partial def isExprDefEqAuxImpl (t : Expr) (s : Expr) : MetaM Bool := withIncRecD
       outer invocations or not. It is not perfect (we may assign mvars in nested calls), but it should work well enough in practice,
       and prevent repeated traversals in nested calls.
     -/
-    let t ← instantiateMVars t
-    let s ← instantiateMVars s
+    let t ← instantiateMVarsAtDefEq t
+    let s ← instantiateMVarsAtDefEq s
     let numPostponed ← getNumPostponed
     let k ← mkCacheKey t s
     match (← getCachedResult k) with

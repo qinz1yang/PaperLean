@@ -68,9 +68,10 @@ run lake build
 capture lake paperlean prepare -j 2
 check_out_contains "Compiling the native library of dep (2 jobs, 1 units)"
 check_out_contains "dep: 5 modules"
-[ "$(stat -c %a .lake/paperlean/native-*/dep.so 2>/dev/null || stat -f %Lp .lake/paperlean/native-*/dep.dylib)" = 555 ] ||
-  fail "the native library is not read-only"
-[ -z "$(ls .lake/paperlean/native-*/*.rsp 2>/dev/null)" ] || fail "a response file was left"
+NATIVE=$(ls -d "$PAPERLEAN_CACHE_DIR"/prepared/*/native/dep-*)
+LIB=$(ls "$NATIVE"/dep.so "$NATIVE"/dep.dylib 2> /dev/null || true)
+[ "$(stat -c %a "$LIB" 2>/dev/null || stat -f %Lp "$LIB")" = 555 ] || fail "the native library is not read-only"
+[ -z "$(ls "$NATIVE"/*.rsp 2>/dev/null)" ] || fail "a response file was left"
 capture env PAPERLEAN_UNIT_BYTES=1 lake paperlean prepare -j 2
 check_out_contains "Compiling the native library of dep (2 jobs, 5 units)"
 check_out_contains "dep: 5 modules"

@@ -336,8 +336,6 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
       -- imports) calls `importModules`, which in turn requires the flag to be set. Restore it.
       unsafe enableInitializersExecution
     return snap
-  -- PaperLean: reuse is for the first frontend of a process (`Lean.PaperLean.Speculation`)
-  PaperLean.Speculation.noteFrontend fileName
   let processor := Language.Lean.process
   let snap ← processor setup old? ctx
   let snaps := Language.toSnapshotTree snap

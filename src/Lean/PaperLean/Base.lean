@@ -300,4 +300,30 @@ that use the caches, only while the thread records (`envRecording`). -/
   envRecordAll #[.cache cache op (unsafe unsafeCast key) value] #[unsafe unsafeCast ()]
   setHeartbeats heartbeats
 
+/-!
+Lookups of names in tables of the imported modules, which do not change, through a cache of each
+thread (`src/paperlean/lookup_cache.cpp`): an entry is keyed by the addresses of the name and of two
+tables, and by a kind of lookup, which fixes how its result is computed from them.
+-/
+
+/-- `some r` if this thread's cache has the result `r` of the lookup (`lookupStore`). -/
+@[extern "lean_paperlean_lookup_probe"]
+def lookupProbe {τ τ' α : Type} (_kind : UInt8) (_t : @& τ) (_t' : @& τ') (_n : @& Name) :
+    Option α :=
+  none
+
+/-- `r`, which this thread's cache stores as the result of the lookup. -/
+@[extern "lean_paperlean_lookup_store"]
+def lookupStore {τ τ' α : Type} (_kind : UInt8) (_t : @& τ) (_t' : @& τ') (_n : @& Name) (r : α) :
+    α :=
+  r
+
+/-- `f ()`, the lookup of kind `kind` of `n` in the tables `t` and `t'` of the imported modules, which
+`f` computes from these alone, through this thread's cache (only where `nativeAvailable`). -/
+@[inline] def cachedLookup {τ τ' α : Type} (kind : UInt8) (t : τ) (t' : τ') (n : Name)
+    (f : Unit → α) : α :=
+  match lookupProbe (α := α) kind t t' n with
+  | some r => r
+  | none => lookupStore kind t t' n (f ())
+
 end Lean.PaperLean

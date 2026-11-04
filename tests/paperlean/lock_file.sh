@@ -128,7 +128,7 @@ chmod 311 .lake
 check_compile ", with the same results but slower:" "$builtin"
 chmod 755 .lake
 # Warnings of the `lean` processes are not lost there either, and name the file that holds them.
-lib=$(ls .lake/paperlean/native-*/*.so)
+lib=$(ls "$PAPERLEAN_CACHE_DIR"/prepared/*/native/*/*.so "$PAPERLEAN_CACHE_DIR"/prepared/*/native/*/*.dylib 2> /dev/null || true)
 chmod u+w "$lib"
 printf 'x' >> "$lib"
 chmod a-w .lake

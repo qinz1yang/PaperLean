@@ -347,8 +347,9 @@ def runLinters (stx : Syntax) (infoTreePromise? : Option (IO.Promise InfoTree) :
       let producedCodeQualityEntries ← IO.mkRef (#[] : Array Linter.CodeQualityLogEntry)
       unless linters.isEmpty do
         for linter in linters do
+          -- PaperLean: (`withTraceNode` uses a tag only under trace options)
           withTraceNode `Elab.lint (fun _ => return m!"running linter: {.ofConstName linter.name}")
-              (tag := linter.name.toString) do
+              (tag := if (← getOptions).hasTrace then linter.name.toString else "") do
             let savedState ← get
             let originalSize := savedState.infoState.trees.size
             try

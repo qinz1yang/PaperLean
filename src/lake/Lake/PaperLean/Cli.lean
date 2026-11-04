@@ -11,9 +11,11 @@ public import Lake.Config.Workspace
 import Lake.Load.Workspace
 import Lake.Config.LeanExe
 import Lake.PaperLean.Env
+import Lake.PaperLean.Cache
 import Lake.PaperLean.Prepare
 import Lake.PaperLean.Update
 import Lake.PaperLean.BuildData
+import Lake.PaperLean.HashCache
 import Lake.PaperLean.ReuseSummary
 import Lean.PaperLean.System
 import Lean.PaperLean.OLeanPack
@@ -38,7 +40,8 @@ commands:
                             of all of them, or of the named packages (or packages of the named
                             libraries) with the packages they depend on that are not prepared yet,
                             keeping the others' data; with --all, or if it is named, also a pack of
-                            the root package
+                            the root package. The packs and libraries are kept in a cache that all
+                            workspaces share, and made again only for packages whose files changed
   build [--rebuild-deps] [--prepare[=names]] [lake arguments]
                             check the dependencies, report whether prepared data is used, then run
                             `lake build`; with --prepare, pack the root package's modules that
@@ -51,6 +54,9 @@ commands:
                             written
   clean [names]             delete prepared data: all of it, or that of the named packages and of
                             the prepared packages that depend on them
+  clean --cache [--unused-for DAYS]
+                            delete the entries of the shared cache that no workspace's prepared data
+                            uses (and that were not used in the last DAYS days)
   install                   install or update the `paperlean` front end in elan's `bin`
   --version                 print PaperLean's version and the Lean release it is built on; outside
                             a project, the installed PaperLean toolchains"
@@ -113,12 +119,17 @@ def dataUse (ws : Workspace) : IO String := do
     | some why => return s!"not used: {why}; run `paperlean prepare`"
     | none =>
       if d.isEmpty then return "none prepared: run `paperlean prepare`"
-      for p in d.packs do
-        let why ← Lean.PaperLean.OLeanPack.whyIgnored (dataDir ws.dir / p).toString
-        unless why.isEmpty do return s!"not used: {p}: {why}; run `paperlean prepare`"
-      let parts := toString d.packs.size ++ " pack(s)" ++ (if d.image?.isSome then ", an import image" else "") ++
-        (if d.native.isEmpty then "" else s!", {d.native.size} native libraries")
-      return s!"used: {parts}"
+      let packs := d.packFiles (dataDir ws.dir)
+      let ignored ← packs.filterMapM fun p => do
+        let why ← Lean.PaperLean.OLeanPack.whyIgnored p.toString
+        return if why.isEmpty then none else some s!"{p}: {why}"
+      let some first := ignored[0]?
+        | return s!"used: {packs.size} pack(s){if d.image?.isSome then ", an import image" else ""}\
+            {if d.native.isEmpty then "" else s!", {d.native.size} native libraries"}"
+      let more := if ignored.size > 1 then s!" (and {ignored.size - 1} more)" else ""
+      if ignored.size == packs.size then return s!"not used: {first}{more}; run `paperlean prepare`"
+      return s!"used in part: {packs.size - ignored.size} of {packs.size} pack(s), but not {first}{more}; \
+        run `paperlean prepare`"
 
 /-- The Lean release PaperLean is built on: the part of its version after `-lean`. -/
 def upstreamVersion : String :=
@@ -182,29 +193,31 @@ def dependencyMismatches (ws : Workspace) : IO (Array String × Array String) :=
     | none => out := out ++ asks
   return (out, notes)
 
-/-- How many packed modules of the used prepared data changed since packing, if any did. -/
-def staleNote (ws : Workspace) : IO String := do
-  let some (.ok d) ← readPreparedData ws.dir | return ""
-  if d.mismatch?.isSome || (← explicitDataVars) then return ""
-  let mut stale := 0
-  let mut total := 0
-  for p in d.packs do
-    if p.endsWith "/deps.paperlean" then
-      if let .ok (s, t) ← (Lean.PaperLean.OLeanPack.staleness (dataDir ws.dir / p).toString).toBaseIO then
+/-- How many packed modules of the used prepared data changed since packing, if any did: a task, as
+it takes a `stat` of every packed file. -/
+def staleNote (ws : Workspace) : BaseIO (Task String) := do
+  let some (.ok d) ← readPreparedData ws.dir | return .pure ""
+  if d.mismatch?.isSome || (← explicitDataVars) then return .pure ""
+  BaseIO.asTask (prio := .dedicated) do
+    let mut stale := 0
+    let mut total := 0
+    for p in d.deps.filter (!·.binding.isEmpty) do
+      let binding := dataDir ws.dir / p.binding
+      if let .ok (s, t) ← (Lean.PaperLean.OLeanPack.staleness binding.toString).toBaseIO then
         stale := stale + s; total := total + t
-  if let (some base, delta?) := rootPacks d then
-    let packs := (delta?.toArray.push base).map fun (p : String) => dataDir ws.dir / p
-    if let .ok (s, t) ← (packStaleness ws.root packs).toBaseIO then
-      stale := stale + s; total := total + t
-  if stale == 0 then return ""
-  return s!"; {stale} of {total} packed modules changed since packing and are read from disk \
-    (run `paperlean prepare`)"
+    if let (some base, delta?) := rootPacks d then
+      let packs := (delta?.toArray.push base).map fun (p : String) => dataDir ws.dir / p
+      if let .ok (s, t) ← (packStaleness ws.root packs).toBaseIO then
+        stale := stale + s; total := total + t
+    if stale == 0 then return ""
+    return s!"{stale} of {total} packed modules changed since packing and are read from disk \
+      (run `paperlean prepare`)"
 
 /-- `l` as `paperlean status` tells of it, where no import has looked at its modules: `currentFindings`,
 only for modules that still exist, and with what was found only of the files of the pack in use. -/
 def statusFindings (ws : Workspace) (d : PreparedData) (l : PreparedNative) : IO PreparedNative := do
-  let l ← match ws.packages.find? (pkgKey · == l.pkg), d.packs.find? (·.endsWith "/deps.paperlean") with
-    | some pkg, some pack => keptFindings pkg (dataDir ws.dir / pack) l
+  let l ← match ws.packages.find? (pkgKey · == l.pkg), d.deps.find? (·.pkg == l.pkg) with
+    | some pkg, some p => keptFindings pkg (dataDir ws.dir / p.binding) l
     | _, _ => pure l
   let l := currentFindings ws l
   let exist (m : String) : IO Bool := match ws.findModule? m.toName with
@@ -217,16 +230,42 @@ def statusFindings (ws : Workspace) (d : PreparedData) (l : PreparedNative) : IO
     others := ← l.others.filterM exist
     outdated := ← l.outdated.filterM exist }
 
+/-- What `paperlean status` says of the data of the dependency package `p` of `d`: whether Lean reads its
+pack and how many of its modules changed since they were bound, and whether its native library is in
+the cache. -/
+def packStatus (ws : Workspace) (d : PreparedData) (p : PreparedPackage) : IO String := do
+  if p.pack.isEmpty then return "it has no built modules"
+  let binding := dataDir ws.dir / p.binding
+  let name := (p.pack.splitOn "/").getLast!
+  let why ← Lean.PaperLean.OLeanPack.whyIgnored binding.toString
+  let pack ← if !why.isEmpty then pure s!"its pack {name} is not used ({why}); run `paperlean prepare`" else
+    match ← (Lean.PaperLean.OLeanPack.staleness binding.toString).toBaseIO with
+    | .ok (s, t) => pure s!"pack {name} of the cache ({t} modules\
+        {if s > 0 then s!", {s} changed since and read from disk" else ""})"
+    | .error e => pure s!"its pack {name} is not used ({e}); run `paperlean prepare`"
+  let native ← match d.libs.find? (·.pkg == p.pkg) with
+    | some l =>
+      if l.entry.isEmpty then pure "" else
+      let name := (l.entry.splitOn "/").getLast!
+      if ← ((d.cache : FilePath) / l.manifest).pathExists then pure s!", native library {name}"
+      else pure s!", its native library {name} is missing from the cache; run `paperlean prepare`"
+    | none => pure ""
+  return pack ++ native
+
 def status (ws : Workspace) (verify := false) : IO UInt32 := do
   IO.println s!"PaperLean {Lean.PaperLean.version}, build {Lean.PaperLean.build} \
     (Lean {Lean.versionString}, {Lean.githash})"
   IO.println s!"workspace: {ws.dir}"
   IO.println s!"prepared data ({dataDir ws.dir}): {← dataUse ws}"
   if let some (.ok d) ← readPreparedData ws.dir then
-    let prepared := if d.mismatch?.isNone then d.packages else #[]
+    let deps := if d.mismatch?.isNone then d.deps else #[]
     for pkg in dependencies ws do
-      IO.println s!"  package {pkg.prettyName}: \
-        {if prepared.contains (pkgKey pkg) then "prepared" else "not prepared"}"
+      match deps.find? (·.pkg == pkgKey pkg) with
+      | some p => IO.println s!"  package {pkg.prettyName}: prepared: {← packStatus ws d p}"
+      | none => IO.println s!"  package {pkg.prettyName}: not prepared"
+    if let some t := d.toolchain? then
+      let why ← Lean.PaperLean.OLeanPack.whyIgnored ((d.cache : FilePath) / t).toString
+      IO.println s!"  Lean's library: {if why.isEmpty then "packed" else s!"its pack is not used ({why})"}"
     for line in ← currentSummary ws d.libs d.summary do
       IO.println s!"  native library of {line}"
     for l in ← d.libs.mapM (statusFindings ws d) do
@@ -242,15 +281,18 @@ def status (ws : Workspace) (verify := false) : IO UInt32 := do
       for m in l.outdated do
         IO.println s!"    {m} runs in the interpreter where no plugin loads it: what `paperlean prepare` \
           found of it may no longer hold"
-    for f in d.packs ++ d.image?.toArray ++ d.native do
-      let file := dataDir ws.dir / f
+    -- the files of the data, of the workspace and of the cache, with what `--verify` reads them as
+    let inData (f : String) := dataDir ws.dir / f
+    let inCache (f : String) := (d.cache : FilePath) / f
+    let packs := d.packs.map inData ++
+      (d.toolchain?.toArray ++ (d.deps.filter (!·.pack.isEmpty)).map (packFile ·.pack)).map inCache
+    let files := packs.map (·, "pack") ++ d.image?.toArray.map (inData · , "image") ++
+      d.native.map (inCache ·, "")
+    for (file, kind) in files do
       -- (another command may delete it meanwhile)
       if let .ok md ← file.metadata.toBaseIO then
-        let stale ← if f.endsWith "/deps.paperlean" then
-            match ← (Lean.PaperLean.OLeanPack.staleness file.toString).toBaseIO with
-            | .ok (s, t) => pure s!", {s} of {t} modules changed since packing"
-            | .error e => pure s!", {e}"
-          else if f.endsWith "/root.paperlean" then
+        let f := file.toString
+        let stale ← if f.endsWith "/root.paperlean" then
             -- with the pack of its changes
             let packs := ((rootPacks d).2.toArray.map fun (p : String) => dataDir ws.dir / p).push file
             match ← (packStaleness ws.root packs).toBaseIO with
@@ -259,20 +301,33 @@ def status (ws : Workspace) (verify := false) : IO UInt32 := do
           else if f.endsWith ".delta.paperlean" then
             pure s!", the modules of {ws.root.prettyName} that changed since its pack was written"
           else pure ""
-        let verified ← if verify && d.packs.contains f then
-            match ← Lean.PaperLean.OLeanPack.verify file.toString with
+        let verified ← match verify, kind with
+          | true, "pack" =>
+            match ← Lean.PaperLean.OLeanPack.verify f with
             | "" => pure ", verified"
             | why => pure s!", not usable: {why}"
-          else if verify && d.image? == some f then
-            match ← Lean.PaperLean.OLeanPack.verifyImportImage file.toString with
+          | true, "image" =>
+            match ← Lean.PaperLean.OLeanPack.verifyImportImage f with
             | "" => pure ", verified"
             | why => pure s!", not usable: {why}"
-          else pure ""
-        IO.println s!"  {f}: {showBytes md.byteSize.toNat}{stale}{verified}"
+          | _, _ => pure ""
+        IO.println s!"  {file}: {showBytes md.byteSize.toNat}{stale}{verified}"
       else
-        IO.println s!"  {f}: missing"
+        IO.println s!"  {file}: missing"
   for v in dataVars do
     IO.println s!"{v}: {(← IO.getEnv v).getD "(not set)"}"
+  return 0
+
+/-- `paperlean clean --cache`: deletes the entries of this build's part of the cache that no registered
+workspace uses and that were not used in the last `unusedFor` seconds (`Cache.collect`). -/
+def cleanCache (unusedFor : Nat) : IO UInt32 := do
+  let some root ← Cache.root? | IO.println "There is no cache."; return 0
+  let cdir := Cache.buildDir root
+  unless ← cdir.isDir do
+    IO.println s!"There is no cache of this build in {root}."
+    return 0
+  let c ← Cache.collect cdir unusedFor
+  IO.println s!"Deleted {c.deleted} entries of the cache in {cdir} ({showBytes c.bytes}); {c.kept} are kept."
   return 0
 
 def clean (ws : Workspace) (names : List String) : LoggerIO UInt32 := do
@@ -645,10 +700,15 @@ def build (ws : Workspace) (args : List String) (buildIn : BuildIn) : LoggerIO U
       IO.println s!"PaperLean prepared data: not used: {why}; building as `lake build` does."
       spawnPlainLake ws (#["build"] ++ args.toArray)
     | none => do
-      IO.println s!"PaperLean prepared data: {← dataUse ws}{← staleNote ws}"
+      IO.println s!"PaperLean prepared data: {← dataUse ws}"
+      -- (counted while the build runs, and said after it)
+      let stale ← staleNote ws
       -- the packs of builds that were interrupted, which only a build that packs would remove
       BuildData.removeEnded ws.dir
-      runBuild ws args buildIn
+      let code ← runBuild ws args buildIn
+      let note ← IO.wait stale
+      unless note.isEmpty do IO.println s!"PaperLean prepared data: {note}"
+      return code
   -- what was built is packed even if the build failed in part
   let mut result := code
   if !prepareDeps.isEmpty then
@@ -708,6 +768,10 @@ public def cli (config : LoadConfig) (args : List String) (buildIn : BuildIn := 
     unless known.contains cmd do
       IO.eprintln s!"paperlean: unknown command '{cmd}'\n{usage}"
       return 1
+    -- (the others write packs in this process)
+    if cmd == "status" || cmd == "build" && !(rest.any fun a => a == "--prepare" || a.startsWith "--prepare=") then
+      usePreparedImports config.wsDir
+    if cmd == "build" then HashCache.prefetch config.pkgDir
     let ws ← loadWorkspace config
     match cmd, rest with
     | "prepare", rest =>
@@ -740,6 +804,13 @@ public def cli (config : LoadConfig) (args : List String) (buildIn : BuildIn := 
     | "cache", "get" :: rest => cacheGet ws rest
     | "status", [] => status ws
     | "status", ["--verify"] => status ws (verify := true)
+    | "clean", "--cache" :: rest =>
+      let days? := match rest with
+        | [] => some 0
+        | ["--unused-for", d] => d.toNat?
+        | _ => none
+      let some days := days? | IO.eprintln s!"paperlean: clean --cache [--unused-for DAYS]\n{usage}"; return 1
+      cleanCache (days * 86400)
     | "clean", names => clean ws names
     | "update", rest =>
       let mut pkgs := #[]

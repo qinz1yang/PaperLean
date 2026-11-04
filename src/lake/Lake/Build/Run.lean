@@ -14,6 +14,7 @@ import Init.Omega
 import Lake.PaperLean.BuildData
 import Lake.PaperLean.Schedule
 import Lake.PaperLean.HashCache
+import Lake.PaperLean.SetupIndex
 
 /-! # Build Runner
 
@@ -464,16 +465,20 @@ public def Workspace.checkNoBuild
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
-  -- PaperLean: under `paperlean build`, the order of compiles and the record of `.hash` files read
-  -- (`Lake.PaperLean.Schedule`, `Lake.PaperLean.HashCache`)
+  -- PaperLean: under `paperlean build`, the order of compiles, the record of `.hash` files read and
+  -- the setup index (`Lake.PaperLean.Schedule`, `Lake.PaperLean.HashCache`,
+  -- `Lake.PaperLean.SetupIndex`)
   PaperLean.Schedule.start ws.dir
   PaperLean.HashCache.start ws.dir
+  PaperLean.SetupIndex.start ws.dir
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
-  -- PaperLean: the packs written during the build are not needed after it (`Lake.PaperLean.BuildData`)
+  -- PaperLean: the packs and setup indexes written during the build are not needed after it
+  -- (`Lake.PaperLean.BuildData`, `Lake.PaperLean.SetupIndex`)
   PaperLean.BuildData.finish
   PaperLean.Schedule.finish
   PaperLean.HashCache.finish
+  PaperLean.SetupIndex.finish ws.dir
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/

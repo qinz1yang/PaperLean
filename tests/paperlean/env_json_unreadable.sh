@@ -128,5 +128,5 @@ cd "$WSD"
 capture lake paperlean prepare --no-native
 check_out_contains "Prepared"
 capture lake paperlean status
-check_out_contains "used: 1 pack(s)"
+check_out_contains "used: 2 pack(s)"
 [ ! -e .lake/paperlean/deps-1 ] || fail "prepare kept the pack that the damaged env.json may have listed"

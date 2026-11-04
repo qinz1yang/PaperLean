@@ -782,7 +782,7 @@ done
 sites=$(cd "$(dirname "$FILE")/../../src" &&
   grep -rlE 'lean_apply_[0-9nm]\b|[^_a-z]apply_[0-9nm]\b' --include=*.cpp . | sed 's|^\./||' |
   grep -v '^runtime/apply.cpp' | sort | tr '\n' ' ')
-[ "$sites" = "kernel/for_each_fn.cpp kernel/replace_fn.cpp library/ir_interpreter.cpp library/time_task.cpp paperlean/env_recorder.cpp paperlean/fast_import.cpp runtime/io.cpp runtime/object.cpp runtime/sharecommon.cpp runtime/uv/signal.cpp runtime/uv/tcp.cpp runtime/uv/timer.cpp runtime/uv/udp.cpp " ] ||
+[ "$sites" = "kernel/for_each_fn.cpp kernel/replace_fn.cpp library/ir_interpreter.cpp library/time_task.cpp paperlean/env_recorder.cpp paperlean/fast_import.cpp paperlean/replace.cpp runtime/io.cpp runtime/object.cpp runtime/sharecommon.cpp runtime/uv/signal.cpp runtime/uv/tcp.cpp runtime/uv/timer.cpp runtime/uv/udp.cpp " ] ||
   fail "C++ that applies closures changed: $sites"
 
 # Fields are told apart: a constant applies a pure closure of a structure that also holds `IO` code.

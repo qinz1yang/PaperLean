@@ -23,9 +23,12 @@ The switches of reuse.
 
 `lean` reuses results (`Lean.PaperLean.TCCache`, `Lean.PaperLean.SectionVars`) only when a `paperlean`
 command asks for it (`reuse`), and only on the threads that elaborate commands in order
-(`onElabThread`), for the module of the process: its first frontend. A further frontend in the process,
-which a command or a program started, turns reuse and the oracle off with a message
-(`noteFrontend`). A plain `lean`, as under a plain `lake build`, runs Lean's path.
+(`onElabThread`), of one frontend: the first of the process, if the command-line `lean` runs it for
+its module (`noteCommandLine`). A further frontend in the process, which a command or a program
+started, turns reuse and the oracle off with a message (`noteFrontend`). Neither the language
+server's workers, where an elaboration after an edit may run while a cancelled one still does, nor
+other programs that run frontends reuse. A plain `lean`, as under a plain `lake build`, runs Lean's
+path.
 
 With `PAPERLEAN_REUSE_ORACLE`, a testing switch, each reuse of a typeclass result
 (`Lean.PaperLean.TCCache`) is compared with Lean's own search, and each reuse of section variables
@@ -61,10 +64,15 @@ def fault : String :=
 opaque setElabThread (on : Bool) : BaseIO Unit
 
 /-- Whether this thread elaborates commands in order and may use the caches of reuse, unlike the
-tasks that it starts, e.g. of linters, whose order is not that of the commands. Only where
-`nativeAvailable`. -/
+tasks that it starts, e.g. of linters, whose order is not that of the commands: in the frontend that
+reuses (`noteFrontend`), while reuse is on. Only where `nativeAvailable`. -/
 @[extern "lean_paperlean_elab_thread"]
 opaque onElabThread : BaseIO Bool
+
+/-- Notes that the command-line `lean` is to run the frontend of its module: if it is the first
+frontend of the process, it reuses (`noteFrontend`). -/
+@[extern "lean_paperlean_note_command_line"]
+opaque noteCommandLine : BaseIO Unit
 
 /-- Runs `act`, in which this thread uses no caches of reuse: for the oracles' run of Lean's own
 elaboration. -/
@@ -147,8 +155,9 @@ opaque fail (reason : @& String) : BaseIO Unit
 @[extern "lean_paperlean_note_frontend"]
 private opaque noteFrontendCore (fileName : @& String) : BaseIO Unit
 
-/-- Notes a frontend run of `fileName`: from the second of the process on, nothing is reused any more,
-which it says on the standard error. -/
+/-- Notes the start of a frontend run of `fileName`, before it elaborates commands. The first of the
+process reuses if `noteCommandLine` came before it, and no other does: from the second on, nothing is
+reused any more, which it says on the standard error. -/
 @[noinline] def noteFrontend (fileName : String) : BaseIO Unit := do
   if reuse then noteFrontendCore fileName
 

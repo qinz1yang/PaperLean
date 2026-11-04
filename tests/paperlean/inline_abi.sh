@@ -513,11 +513,11 @@ uint64_t lean_uint64_of_nat_mk(lean_object*);
 uint64_t lean_uint64_shift_left(uint64_t, uint64_t);
 uint64_t lean_uint64_shift_right(uint64_t, uint64_t);
 uint64_t lean_uint64_xor(uint64_t, uint64_t);
-uint8_t l_Array_binSearchAux___at___00Lean_TagDeclarationExtension_isTagged_spec__0___redArg(lean_object*, lean_object*, lean_object*, lean_object*, lean_object*);
 uint8_t l_Lean_Environment_containsOnBranch(lean_object*, lean_object*);
 uint8_t l_Lean_Name_hasMacroScopes(lean_object*);
 uint8_t l_Lean_Name_isInaccessibleUserName(lean_object*);
 uint8_t l_Lean_Name_quickCmpAux(lean_object*, lean_object*);
+uint8_t l_Lean_TagDeclarationExtension_isTagged(lean_object*, lean_object*, lean_object*, lean_object*);
 uint8_t l_Lean_isNoncomputable(lean_object*, lean_object*, lean_object*);
 uint8_t l_Lean_isPrivateName(lean_object*);
 uint8_t l_Std_DHashMap_Internal_AssocList_contains___at___00Std_DHashMap_Internal_Raw_u2080_contains___at___00Lean_registerBuiltinAttribute_spec__0_spec__0___redArg(lean_object*, lean_object*);
@@ -662,6 +662,14 @@ Lean.Elab.runFrontend: obj obj obj tobj u32 tobj @& tobj u8 @& obj obj u8 tobj t
 Lean.Elab.runFrontend (impure): obj obj obj tobj UInt32 tobj @& tobj UInt8 @& obj obj UInt8 tobj tobj tobj tobj lcVoid : obj
 Lean.Elab.runFrontend._boxed: obj obj obj tobj tobj tobj tobj tagged obj obj tagged tobj tobj tobj tobj tagged : obj
 Lean.Elab.runFrontend._boxed (impure): obj obj obj tobj tobj tobj tobj tagged obj obj tagged tobj tobj tobj tobj tagged : obj
+Lean.Language.Lean.process: obj tobj @& obj void : obj
+Lean.Language.Lean.process (impure): obj tobj @& obj lcVoid : obj
+Lean.Language.Lean.process._boxed: obj tobj obj tagged : obj
+Lean.Language.Lean.process._boxed (impure): obj tobj obj tagged : obj
+Lean.Language.Lean.processCommands: @& obj obj obj tobj void : obj
+Lean.Language.Lean.processCommands (impure): @& obj obj obj tobj lcVoid : obj
+Lean.Language.Lean.processCommands._boxed: obj obj obj tobj tagged : obj
+Lean.Language.Lean.processCommands._boxed (impure): obj obj obj tobj tagged : obj
 Lean.Elab.Term.runTactic: tobj tobj tobj u8 @& obj @& tobj @& obj @& tobj @& obj @& tobj void : obj
 Lean.Elab.Term.runTactic (impure): tobj tobj tobj UInt8 @& obj @& tobj @& obj @& tobj @& obj @& tobj lcVoid : obj
 Lean.Elab.Term.runTactic._boxed: tobj tobj tobj tagged obj tobj obj tobj obj tobj tagged : obj
@@ -714,6 +722,14 @@ Lean.Environment.findTask: obj tobj u8 : obj
 Lean.Environment.findTask (impure): obj tobj UInt8 : obj
 Lean.Environment.findTask._boxed: obj tobj tagged : obj
 Lean.Environment.findTask._boxed (impure): obj tobj tagged : obj
+Lean.TagDeclarationExtension.isTagged: @& obj obj tobj @& tobj : u8
+Lean.TagDeclarationExtension.isTagged (impure): @& obj obj tobj @& tobj : UInt8
+Lean.TagDeclarationExtension.isTagged._boxed: obj obj tobj tobj : tagged
+Lean.TagDeclarationExtension.isTagged._boxed (impure): obj obj tobj tobj : tagged
+Lean.getReducibilityStatusCore: obj tobj : u8
+Lean.getReducibilityStatusCore (impure): obj tobj : UInt8
+Lean.getReducibilityStatusCore._boxed: obj tobj : tagged
+Lean.getReducibilityStatusCore._boxed (impure): obj tobj : tagged
 Lean.Environment.getLocalConstantInfos: @& obj u8 void : obj
 Lean.Environment.getLocalConstantInfos (impure): @& obj UInt8 lcVoid : obj
 Lean.Environment.getLocalConstantInfos._boxed: obj tagged tagged : obj

@@ -1,8 +1,8 @@
 # Copyright (c) 2026 PaperLean contributors.
 # Released under Apache 2.0 license as described in the file LICENSE.
 #
-# Tests that `paperlean prepare` and `paperlean clean` of some packages, which pack the current files of
-# the others again and keep their native libraries, keep what `prepare` found of those packages only for
+# Tests that `paperlean prepare` and `paperlean clean` of some packages, which pack (and bind) the current
+# files of the others again and keep their native libraries, keep what `prepare` found of those packages only for
 # the files that it found that of. The reason of a module that changed since, and that it imports one that
 # runs in the interpreter, are gone from the end of a build and from `paperlean status`, and the loader's
 # reason stands; so is the reason why a package has no library. A module that did not change keeps
@@ -305,7 +305,9 @@ check_out_contains "Pre $runs $outdated"
 # A module that did not change still imports one that runs in the interpreter, though that one changed:
 # its library is kept, as are those it is linked against, so that nothing gives that one native code.
 first_state
-touch dep/.lake/build/lib/lean/Dep/Base.olean
+# (`base`, which `Dep.Up` uses, stays as it was, so that Lake builds `Dep.Up` to the same files)
+printf 'builtin_initialize baseRef : IO.Ref Nat ← IO.mkRef 1\ndef base : Nat := 1\ndef baseToo : Nat := 1\n' > dep/Dep/Base.lean
+run lake build Root
 capture lake paperlean prepare other
 compile
 unchanged_build
@@ -316,10 +318,10 @@ unchanged_status
 check_out_contains "Dep.Base $runs $outdated"
 check_out_contains "Dep.Up $runs it imports one that does"
 
-# Without the pack, the files cannot be compared. Nothing that was found is said, and what the loader
-# says is true whether they changed or not.
+# Without the pack (here deleted from the cache, which `prepare` then packs again), the files cannot be
+# compared. Nothing that was found is said, and what the loader says is true whether they changed or not.
 first_state
-rm -f .lake/paperlean/deps-*/deps.paperlean
+rm -rf "$PAPERLEAN_CACHE_DIR"/prepared/*/pack/dep-*
 capture lake paperlean prepare other
 compile
 check_out_contains "  Dep.Left: $loader"

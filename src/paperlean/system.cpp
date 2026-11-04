@@ -4,6 +4,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 */
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <thread>
 #if !defined(LEAN_WINDOWS)
@@ -63,6 +64,11 @@ extern "C" LEAN_EXPORT uint8 lean_paperlean_process_alive(uint32_t pid) {
 extern "C" LEAN_EXPORT obj_res lean_paperlean_num_cpus(obj_arg) {
     unsigned n = std::thread::hardware_concurrency();
     return lean_box(n ? n : 1);
+}
+
+/* wallSeconds : BaseIO Nat -- the seconds since the epoch */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_wall_seconds(obj_arg) {
+    return lean_uint64_to_nat(static_cast<uint64_t>(time(nullptr)));
 }
 
 /* totalMemory : BaseIO Nat -- the bytes of physical memory, 0 if unknown */

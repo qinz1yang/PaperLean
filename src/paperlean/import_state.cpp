@@ -390,7 +390,8 @@ bool init_trie_empty() {
 // =======================================
 // Import images
 //
-// An image refers to the objects of one olean pack by their addresses. Per extension it holds the
+// An image refers to the objects of the olean packs of a process by their addresses, which it records
+// with their checksums, so that it is used only with those packs. Per extension it holds the
 // classes of the names and origins of all entries, the known trie nodes, and per entries array of a
 // packed part the interned entries. Its writer checks all tables (`check_image_ext`: their checksum,
 // and that every index and object lies in range), and records the checksums of the file's blocks
@@ -399,7 +400,7 @@ bool init_trie_empty() {
 // not used (`image_damaged`).
 
 constexpr char g_image_kind[] = "import-image";
-constexpr uint32 g_image_format = 4;
+constexpr uint32 g_image_format = 5;
 // `image_header::validated` of an image whose writer checked its tables.
 constexpr uint32 g_image_validated = 0x564c4150;
 constexpr uint32 g_none = UINT32_MAX;
@@ -422,7 +423,8 @@ struct image_ext {
 struct image_header {
     side_file_header common;
     uint32 format, num_exts;
-    uint64 pack_checksum, pack_base, pack_size;   // the pack the object addresses are in
+    // the packs the object addresses are in: `pack_range`s after the extension records
+    uint64 num_packs, packs_off;
     uint64 size;
     uint64 exts_off;
     // The file's modification time, as the writer set it after writing everything else.
@@ -457,14 +459,19 @@ inline size_t slot_of(uint64 h, size_t size) { return (h * 0x9e3779b97f4a7c15ull
 // Thrown when a table of the image in use turns out to be inconsistent while a state is replayed.
 struct image_damaged {};
 [[noreturn]] void damaged() { throw image_damaged(); }
-// The address range of the pack that the image in use describes, where its objects lie.
-uint64 g_image_pack_base = 0, g_image_pack_size = 0;
+// The address ranges of the packs that the image in use describes, where its objects lie.
+std::vector<pack_range> * g_image_packs = new std::vector<pack_range>();
 // The blocks of the image in use.
 side_file_blocks const * g_image_blocks = nullptr;
 // Whether the `n` bytes at `p`, of the image in use, are as written.
 inline bool image_used(void const * p, uint64 n) { return g_image_blocks && g_image_blocks->ok(p, n); }
 template<class T> inline bool image_used(T const & x) { return image_used(&x, sizeof(T)); }
-inline bool image_obj_ok(uint64 a) { return a % 8 == 0 && a >= g_image_pack_base && a - g_image_pack_base < g_image_pack_size; }
+inline bool in_ranges(std::vector<pack_range> const & ranges, uint64 a) {
+    for (pack_range const & r : ranges)
+        if (a >= r.base && a - r.base < r.size) return true;
+    return false;
+}
+inline bool image_obj_ok(uint64 a) { return a % 8 == 0 && in_ranges(*g_image_packs, a); }
 // keys and names may also be scalars
 inline bool image_key_ok(uint64 a) { return (a & 1) == 1 || image_obj_ok(a); }
 
@@ -1104,10 +1111,18 @@ bool valid_initial(object * init, unsigned n) {
 // =======================================
 // Loading an image
 
-// The header's checksum: of the header with this field zero, then of the extension records.
-uint64 image_checksum(image_header hdr, char const * exts, size_t size) {
+// The header's checksum: of the header with this field zero, then of the extension records and of the
+// packs, in `file`, which holds them (as `image_records_in_range` checks).
+uint64 image_checksum(image_header hdr, char const * file) {
     hdr.common.checksum = 0;
-    return side_file_checksum(exts, size, side_file_checksum(&hdr, sizeof(hdr)));
+    uint64 h = side_file_checksum(file + hdr.exts_off, hdr.num_exts * sizeof(image_ext), side_file_checksum(&hdr, sizeof(hdr)));
+    return side_file_checksum(file + hdr.packs_off, hdr.num_packs * sizeof(pack_range), h);
+}
+
+// Whether the extension records and the packs of `hdr` lie in the file.
+bool image_records_in_range(image_header const & hdr) {
+    return hdr.exts_off % 8 == 0 && hdr.exts_off <= hdr.size && hdr.num_exts <= (hdr.size - hdr.exts_off) / sizeof(image_ext) &&
+        hdr.packs_off % 8 == 0 && hdr.packs_off <= hdr.size && hdr.num_packs <= (hdr.size - hdr.packs_off) / sizeof(pack_range);
 }
 
 struct loaded_image {
@@ -1117,6 +1132,8 @@ struct loaded_image {
     // per extension: 0 = not yet checked, 1 = usable, 2 = not
     std::unique_ptr<std::atomic<uint8>[]> state;
     side_file_blocks blocks;
+    // (`load_image`)
+    bool quiet = false;
 };
 
 // Whether the table of block checksums of `img` lies at the end of the file after the header,
@@ -1132,8 +1149,16 @@ loaded_image * g_image = nullptr;
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
 void load_image() {
     char const * fname = getenv("LEAN_IMPORT_IMAGE");
-    if (!fname || !*fname) return;
-    auto warn = [&](char const * why) { side_file_warning("warning: ignoring import image '%s': %s\n", fname, why); };
+    // (one that describes the packs that this process reads for itself, which says nothing about it)
+    bool quiet = false;
+    if (!fname || !*fname) {
+        fname = process_import_image();
+        if (!fname) return;
+        quiet = true;
+    }
+    auto warn = [&](char const * why) {
+        if (!quiet) side_file_warning("warning: ignoring import image '%s': %s\n", fname, why);
+    };
     int fd = open(fname, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) { warn(strerror(errno)); return; }
     struct stat st;
@@ -1145,24 +1170,27 @@ void load_image() {
     if (char const * why = check_side_file_header(hdr.common, g_image_kind, sizeof(image_header))) {
         close(fd); warn(why); return;
     }
-    uint64_t pack_checksum, pack_base, pack_size;
     if (hdr.format != g_image_format) { close(fd); warn("written by a different version"); return; }
     if (hdr.size != static_cast<uint64>(st.st_size)) { close(fd); warn("its size differs from the recorded one"); return; }
-    if (!first_pack_identity(pack_checksum, pack_base, pack_size) || pack_checksum != hdr.pack_checksum ||
-        pack_base != hdr.pack_base || pack_size != hdr.pack_size) {
-        close(fd); warn("it belongs to another olean pack than the first of LEAN_OLEAN_PACK"); return;
-    }
     if (!side_file_mtime_is(st, hdr.mtime_sec, hdr.mtime_nsec)) { close(fd); warn("it changed since it was written"); return; }
     if (hdr.validated != g_image_validated) { close(fd); warn("corrupt"); return; }
     void * m = mmap(nullptr, hdr.size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) { warn(strerror(errno)); return; }
     char const * sums = static_cast<char const *>(m) + hdr.block_sums_off;
-    if (hdr.exts_off % 8 != 0 || hdr.exts_off > hdr.size || hdr.num_exts > (hdr.size - hdr.exts_off) / sizeof(image_ext) ||
-        image_checksum(hdr, static_cast<char const *>(m) + hdr.exts_off, hdr.num_exts * sizeof(image_ext)) != hdr.common.checksum ||
+    if (!image_records_in_range(hdr) || image_checksum(hdr, static_cast<char const *>(m)) != hdr.common.checksum ||
         !image_blocks_in_range(hdr) ||
         side_file_checksum4(sums, hdr.size - hdr.block_sums_off, g_image_block_sums_seed) != hdr.block_sums_checksum) {
         munmap(m, hdr.size); warn("corrupt (checksum mismatch)"); return;
+    }
+    std::vector<pack_range> packs(hdr.num_packs);
+    if (hdr.num_packs > 0) memcpy(packs.data(), static_cast<char const *>(m) + hdr.packs_off, hdr.num_packs * sizeof(pack_range));
+    std::vector<pack_range> loaded = loaded_pack_ranges();
+    for (pack_range const & r : packs) {
+        if (!std::any_of(loaded.begin(), loaded.end(), [&](pack_range const & l) {
+                return l.checksum == r.checksum && l.base == r.base && l.size == r.size; })) {
+            munmap(m, hdr.size); warn("it belongs to other olean packs than those of LEAN_OLEAN_PACK"); return;
+        }
     }
     loaded_image * img = new loaded_image();
     img->blocks.init(static_cast<char const *>(m) + sizeof(image_header), hdr.block_sums_off - sizeof(image_header),
@@ -1173,8 +1201,8 @@ void load_image() {
     img->exts = reinterpret_cast<image_ext const *>(img->begin + hdr.exts_off);
     img->state.reset(new std::atomic<uint8>[hdr.num_exts]);
     for (uint32 i = 0; i < hdr.num_exts; i++) img->state[i].store(0);
-    g_image_pack_base = hdr.pack_base;
-    g_image_pack_size = hdr.pack_size;
+    *g_image_packs = std::move(packs);
+    img->quiet = quiet;
     g_image = img;
 }
 #else
@@ -1208,8 +1236,10 @@ bool image_ext_in_range(loaded_image const & img, image_ext const & x, bool chec
 // leaves them.
 bool check_image_ext(loaded_image const & img, image_ext const & x) {
     if (!image_ext_in_range(img, x, true)) return false;
-    // all objects are in the pack the image describes, the first one
-    auto obj_ok = [&](uint64 a) { return a % 8 == 0 && a >= img.hdr.pack_base && a - img.hdr.pack_base < img.hdr.pack_size; };
+    // all objects are in the packs the image describes
+    std::vector<pack_range> packs(img.hdr.num_packs);
+    if (!packs.empty()) memcpy(packs.data(), img.begin + img.hdr.packs_off, packs.size() * sizeof(pack_range));
+    auto obj_ok = [&](uint64 a) { return a % 8 == 0 && in_ranges(packs, a); };
     // keys and names may also be scalars
     auto key_ok = [&](uint64 a) { return (a & 1) == 1 || obj_ok(a); };
     for (unsigned t = 0; t < 2; t++) {
@@ -1292,7 +1322,7 @@ bool check_image_ext(loaded_image const & img, image_ext const & x) {
 
 // Marks the image's tables `i` as not usable, with a warning.
 void image_ext_damaged(uint32 i) {
-    if (g_image->state[i].exchange(2, std::memory_order_acq_rel) != 2)
+    if (g_image->state[i].exchange(2, std::memory_order_acq_rel) != 2 && !g_image->quiet)
         side_file_warning("warning: ignoring the import image's tables for an extension: corrupt\n");
 }
 
@@ -1431,18 +1461,14 @@ bool write_image_ext(image_writer & w, object * ext_name, state_kind kind, image
     std::vector<image_step> steps;
     std::vector<std::pair<uint64, std::pair<uint32, uint32>>> arrays;
     std::unordered_set<object *> seen;
-    uint64_t pack_checksum, pack_base, pack_size;
-    if (!first_pack_identity(pack_checksum, pack_base, pack_size)) return false;
-    // only objects of the first pack can be referred to; keys and names may also be scalars
-    auto in_pack = [&](void const * p) {
-        uint64 a = reinterpret_cast<uint64>(p);
-        return p && a >= pack_base && a - pack_base < pack_size;
-    };
+    std::vector<pack_range> packs = loaded_pack_ranges();
+    // only objects of the packs can be referred to; keys and names may also be scalars
+    auto in_pack = [&](void const * p) { return p && in_ranges(packs, reinterpret_cast<uint64>(p)); };
     auto key_in_pack = [&](void const * p) { return (reinterpret_cast<uintptr_t>(p) & 1) == 1 || in_pack(p); };
     // arrays with an entry that the image cannot describe are left out; imports replay them by
     // calling Lean functions
     size_t left_out = 0;
-    for_each_first_pack_ext_entries(ext_name, [&](object * a) {
+    for_each_pack_ext_entries(ext_name, [&](object * a) {
         if (!seen.insert(a).second) return;
         size_t first = entries.size(), first_step = steps.size();
         bool ok = true;
@@ -1860,17 +1886,18 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_imported_state(b_obj_arg ext_name,
 }
 
 /* writeImportImageCore (out : @& String) (exts : @& Array (Name × UInt8)) : IO Nat
-   Writes the import image of the first olean pack for the extensions `exts` of the given kinds. */
+   Writes the import image of the olean packs in use for the extensions `exts` of the given kinds. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout, b_obj_arg oexts) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
     std::string out(lean_string_cstr(oout));
     image_header hdr = {};
     init_side_file_header(hdr.common, g_image_kind, sizeof(image_header));
     hdr.format = g_image_format;
-    if (!first_pack_identity(hdr.pack_checksum, hdr.pack_base, hdr.pack_size) || !init_trie_empty())
+    std::vector<pack_range> packs = loaded_pack_ranges();
+    if (packs.empty() || !init_trie_empty())
         return io_result_mk_error("writeImportImage: no olean pack is in use");
-    if (char const * why = first_pack_damaged())
-        return io_result_mk_error(std::string("writeImportImage: the olean pack in use is ") + why);
+    if (char const * why = packs_damaged())
+        return io_result_mk_error(std::string("writeImportImage: an olean pack in use is ") + why);
     std::vector<std::pair<object *, state_kind>> kinds;
     for (size_t i = 0; i < lean_array_size(oexts); i++) {
         object * p = lean_array_get_core(oexts, i);
@@ -1878,9 +1905,11 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
         if (k <= 1) kinds.push_back({ lean_ctor_get(p, 0), static_cast<state_kind>(k) });
     }
     image_writer w;
-    // the extension records follow the header, the tables them
+    // the extension records follow the header, the packs them, the tables these
     hdr.exts_off = sizeof(image_header);
-    w.base = hdr.exts_off + kinds.size() * sizeof(image_ext);
+    hdr.packs_off = hdr.exts_off + kinds.size() * sizeof(image_ext);
+    hdr.num_packs = packs.size();
+    w.base = hdr.packs_off + packs.size() * sizeof(pack_range);
     std::vector<image_ext> exts;
     size_t num_entries = 0;
     for (auto const & k : kinds) {
@@ -1891,6 +1920,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
     hdr.num_exts = static_cast<uint32>(exts.size());
     // tables were laid out for `kinds.size()` records; pad the records to that number
     std::string file(sizeof(image_header) + kinds.size() * sizeof(image_ext), '\0');
+    file.append(reinterpret_cast<char const *>(packs.data()), packs.size() * sizeof(pack_range));
     file += w.data;
     for (image_ext & x : exts) x.checksum = image_ext_checksum(file.data(), x);
     if (!exts.empty()) memcpy(&file[hdr.exts_off], exts.data(), exts.size() * sizeof(image_ext));
@@ -1909,7 +1939,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
     hdr.validated = g_image_validated;
     hdr.mtime_sec = side_file_mtime_now();
     hdr.mtime_nsec = 0;
-    hdr.common.checksum = image_checksum(hdr, file.data() + hdr.exts_off, hdr.num_exts * sizeof(image_ext));
+    hdr.common.checksum = image_checksum(hdr, file.data());
     memcpy(&file[0], &hdr, sizeof(hdr));
     std::string tmp = out + ".tmp." + std::to_string(getpid());
     // read-only: a tool writing to a mapped image in place fails
@@ -1938,7 +1968,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
 
 /* OLeanPack.verifyImportImage (image : @& String) : IO String
    Why the import image `image` cannot be used, or "" if it can and its tables are as written, which
-   reads all of them. Whether it belongs to the pack in use is not checked. */
+   reads all of them. Whether it belongs to the packs in use is not checked. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_import_image_verify(b_obj_arg opath) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
     auto result = [](char const * why) { return io_result_mk_ok(mk_string(why)); };
@@ -1967,8 +1997,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_import_image_verify(b_obj_arg opat
     }
     close(fd);
     if (why) return result(why);
-    if (hdr.exts_off % 8 != 0 || hdr.exts_off > hdr.size || hdr.num_exts > (hdr.size - hdr.exts_off) / sizeof(image_ext) ||
-        image_checksum(hdr, file.data() + hdr.exts_off, hdr.num_exts * sizeof(image_ext)) != hdr.common.checksum ||
+    if (!image_records_in_range(hdr) || image_checksum(hdr, file.data()) != hdr.common.checksum ||
         !image_blocks_in_range(hdr) ||
         side_file_checksum4(file.data() + hdr.block_sums_off, hdr.size - hdr.block_sums_off, g_image_block_sums_seed) != hdr.block_sums_checksum)
         return result("corrupt (checksum mismatch)");

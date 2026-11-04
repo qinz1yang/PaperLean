@@ -4,8 +4,8 @@
 # Tests that plain `lake` of PaperLean gives a module's setup as official Lake does: `lake build` writes
 # `.setup.json` pretty-printed (`Lake.compileLeanModule`), with `importArts` in full paths, and `lake
 # query` and `lake setup-file` give the same `importArts`; only the Lake of the `paperlean` commands
-# (`PAPERLEAN_ACCELERATE=1`) writes it compact, with PaperLean's encoding of `importArts`
-# (`PaperLean.setupToJsonCompact`), which official Lean does not read, in a side file.
+# (`PAPERLEAN_ACCELERATE=1`) writes it compact, with `importArts` referring to the build's setup
+# index (`Lake.PaperLean.SetupIndex`), which official Lean does not read, in a side file.
 
 WS="$(cd "$TMP_DIR" && pwd -P)/ws"
 mkdir -p "$WS/R"
@@ -42,8 +42,9 @@ echo '-- changed' >> R.lean
 run env PAPERLEAN_ACCELERATE=1 lake build
 SIDE=.lake/build/ir/R.setup.paperlean
 [ "$(wc -l < $SIDE)" = 0 ] || fail "the Lake of paperlean commands did not write R.setup.paperlean compact"
-COMPACT="{\"\":[\"$WS/.lake/build/lib/lean\"],\"R.A\":[0,1]}"
-[ "$(show_json arts < $SIDE)" = "$COMPACT" ] || fail "the Lake of paperlean commands wrote importArts as: $(show_json arts < $SIDE)"
+INDEX="$WS/\\.lake/paperlean-setup/[0-9]+/setup-[0-9a-f]+\\.paperlean"
+show_json arts < $SIDE | grep -Eq "^\\{\"\\[anonymous\\]\":\\[\\[\"$INDEX\"\\],\\[\"[0-9]+\"\\]\\]\\}$" ||
+  fail "the Lake of paperlean commands wrote importArts as: $(show_json arts < $SIDE)"
 [ "$(show_json arts < $SETUP)" = "$FULL" ] || fail "the Lake of paperlean commands changed R.setup.json: $(show_json arts < $SETUP)"
 echo '-- changed again' >> R.lean
 run lake build

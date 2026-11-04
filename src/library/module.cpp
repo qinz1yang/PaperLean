@@ -37,6 +37,9 @@ Modified by PaperLean.
 #include "library/util.h"
 #include "paperlean/olean_pack.h"
 #include "paperlean/fast_import.h"
+
+// PaperLean: `src/paperlean/lookup_cache.cpp`
+extern "C" void lean_paperlean_lookup_cache_region_freed();
 #include "githash.h"
 
 #ifdef LEAN_WINDOWS
@@ -675,6 +678,8 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 }
 
 extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object *) {
+    // PaperLean: (its persistent objects may name entries of the caches of lookups)
+    lean_paperlean_lookup_cache_region_freed();
     char * buffer = region_buffer(region);
     size_t full_sz = region_size(region);
     bool is_mmap = lean_ctor_get_uint8(region, sizeof(void*) * 5) != 0;

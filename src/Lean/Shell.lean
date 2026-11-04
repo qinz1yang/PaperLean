@@ -14,6 +14,7 @@ import Lean.Compiler.LCNF.EmitC
 import Init.System.Platform
 import Lean.Compiler.Options
 import Std.Async.Process
+import Lean.PaperLean.Speculation
 
 /-  Lean companion to  `shell.cpp` -/
 
@@ -550,6 +551,8 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
           throw e
     else
       pure `_stdin
+  -- PaperLean: the frontend that may reuse results (`Lean.PaperLean.Speculation.noteCommandLine`)
+  PaperLean.Speculation.noteCommandLine
   let env? ← Elab.runFrontend contents opts.leanOpts fileName mainModuleName
     opts.trustLevel opts.oleanFileName? opts.ileanFileName? opts.jsonOutput opts.errorOnKinds
     #[] opts.printStats setup?

@@ -318,7 +318,16 @@ private structure Entry where
   /-- Where it was elaborated, for debugging. -/
   pos : String
 
-private builtin_initialize entriesRef : IO.Ref (Array Entry) ← IO.mkRef #[]
+/-- The entries (`empty` if none were put yet), out of the native store where they are kept
+(`speculation.cpp`), which leaves it taken; none if it is taken, which turns reuse off. As those of
+`TCCache.takeEntries`, they are not marked multi-threaded: one thread at a time uses them
+(`TCCache.getEntries?`). -/
+@[extern "lean_paperlean_take_store"]
+private opaque takeEntries (slot : UInt8) (empty : Array Entry) : BaseIO (Option (Array Entry))
+
+/-- Puts `es` into the native store of the entries, which `takeEntries` left taken. -/
+@[extern "lean_paperlean_put_store"]
+private opaque putEntries (slot : UInt8) (es : Array Entry) : BaseIO Unit
 
 /-- The binders (`varDecls`, `varUIds`) and options whose elaboration could not be kept: they are
 not recorded again, as their elaboration does the same. -/
@@ -1043,7 +1052,11 @@ def withSectionVars (varDecls : Array Syntax) (varUIds : Array Name) (opts : Opt
     return (← elabVars k)
   let ns ← getCurrNamespace
   let openDecls ← getOpenDecls
-  let entries ← entriesRef.get
+  let some entries ← takeEntries 1 #[] |
+    noteExcluded 7
+    setHeartbeats heartbeats
+    return (← elabVars k)
+  putEntries 1 entries
   let candidates := entries.filter (·.start.same start)
   let fileMap ← getFileMap
   let pos := s!"{(← getRef).getPos?.map fun p => fileMap.toPosition p}"
@@ -1114,7 +1127,8 @@ def withSectionVars (varDecls : Array Syntax) (varUIds : Array Name) (opts : Opt
       | .ok e =>
         -- (entries for the same binders are kept too: their dependencies may hold at other
         -- times, e.g. in another namespace)
-        entriesRef.modify fun es => (#[e] ++ es).take maxEntries
+        if let some es ← takeEntries 1 #[] then
+          putEntries 1 ((#[e] ++ es).take maxEntries)
       | .error why =>
         if debugReuse then
           IO.eprintln s!"PaperLean: {pos}: section variables not kept: {why}"

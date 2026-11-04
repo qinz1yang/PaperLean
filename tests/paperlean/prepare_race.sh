@@ -134,6 +134,8 @@ END
 chmod +x "$ROOT/cc-gate"
 paused() { # paused <log> <command>...: `prepare` runs in the background until the analysis is done
   rm -f "$ROOT/blocked" "$ROOT/release" "$1"
+  # (the compiler runs, as no compiled object is in the cache)
+  rm -rf "$PAPERLEAN_CACHE_DIR"/prepared/*/objects
   local log="$1"
   shift
   GATE="$ROOT" LEAN_CC="$ROOT/cc-gate" PAPERLEAN_UNIT_BYTES=0 stdbuf -oL lake paperlean prepare -j 1 "$@" > "$log" 2>&1 &

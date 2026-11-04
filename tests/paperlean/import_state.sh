@@ -127,9 +127,9 @@ capture env LEAN_PATH="$LIB" LEAN_OLEAN_PACK="$TMP_DIR/s.paperlean" PAPERLEAN_IM
 ! grep -q "^paperlean-counter prefetch" "$CAPTURED.out.produced" || fail "the image was consulted without LEAN_IMPORT_IMAGE"
 
 # A large simp set (`Init`'s) is replayed on another thread from the start of
-# `finalizePersistentExtensions`. The image describes only the first pack, so the entries of a
-# module in a second pack are replayed by calling Lean functions, also after that pack is rebuilt
-# with other entries.
+# `finalizePersistentExtensions`. The image describes the packs that it was written with, here only the
+# first, so the entries of a module in a second pack are replayed by calling Lean functions, also after
+# that pack is rebuilt with other entries.
 LIB1="$TMP_DIR/lib1"
 LIB2="$TMP_DIR/lib2"
 mkdir -p "$LIB1" "$LIB2"
@@ -169,7 +169,8 @@ for round in 1 2; do
   capture lean --run "$TMP_DIR/pack2.lean" "$TMP_DIR/p2.paperlean" "$LIB2" 2
   check_out_contains "packed: true"
   if [ "$round" = 1 ]; then
-    capture env LEAN_PATH="$LIB1:$LIB2" LEAN_OLEAN_PACK="$PACKS" lean --run "$TMP_DIR/image.lean" "$TMP_DIR/p.image.paperlean"
+    capture env LEAN_PATH="$LIB1:$LIB2" LEAN_OLEAN_PACK="$TMP_DIR/p1.paperlean" lean --run "$TMP_DIR/image.lean" \
+      "$TMP_DIR/p.image.paperlean"
     check_out_contains "image: true"
   fi
   # `UseD` succeeds in round 1, while `g_zero` is a simp lemma, and fails in round 2
@@ -220,7 +221,7 @@ damage_tables() {
   chmod u+w "$TMP_DIR/$1.image.paperlean"
   perl -e '
     open(F, "+<", $ARGV[0]) or die; binmode F;
-    read(F, my $h, 224); my $n = unpack("L", substr($h, 156, 4)); my $exts = unpack("Q", substr($h, 192, 8));
+    read(F, my $h, 224); my $n = unpack("L", substr($h, 156, 4)); my $exts = unpack("Q", substr($h, 184, 8));
     for my $i (0 .. $n - 1) {
       seek(F, $exts + $i * 272 + $ARGV[1], 0); read(F, my $r, 16); my ($off, $num) = unpack("QQ", $r);
       seek(F, $off, 0); print F "\xff" x ($ARGV[2] * $num);
@@ -236,7 +237,7 @@ cp "$TMP_DIR/s.image.paperlean" "$TMP_DIR/class.image.paperlean"
 chmod u+w "$TMP_DIR/class.image.paperlean"
 perl -e '
   open(F, "+<", $ARGV[0]) or die; binmode F;
-  read(F, my $h, 224); my $n = unpack("L<", substr($h, 156, 4)); my $exts = unpack("Q<", substr($h, 192, 8));
+  read(F, my $h, 224); my $n = unpack("L<", substr($h, 156, 4)); my $exts = unpack("Q<", substr($h, 184, 8));
   EXT: for my $i (0 .. $n - 1) {
     seek(F, $exts + $i * 272, 0); read(F, my $x, 272);
     next unless unpack("L<", substr($x, 16, 4)) == 1;

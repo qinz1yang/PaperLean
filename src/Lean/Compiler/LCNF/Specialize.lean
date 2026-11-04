@@ -25,11 +25,12 @@ public structure CacheEntry where
   declName : Name
   deriving Inhabited
 
--- PaperLean: code compiled here reuses what official Lean's compiler reuses, under the same names, and
--- calls only what official Lean has: the cache leaves out the specializations of PaperLean's own code
+-- PaperLean: imported specializations exclude PaperLean's code; local ones must stay cached so
+-- recursive specialization terminates. `addImportedFn` switches the map to local insertion.
 -- (not inlined: its body calls PaperLean's code)
 @[noinline] public def addEntry (cache : Cache) (e : CacheEntry) : Cache :=
-  (PaperLean.ownSpecPath e.declName).select cache <|
+  (PaperLean.ownSpecPath e.declName).select
+    (if cache.stage₁ then cache else cache.insert e.key e.declName) <|
   cache.insert e.key e.declName
 
 builtin_initialize specCacheExt : SimplePersistentEnvExtension CacheEntry Cache ←

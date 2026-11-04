@@ -17,8 +17,12 @@
 # found. And that linters, which run in tasks with the command's environment, neither use nor fill
 # the caches of typeclass results and section variables. And that a key keeps the sharing of the
 # context that it holds, and that a problem with a large context has none and is searched as Lean's.
+# And that a search of fewer heartbeats than `minHeartbeats` is not kept, and the next one with its key
+# not recorded, unlike a longer one.
 
 export PAPERLEAN_REUSE=1
+# (every search is kept: these problems are small)
+export PAPERLEAN_REUSE_MIN_HEARTBEATS=0
 
 cat > "$TMP_DIR/TCCache.lean" <<'EOF'
 class Foo (α : Type) where
@@ -457,7 +461,9 @@ PAPERLEAN_REUSE_STATS=no_linter.stats lean NoLinter.lean > no_linter.out 2>&1 ||
 # a key keeps the sharing of the context that it holds: a local instance whose type is a sum of
 # depth 16 with both summands shared at each level (2^17 objects unshared) gives a key of a few dozen
 # objects; and a problem whose context has more than `maxDecls` declarations, or more than
-# `maxContext` declarations and metavariables, has no key (`key?`, read with `import all`)
+# `maxContext` declarations and metavariables, has no key (`key?`, read with `import all`), as soon as
+# more than `maxDecls` free variables are found: the declarations not yet visited are not (here a
+# let-variable whose value has an unassigned metavariable, which would exclude the problem for that)
 cat > Keys.lean <<'EOF2'
 module
 public import Lean
@@ -483,6 +489,10 @@ def withInsts (x : Expr) : Nat → MetaM Unit → MetaM Unit
   | 0, k => k
   | n + 1, k => withLocalDecl `inst .instImplicit (mkApp (mkConst ``Big) (mkNatAdd x (mkNatLit n)))
       fun _ => withInsts x n k
+/-- `k` with `n` variables of type `Nat`. -/
+def withNats : Nat → (Array Expr → MetaM Unit) → MetaM Unit
+  | 0, k => k #[]
+  | n + 1, k => withLocalDeclD `z (mkConst ``Nat) fun z => withNats n fun zs => k (zs.push z)
 /-- What `key?` gives for `Big x`: the number of objects of its context, or the exclusion. -/
 def keyOf (x : Expr) : MetaM String := do
   match ← key? (← getLocalInstances) (mkApp (mkConst ``Big) x) 0 with
@@ -505,6 +515,10 @@ run_meta withLocalDeclD `x (mkConst ``Nat) fun x => do
     withLocalDecl `inst .instImplicit (mkApp (mkConst ``Big) sum) fun _ => do
       let r ← keyOf x
       logInfo m!"metavariables {what} the limit: {if r.startsWith "key" then "key" else r}"
+  withLetDecl `y (mkConst ``Nat) (← mkFreshExprMVar (mkConst ``Nat)) fun y =>
+    withNats maxDecls fun zs =>
+      withLocalDecl `inst .instImplicit (mkApp (mkConst ``Big) (zs.foldl mkNatAdd y)) fun _ => do
+        logInfo m!"found over the limit before a metavariable: {← keyOf x}"
 EOF2
 lean Keys.lean 2>&1 | sed 's/^.*info: //' > keys.out || fail "Keys.lean failed: $(cat keys.out)"
 N=$(sed -n 's/^shared: key of \([0-9]*\) objects$/\1/p' keys.out)
@@ -512,7 +526,8 @@ N=$(sed -n 's/^shared: key of \([0-9]*\) objects$/\1/p' keys.out)
 grep -qx "declarations at the limit: key of [0-9]* objects" keys.out &&
   grep -qx "declarations over the limit: excluded 6" keys.out &&
   grep -qx "metavariables at the limit: key" keys.out &&
-  grep -qx "metavariables over the limit: excluded 6" keys.out ||
+  grep -qx "metavariables over the limit: excluded 6" keys.out &&
+  grep -qx "found over the limit before a metavariable: excluded 6" keys.out ||
   fail "the limits of a key's context do not hold: $(cat keys.out)"
 # a problem with a large context is searched as Lean's, and the statistics say why it was left out
 { echo "class D (α : Type) where"
@@ -526,3 +541,22 @@ grep -qx "declarations at the limit: key of [0-9]* objects" keys.out &&
 PAPERLEAN_REUSE_STATS=large.stats lean Large.lean > large.out 2>&1 || fail "Large.lean failed: $(cat large.out)"
 [ ! -s large.out ] || fail "Large.lean printed: $(cat large.out)"
 grep -q "not eligible: a large context=[1-9]" large.stats || fail "no problem was left out for a large context: $(cat large.stats)"
+# a search of fewer heartbeats than `minHeartbeats` is not kept, and the next one with its key runs
+# unrecorded, while one of 30 steps is kept and reused; with every search kept, the small ones are reused
+{ echo "class Foo (α : Type) where"
+  echo "  foo : α"
+  echo "instance : Foo Nat := ⟨0⟩"
+  for i in 1 2 3; do echo "example : (Foo.foo : Nat) = 0 := rfl"; done
+  for i in $(seq 0 30); do echo "class C$i (α : Type) : Prop where"; done
+  echo "instance : C0 Nat := ⟨⟩"
+  for i in $(seq 1 30); do echo "instance [C$((i - 1)) α] : C$i α := ⟨⟩"; done
+  for i in 1 2; do echo "example : C30 Nat := inferInstance"; done
+} > Threshold.lean
+env -u PAPERLEAN_REUSE_MIN_HEARTBEATS PAPERLEAN_REUSE_STATS=threshold.stats PAPERLEAN_REUSE_ORACLE=1 \
+  lean Threshold.lean > threshold.out 2>&1 || fail "Threshold.lean failed: $(cat threshold.out)"
+PAPERLEAN_REUSE_STATS=all.stats lean Threshold.lean > all.out 2>&1 || fail "Threshold.lean failed: $(cat all.out)"
+[ "$(cut -f2 threshold.stats)" = 1 ] && grep -q "not kept: cheaper than a reuse=[1-9]" threshold.stats &&
+  grep -q "not recorded: the last search was cheaper than a reuse=[1-9]" threshold.stats ||
+  fail "the small searches were kept or the long one not reused: $(cat threshold.stats)"
+[ "$(cut -f2 all.stats)" -ge 3 ] && ! grep -q "cheaper than a reuse" all.stats ||
+  fail "with every search kept, the small ones were not reused: $(cat all.stats)"

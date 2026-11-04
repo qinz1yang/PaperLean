@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="290" viewBox="0 0 800 290" font-family="Helvetica, Arial, sans-serif" role="img" aria-labelledby="title">
+<title id="title">Mathlib build output disk usage on Lean rc3 and PaperLean 0.2.2</title>
+<style>.t{fill:#111111}.m{fill:#6b6b6b}.l{fill:#969A98}.p{fill:#B83D26} .bar{fill:#F27655}.ax{stroke:#d0d0d0}.sep{stroke:#e9e9e9}
+@media (prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.l{fill:#707875}.p{fill:#FFAA93} .bar{fill:#FF9175}.ax{stroke:#3a3a3a}.sep{stroke:#282828}}.caption{fill:#777777}@media (prefers-color-scheme:dark){.caption{fill:#92999f}}</style>
+<text class="m" x="388" y="22" font-size="13" text-anchor="end">Lean v4.35.0-rc3</text>
+<text class="p" x="412" y="22" font-size="13" text-anchor="start">PaperLean v0.2.2</text>
+<line class="sep" x1="400.5" y1="60" x2="400.5" y2="224"/>
+<line class="ax" x1="49" y1="180.5" x2="351" y2="180.5"/>
+<path class="l" d="M120.5 180V63.000q0 -3.000 3.000 -3.000h55.000q3.000 0 3.000 3.000V180Z"/>
+<text class="m" x="151" y="52.0" font-size="12" text-anchor="middle">14.53 GB</text>
+<path class="bar" d="M218.5 180V124.910q0 -3.000 3.000 -3.000h55.000q3.000 0 3.000 3.000V180Z"/>
+<text class="p" x="249" y="113.91" font-size="12" text-anchor="middle">7.03 GB</text>
+<text class="m" x="200" y="203" font-size="13" text-anchor="middle">Whole build directory</text>
+<text class="p" x="200" y="223" font-size="14" text-anchor="middle" font-weight="bold">−51.6%</text>
+<line class="ax" x1="449" y1="180.5" x2="751" y2="180.5"/>
+<path class="l" d="M520.5 180V63.000q0 -3.000 3.000 -3.000h55.000q3.000 0 3.000 3.000V180Z"/>
+<text class="m" x="551" y="52.0" font-size="12" text-anchor="middle">7.53 GB</text>
+<path class="bar" d="M618.5 180V179.713q0 -0.287 0.287 -0.287h60.427q0.287 0 0.287 0.287V180Z"/>
+<text class="p" x="649" y="171.427" font-size="12" text-anchor="middle">35.98 MB</text>
+<text class="m" x="600" y="203" font-size="13" text-anchor="middle">Setup files</text>
+<text class="p" x="600" y="223" font-size="14" text-anchor="middle" font-weight="bold">−99.52%</text>
+<text class="caption" x="400" y="259" font-size="11" text-anchor="middle">Apple M5 Max · macOS 26.6.1 · Lean 4.35.0-rc3 · PaperLean 0.2.2, C++ and generated C PGO</text>
+<text class="caption" x="400" y="275" font-size="11" text-anchor="middle">Clean Mathlib builds · 8,564 modules · prebuilt dependencies · LEAN_NUM_THREADS=8</text>
+</svg>

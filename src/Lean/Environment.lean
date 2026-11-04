@@ -841,6 +841,12 @@ private def recordConstImpl {α : Type} (_n : @& Name) (_skipRealize : Bool) (r 
     Option α :=
   if PaperLean.envRecording n then recordConstImpl n skipRealize r else r
 
+/-- PaperLean: `kenv.constants.map₁[n]?`, of the imported constants, through this thread's cache of
+lookups where it is available (`PaperLean.cachedLookup`). -/
+@[inline] private def findImported? (kenv : Kernel.Environment) (n : Name) : Option ConstantInfo :=
+  let m := kenv.constants.map₁
+  if PaperLean.nativeAvailable n then PaperLean.cachedLookup 0 m () n fun _ => m[n]? else m[n]?
+
 /--
 Looks up the given declaration name in the environment, avoiding forcing any in-progress elaboration
 tasks unless necessary. This can usually be done efficiently because `addConstAsync` ensures that
@@ -858,7 +864,7 @@ Use `findTask` instead if any blocking should be avoided.
 -- PaperLean: (not inlined: its body calls PaperLean's code)
 @[noinline] def findAsync? (env : Environment) (n : Name) (skipRealize := false) : Option AsyncConstantInfo := do
   -- Avoid going through `AsyncConstantInfo` for `base` access
-  if let some c := env.base.get env |>.constants.map₁[n]? then
+  if let some c := findImported? (env.base.get env) n then
     return .ofConstantInfo c
   recordConst n skipRealize <| findAsyncCore? (skipRealize := skipRealize) env n
 
@@ -880,7 +886,7 @@ through the result.
 -- PaperLean: (not inlined: its body calls PaperLean's code)
 @[noinline] def findConstVal? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantVal := do
   -- Avoid going through `AsyncConstantInfo` for `base` access
-  if let some c := env.base.get env |>.constants.map₁[n]? then
+  if let some c := findImported? (env.base.get env) n then
     return c.toConstantVal
   recordConst n skipRealize <|
     env.findAsyncCore? n (skipRealize := skipRealize) |>.map (·.toConstantVal)
@@ -888,7 +894,7 @@ through the result.
 /-- Like `findAsync?`, but blocks until the constant's info is fully available.  -/
 -- PaperLean: (not inlined: its body calls PaperLean's code)
 @[noinline] def find? (env : Environment) (n : Name) (skipRealize := false) : Option ConstantInfo := do
-  if let some c := env.base.get env |>.constants.map₁[n]? then
+  if let some c := findImported? (env.base.get env) n then
     return c
   recordConst n skipRealize <|
     env.findAsyncCore? n (skipRealize := skipRealize) |>.map (·.toConstantInfo)
@@ -1256,6 +1262,12 @@ def mainModule (env : Environment) : Name :=
 def getModuleIdxFor? (env : Environment) (declName : Name) : Option ModuleIdx :=
   -- async constants are always from the current module
   env.base.get env |>.const2ModIdx[declName]?
+
+/-- PaperLean: the map that `getModuleIdxFor?` reads, which identifies, with an extension's
+`getImportedEntries`, the lookups of a name in the entries of the imported modules
+(`PaperLean.cachedLookup`). -/
+def importedModuleIdxs (env : Environment) : Std.HashMap Name ModuleIdx :=
+  env.base.get env |>.const2ModIdx
 
 def isImportedConst (env : Environment) (declName : Name) : Bool :=
   env.getModuleIdxFor? declName |>.isSome
@@ -1759,6 +1771,15 @@ def getModuleEntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtens
     | _         => env.serverBaseExts
   -- safety: as in `getStateUnsafe`
   unsafe (ext.toEnvExtension.getStateImpl exts).importedEntries[m]!
+
+/-- PaperLean: the entries of all imported modules, of which `getModuleEntries` takes one. -/
+def getImportedEntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α β σ)
+    (env : Environment) (level := OLeanLevel.exported) : Array (Array α) :=
+  let exts := match level with
+    | .exported => env.base.private.extensions
+    | _         => env.serverBaseExts
+  -- safety: as in `getStateUnsafe`
+  unsafe (ext.toEnvExtension.getStateImpl exts).importedEntries
 
 /-- Retrieves additional IR extension state for the interpreter. -/
 def getModuleIREntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α β σ)

@@ -209,17 +209,20 @@ private opaque endNativeInit (env : @& Environment) : BaseIO Unit
 private def prefetchImportedStatesImpl (env : Environment) (opts : Options) (startingAt : Nat)
     (persistent : Bool) : BaseIO Unit := do
   if (← importMode) == 1 then return
-  -- before the interpreter first runs for `env`
-  if startingAt == 0 then
-    loadNativeLibs env opts
   let states := env.base.private.extensions
-  for descr in (← persistentEnvExtensionsRef.get)[startingAt...*] do
-    let as := (unsafe descr.toEnvExtension.getStateImpl states).importedEntries
-    prefetchImportedState descr.name as persistent
+  let descrs := (← persistentEnvExtensionsRef.get)[startingAt...*].toArray
+  for descr in descrs do
     -- only in an environment marked persistent, which the task does not need to mark
     if persistent && pureImportedFolds.contains descr.name.toString then
+      let as := (unsafe descr.toEnvExtension.getStateImpl states).importedEntries
       let task ← IO.asTask (descr.addImportedFn as { env, opts }) .dedicated
       importedFoldsRef.modify (·.push (descr.name, as, task))
+  -- The core folds do not use native libraries; the interpreter first runs after they are loaded.
+  if startingAt == 0 then
+    loadNativeLibs env opts
+  for descr in descrs do
+    let as := (unsafe descr.toEnvExtension.getStateImpl states).importedEntries
+    prefetchImportedState descr.name as persistent
 
 /-- The result of `addImportedFn` of the extension named `extName` for the entries `as`, if it was
 computed in the background. -/
@@ -355,6 +358,12 @@ private opaque packModuleFind (name : @& Name) : UInt32
 /-- Whether some olean pack is in use. -/
 @[extern "lean_paperlean_packs_loaded"]
 private opaque packsLoaded : BaseIO Bool
+/-- Records search-path roots for pack file reads, before either traversal. -/
+@[extern "lean_paperlean_pack_search_path"]
+private opaque packSearchPath (paths : @& Array String) : BaseIO Unit
+/-- Whether aliases keep the table traversal's choice of packed files unambiguous. -/
+@[extern "lean_paperlean_pack_aliases_unambiguous"]
+private opaque packAliasesUnambiguous : BaseIO Bool
 /--
 With `wait`, whether no file of the packed modules that `packModuleParts` served to this thread
 before checking them changed since packing, checking them (other threads check them meanwhile);
@@ -392,7 +401,7 @@ private opaque packModuleIsModule (m : UInt32) : Bool
 /-- The first `count` parts of the `.olean` (or IR) chain of `m`, if they can be served; if they are
 not checked yet, `packJoin` checks them. -/
 @[extern "lean_paperlean_pack_module_parts"]
-private opaque packModuleParts (m : UInt32) (ir : Bool) (count : UInt32) :
+private opaque packModuleParts (m : UInt32) (ir : Bool) (count : UInt32) (readRoot? : @& Option String) :
     BaseIO (Option (Array (ModuleData × CompactedRegion)))
 
 private def noPackModule : UInt32 := 0xffffffff
@@ -409,7 +418,7 @@ private structure FastImportState where
   byName : Std.HashMap Name Nat := {}
   /-- For packed modules found via the search path: whether the search path finds their package
   in their pack root, by pack root and package (`root/package`). -/
-  packageRoots : Std.HashMap String Bool := {}
+  packageRoots : Std.HashMap String (Option String) := {}
   /-- The regions read from files, to be freed if the traversal is abandoned. -/
   read : List CompactedRegion := []
   /-- The result of `readIRPartsOfMod` for modules without IR files. `importModulesCore` reads
@@ -421,21 +430,30 @@ private abbrev FastImportM := StateRefT FastImportState IO
 private def fastImportFail {α} (why : String) : FastImportM α :=
   throw <| IO.userError s!"fast import not applicable: {why}"
 
-/-- Whether `importModulesCore` reads packed module `m` from the files of its pack: from `arts`,
-`artsOf` holds the artifacts of the packed modules that have them, and the search path must find the
-module's package in the module's pack root. -/
-private def packModuleServable (m : UInt32) (artsOf : Std.HashMap UInt32 ImportArtifacts) :
-    FastImportM Bool := do
-  if artsOf.contains m then return true
+/-- Whether two paths name the same directory, including through symbolic links. -/
+private def samePackDirectory (a b : System.FilePath) : IO Bool := do
+  try return (← IO.FS.realPath a) == (← IO.FS.realPath b)
+  catch _ => return false
+
+/-- The search-path root from which Lean reads packed module `m`, if it is servable. `some none`
+uses the stored pack paths, also for explicit `artsOf`; `some (some root)` keeps an alias spelling. -/
+private def packModuleReadRoot (m : UInt32) (artsOf : Std.HashMap UInt32 ImportArtifacts) :
+    FastImportM (Option (Option String)) := do
+  if artsOf.contains m then return some none
   let (root, pkg) := packModulePackage m
   let dir := root ++ "/" ++ pkg
-  if let some ok := (← get).packageRoots[dir]? then return ok
+  let keepRoot (readRoot : String) : Option String := if readRoot == root then none else some readRoot
+  if let some readRoot? := (← get).packageRoots[dir]? then return readRoot?.map keepRoot
   let sp ← searchPathRef.get
-  let ok := match ← sp.findWithExt "olean" (.mkSimple pkg) with
-    | some p => p.toString == dir ++ ".olean"
-    | none => false
-  modify fun s => { s with packageRoots := s.packageRoots.insert dir ok }
-  return ok
+  let readRoot? ← match ← sp.findWithExt "olean" (.mkSimple pkg) with
+    | some p =>
+      if p.toString == dir ++ ".olean" then pure (some root)
+      else if ← samePackDirectory (p.parent.getD ".") (System.FilePath.mk root) then
+        pure (some ((p.parent.map (·.toString)).getD ""))
+      else pure none
+    | none => pure none
+  modify fun s => { s with packageRoots := s.packageRoots.insert dir readRoot? }
+  return readRoot?.map keepRoot
 
 private partial def fastImportModules (imports : Array Import) (globalLevel : OLeanLevel)
     (arts : NameMap ImportArtifacts) (isExported : Bool) (artsOf : Std.HashMap UInt32 ImportArtifacts)
@@ -586,11 +604,12 @@ where
         noteRead (← readModuleDataParts (arts.oleanParts (inServer := globalLevel ≥ OLeanLevel.server)))
       else
         noteRead (← readModuleDataPartsOfMod i.module)
-    unless ← packModuleServable m artsOf do fastImportFail s!"{i.module} is not read from its pack"
+    let some readRoot? ← packModuleReadRoot m artsOf |
+      fastImportFail s!"{i.module} is not read from its pack"
     let count := match artsOf[m]? with
       | some arts => (arts.oleanParts (inServer := globalLevel ≥ OLeanLevel.server)).size
       | none => if packModuleIsModule m then 3 else 1
-    let some parts ← packModuleParts m false count.toUInt32 | fastImportFail s!"{i.module} cannot be served"
+    let some parts ← packModuleParts m false count.toUInt32 readRoot? | fastImportFail s!"{i.module} cannot be served"
     return parts
   -- .ir.sig + .ir (optional)
   loadIR (i : Import) (m? : Option UInt32) : FastImportM (Array (ModuleData × CompactedRegion)) := do
@@ -600,14 +619,15 @@ where
         noteRead (← readModuleDataParts arts.irParts)
       else
         readIR i.module
-    unless ← packModuleServable m artsOf do fastImportFail s!"{i.module} is not read from its pack"
+    let some readRoot? ← packModuleReadRoot m artsOf |
+      fastImportFail s!"{i.module} is not read from its pack"
     match artsOf[m]? with
     | some arts =>
       if arts.irParts.isEmpty then return (← readModuleDataParts arts.irParts)
-      let some parts ← packModuleParts m true arts.irParts.size.toUInt32 | fastImportFail s!"{i.module} cannot be served"
+      let some parts ← packModuleParts m true arts.irParts.size.toUInt32 readRoot? | fastImportFail s!"{i.module} cannot be served"
       return parts
     | none =>
-      if let some parts ← packModuleParts m true 2 then return parts
+      if let some parts ← packModuleParts m true 2 readRoot? then return parts
       -- not packed: read as `importModulesCore` does
       readIR i.module
 
@@ -648,12 +668,16 @@ private def importModulesImpl (imports : Array Import) (levelIdx : UInt8) (arts 
   let level : OLeanLevel := match levelIdx with | 0 => .exported | 1 => .server | _ => .private
   importTimingMark "start"
   packNextImport
+  packSearchPath ((← searchPathRef.get).toArray.map (·.toString))
   let mode ← importMode
   let isExported := level < .private
   -- The modules and the regions the traversal read from files.
   let fast (reuse : Option ImportState) :
       IO (Option ((Array Name × Array ImportedModule) × List CompactedRegion)) := do
     unless ← packsLoaded do return none
+    unless ← packAliasesUnambiguous do
+      if ← importTimingEnabled then importTimingMark "modules.fallback (ambiguous pack root aliases)"
+      return none
     let some artsOf := packedArtifacts arts level | return none
     packBeginImport
     let ref ← IO.mkRef ({} : FastImportState)

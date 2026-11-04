@@ -9,6 +9,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -38,6 +39,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include "runtime/object.h"
 #include "runtime/io.h"
 #include "runtime/sstream.h"
+#include "runtime/hash.h"
 #include "runtime/exception.h"
 #include "runtime/compact.h"
 #include "util/name.h"
@@ -71,6 +73,14 @@ public:
 // judging by device, inode, size, mtime and ctime. A served region exposes the original file's
 // `base_addr`, exactly like a file that could not be mapped at its base address and was relocated,
 // so pointers into it from other regions are resolved and saved like those into the file's mapping.
+//
+// A pack of the shared cache (`Lake.PaperLean.Cache`) holds a package's files as some workspace had
+// them, and is read through a binding of each workspace that uses it, a side file that
+// `LEAN_OLEAN_PACK` lists in its place: the binding names the pack, gives its roots in the workspace
+// and, per entry, the identity of the workspace's file whose bytes are those that were packed, as
+// found when the file was hashed (`hashFiles`), or none. A packed file is served while the
+// workspace's file has the identity of the binding, as for one that was packed in place: any write
+// to the file changes its change time.
 
 namespace {
 constexpr char g_pack_kind[] = "olean-pack";
@@ -93,9 +103,11 @@ constexpr size_t g_module_data_size = sizeof(lean_ctor_object) + 5 * sizeof(void
 // status --verify`), which compares the checksums of the whole index and of the regions
 // (`pack_payload_checksum`).
 // The layout of the pack's index and tables; files of another layout are ignored.
-constexpr uint32_t g_pack_format = 7;
+constexpr uint32_t g_pack_format = 8;
 // `pack_header::validated` of a pack whose writer checked its index.
 constexpr uint32_t g_pack_validated = 0x564c4150;
+// `pack_header::flags`: the pack is read only through bindings, as its roots are a workspace's.
+constexpr uint32_t pack_flag_bound = 1;
 
 struct pack_header {
     side_file_header common;
@@ -121,7 +133,7 @@ struct pack_header {
     uint64_t paths_off, paths_size;   // `pack_path_slot`s: open addressing by `path_hash`
     uint64_t modules_by_hash_off;     // `num_modules` `pack_module_hash`es, sorted
     uint32_t validated;               // `g_pack_validated`
-    uint32_t unused;
+    uint32_t flags;                   // `pack_flag_*`
     // The checksums of the blocks of `[entries_off, block_sums_off)`, from `block_sums_off` to the end
     // of the file, and their checksum.
     uint64_t block_sums_off, block_sums_checksum;
@@ -217,6 +229,7 @@ struct pack_entry {
     // as a `CompactedRegion`'s root must be (embedding it in a snapshot relocates it), unlike its copy
     // in the roots area (`root`).
     uint64_t region_root;
+    content_hash content;    // of the file's bytes before relocation
 };
 // The githash of the file's header is the writer's `LEAN_GITHASH`, which is the reader's.
 constexpr uint32_t entry_githash_match = 1;
@@ -289,27 +302,38 @@ inline object * module_data_imports(object * d) { return lean_ctor_get(d, g_modu
 inline object * module_data_field(object * d, unsigned i) { return lean_ctor_get(d, i); }
 inline uint8_t import_flag(object * i, unsigned k) { return lean_ctor_get_uint8(i, sizeof(void *) + k); }
 
-#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
-void set_file_id(pack_entry & e, struct stat const & st) {
-    e.dev = st.st_dev; e.ino = st.st_ino; e.size = st.st_size;
-    e.mtime_sec = LEAN_STAT_MTIM(st).tv_sec; e.mtime_nsec = LEAN_STAT_MTIM(st).tv_nsec;
-    e.ctime_sec = LEAN_STAT_CTIM(st).tv_sec; e.ctime_nsec = LEAN_STAT_CTIM(st).tv_nsec;
+// `loaded_pack::edge_targets` of an edge not looked up yet.
+constexpr uint32_t g_target_unknown = 0xfffffffe;
+
+// The identity of a binding's entry that no file of the workspace matched; no file has it.
+constexpr file_identity g_unbound = { 0, 0, UINT64_MAX, 0, 0, 0, 0 };
+
+inline file_identity entry_identity(pack_entry const & e) {
+    return file_identity { e.dev, e.ino, e.size, e.mtime_sec, e.mtime_nsec, e.ctime_sec, e.ctime_nsec };
 }
 
-bool same_file_id(pack_entry const & e, struct stat const & st) {
-    return e.dev == static_cast<uint64_t>(st.st_dev) && e.ino == static_cast<uint64_t>(st.st_ino) &&
-        e.size == static_cast<uint64_t>(st.st_size) &&
-        e.mtime_sec == LEAN_STAT_MTIM(st).tv_sec && e.mtime_nsec == LEAN_STAT_MTIM(st).tv_nsec &&
-        e.ctime_sec == LEAN_STAT_CTIM(st).tv_sec && e.ctime_nsec == LEAN_STAT_CTIM(st).tv_nsec;
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+file_identity identity_of(struct stat const & st) {
+    return file_identity { static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+        static_cast<uint64_t>(st.st_size), LEAN_STAT_MTIM(st).tv_sec, LEAN_STAT_MTIM(st).tv_nsec,
+        LEAN_STAT_CTIM(st).tv_sec, LEAN_STAT_CTIM(st).tv_nsec };
+}
+
+void set_file_id(pack_entry & e, struct stat const & st) {
+    file_identity id = identity_of(st);
+    e.dev = id.dev; e.ino = id.ino; e.size = id.size;
+    e.mtime_sec = id.mtime_sec; e.mtime_nsec = id.mtime_nsec;
+    e.ctime_sec = id.ctime_sec; e.ctime_nsec = id.ctime_nsec;
 }
 
 // Whether `a` and `b` are the same file, unchanged.
-bool same_stat(struct stat const & a, struct stat const & b) {
-    pack_entry e = {};
-    set_file_id(e, a);
-    return same_file_id(e, b);
-}
+bool same_stat(struct stat const & a, struct stat const & b) { return identity_of(a) == identity_of(b); }
 #endif
+
+content_hash hash_content_core(void const * data, size_t size) {
+    return content_hash { hash_str(size, static_cast<unsigned char const *>(data), 11),
+                          side_file_checksum4(data, size, 0x636f6e74656e74ull) };
+}
 
 size_t align_up(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
 
@@ -620,9 +644,14 @@ struct pack_tables {
 };
 
 struct loaded_pack : pack_tables {
-    std::string fname;
+    std::string fname;      // as listed: the pack or its binding
     char * begin = nullptr;
     std::vector<std::string> roots;
+    // of a binding: per entry, the identity of the file that it serves
+    std::vector<file_identity> bound;
+    // per edge: the module of another pack that it imports (`lean_paperlean_pack_module_edge_target`),
+    // `g_target_unknown` until looked up
+    std::unique_ptr<std::atomic<uint32_t>[]> edge_targets;
     // the current descriptors of `roots`, negative if one cannot be opened
     std::unique_ptr<std::atomic<int>[]> root_fds;
     // per chain: the generation of the imports (`g_pack_generation`) it was checked for << 2 | 0 = not
@@ -636,12 +665,16 @@ struct loaded_pack : pack_tables {
     std::unique_ptr<std::atomic<uint8_t>[]> names_state;
     std::unique_ptr<std::atomic<bool>> warned;
     std::unique_ptr<side_file_blocks> block_table;
+    // read for this process alone (`process_packs`), which says nothing about it
+    bool quiet = false;
 
     // Reports, once, that an entry of the index is damaged; it is not used.
     void damaged() const {
-        if (!warned->exchange(true))
+        if (!warned->exchange(true) && !quiet)
             side_file_warning("warning: olean pack '%s': ignoring damaged entries of its index\n", fname.c_str());
     }
+    // The identity of the file that entry `i` serves.
+    file_identity identity(uint64_t i) const { return bound.empty() ? entry_identity(entries[i]) : bound[i]; }
 };
 constexpr uint8_t module_known = 1;
 // the module, its chains and its edges are consistent
@@ -729,11 +762,8 @@ bool pack_identity_ok(std::string const & pack, uint64_t checksum, struct stat c
         check_side_file_header(id.common, g_pack_identity_kind, sizeof(pack_identity)) ||
         pack_identity_checksum(id) != id.common.checksum || id.pack_checksum != checksum)
         return false;
-    pack_entry e = {};
-    e.dev = id.dev; e.ino = id.ino; e.size = id.size;
-    e.mtime_sec = id.mtime_sec; e.mtime_nsec = id.mtime_nsec;
-    e.ctime_sec = id.ctime_sec; e.ctime_nsec = id.ctime_nsec;
-    return same_file_id(e, st);
+    return file_identity { id.dev, id.ino, id.size, id.mtime_sec, id.mtime_nsec, id.ctime_sec, id.ctime_nsec } ==
+        identity_of(st);
 }
 
 // Records the identity of the pack `pack`, as a file renamed into place.
@@ -741,8 +771,7 @@ void write_pack_identity(std::string const & pack, uint64_t checksum, bool sync)
     struct stat st;
     if (stat(pack.c_str(), &st) != 0)
         throw exception((sstream() << "failed to read '" << pack << "': " << strerror(errno)).str());
-    pack_entry e = {};
-    set_file_id(e, st);
+    file_identity e = identity_of(st);
     pack_identity id;
     memset(&id, 0, sizeof(id));
     init_side_file_header(id.common, g_pack_identity_kind, sizeof(pack_identity));
@@ -786,16 +815,160 @@ bool read_pack_header(std::string const & fname, int fd, struct stat & st, pack_
     return true;
 }
 
+// A binding (see above): the side file holds `binding_header`, the identities, the roots
+// (`pack_string`s) and the strings; the checksum covers all of it.
+constexpr char g_binding_kind[] = "pack-binding";
+constexpr uint64_t g_max_binding_size = uint64_t(1) << 32;
+struct binding_header {
+    side_file_header common;    // `common.checksum`: of this header with the field zero, then the rest
+    uint64_t pack_checksum;     // `common.checksum` of the pack
+    uint64_t size;
+    uint64_t num_entries, num_roots;
+    uint64_t ids_off, roots_off, strings_off, strings_size;
+    pack_string pack;           // the pack's path
+};
+
+uint64_t binding_checksum(binding_header hdr, char const * rest, size_t size) {
+    hdr.common.checksum = 0;
+    return side_file_checksum4(rest, size, side_file_checksum(&hdr, sizeof(hdr)));
+}
+
+struct binding {
+    std::string pack;
+    uint64_t pack_checksum = 0;
+    std::vector<std::string> roots;     // as recorded (`^N/...` relative to the binding), or resolved
+    std::vector<file_identity> ids;     // per entry of the pack; `g_unbound` if none
+};
+
+// Whether the side file open as `fd` is a binding (otherwise it may be a pack).
+bool is_binding(int fd) {
+    side_file_header h;
+    return pread(fd, &h, sizeof(h), 0) == static_cast<ssize_t>(sizeof(h)) && memcmp(h.magic, "PAPERLEAN", 9) == 0 &&
+        strncmp(h.kind, g_binding_kind, sizeof(h.kind)) == 0;
+}
+
+// Reads the binding `fname` open as `fd`, resolving its roots (`resolve_root`); `err` says why it cannot.
+bool read_binding(std::string const & fname, int fd, binding & b, std::string & err) {
+    struct stat st;
+    binding_header hdr;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || pread(fd, &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr))) {
+        err = "cannot be read"; return false;
+    }
+    if (char const * why = check_side_file_header(hdr.common, g_binding_kind, sizeof(binding_header))) { err = why; return false; }
+    if (hdr.size != static_cast<uint64_t>(st.st_size) || hdr.size > g_max_binding_size) { err = "corrupt"; return false; }
+    std::vector<char> rest(hdr.size - sizeof(hdr));
+    for (size_t got = 0; got < rest.size();) {
+        ssize_t r = pread(fd, rest.data() + got, rest.size() - got, sizeof(hdr) + got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { err = "cannot be read"; return false; }
+        got += r;
+    }
+    if (binding_checksum(hdr, rest.data(), rest.size()) != hdr.common.checksum) { err = "corrupt (checksum mismatch)"; return false; }
+    auto in_file = [&](uint64_t off, uint64_t n, uint64_t elem) {
+        return off >= sizeof(hdr) && off % 8 == 0 && off <= hdr.size && n <= (hdr.size - off) / elem;
+    };
+    if (!in_file(hdr.ids_off, hdr.num_entries, sizeof(file_identity)) || !in_file(hdr.roots_off, hdr.num_roots, sizeof(pack_string)) ||
+        !in_file(hdr.strings_off, hdr.strings_size, 1)) {
+        err = "corrupt"; return false;
+    }
+    auto at = [&](uint64_t off) { return rest.data() + (off - sizeof(hdr)); };
+    auto str = [&](pack_string x, std::string & out) {
+        if (x.off > hdr.strings_size || x.len > hdr.strings_size - x.off) return false;
+        out.assign(at(hdr.strings_off) + x.off, x.len);
+        return true;
+    };
+    if (!str(hdr.pack, b.pack)) { err = "corrupt"; return false; }
+    b.pack_checksum = hdr.pack_checksum;
+    b.roots.resize(hdr.num_roots);
+    for (uint64_t r = 0; r < hdr.num_roots; r++) {
+        pack_string x;
+        memcpy(&x, at(hdr.roots_off) + r * sizeof(x), sizeof(x));
+        if (!str(x, b.roots[r])) { err = "corrupt"; return false; }
+        b.roots[r] = resolve_root(fname, b.roots[r]);
+    }
+    b.ids.resize(hdr.num_entries);
+    memcpy(b.ids.data(), at(hdr.ids_off), hdr.num_entries * sizeof(file_identity));
+    return true;
+}
+
+// Writes the binding `b` to `out` (renamed into place), unless `out` already holds it.
+void write_binding(binding const & b, std::string const & out) {
+    std::string strings;
+    auto add = [&](std::string const & x) {
+        pack_string r { strings.size(), x.size() };
+        strings += x;
+        return r;
+    };
+    binding_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    init_side_file_header(hdr.common, g_binding_kind, sizeof(binding_header));
+    hdr.pack_checksum = b.pack_checksum;
+    hdr.num_entries = b.ids.size();
+    hdr.num_roots = b.roots.size();
+    hdr.pack = add(b.pack);
+    std::vector<pack_string> roots;
+    for (std::string const & r : b.roots) roots.push_back(add(r));
+    std::string rest;
+    hdr.ids_off = sizeof(hdr);
+    rest.append(reinterpret_cast<char const *>(b.ids.data()), b.ids.size() * sizeof(file_identity));
+    hdr.roots_off = sizeof(hdr) + rest.size();
+    rest.append(reinterpret_cast<char const *>(roots.data()), roots.size() * sizeof(pack_string));
+    hdr.strings_off = sizeof(hdr) + rest.size();
+    hdr.strings_size = strings.size();
+    rest += strings;
+    hdr.size = sizeof(hdr) + rest.size();
+    hdr.common.checksum = binding_checksum(hdr, rest.data(), rest.size());
+    std::string file(reinterpret_cast<char const *>(&hdr), sizeof(hdr));
+    file += rest;
+    {
+        file_descriptor fd(open(out.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+        struct stat st;
+        if (fd && fstat(fd.get(), &st) == 0 && S_ISREG(st.st_mode) && static_cast<uint64_t>(st.st_size) == file.size()) {
+            std::string old(file.size(), '\0');
+            if (pread(fd.get(), &old[0], old.size(), 0) == static_cast<ssize_t>(old.size()) && old == file) return;
+        }
+    }
+    std::string tmp = out + ".tmp." + std::to_string(getpid());
+    std::remove(tmp.c_str());
+    file_descriptor fd(open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444));
+    bool ok = fd;
+    for (size_t done = 0; ok && done < file.size();) {
+        ssize_t w = write(fd.get(), file.data() + done, file.size() - done);
+        if (w < 0 && errno == EINTR) continue;
+        ok = w > 0;
+        if (ok) done += w;
+    }
+    if (!ok || std::rename(tmp.c_str(), out.c_str()) != 0) {
+        int e = errno;
+        std::remove(tmp.c_str());
+        throw exception((sstream() << "failed to write '" << out << "': " << strerror(e)).str());
+    }
+}
+
 /*
-Checks the header of a pack and maps it. Like `.olean` files, packs are written to a temporary file
-that is then renamed.
+Checks the header of a pack, or of a binding and its pack, and maps the pack. Like `.olean` files,
+packs and bindings are written to a temporary file that is then renamed.
 */
 bool load_pack_core(std::string const & fname, loaded_pack & p, std::string & err) {
     p.fname = fname;
-    file_descriptor fd(open(fname.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+    file_descriptor lfd(open(fname.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+    if (!lfd) { err = strerror(errno); return false; }
+    binding b;
+    bool bound = is_binding(lfd.get());
+    if (bound && !read_binding(fname, lfd.get(), b, err)) return false;
+    file_descriptor pfd(bound ? open(b.pack.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK) : -1);
+    if (bound && !pfd) { err = "its pack '" + b.pack + "': " + strerror(errno); return false; }
+    int fd = bound ? pfd.get() : lfd.get();
     struct stat st;
     pack_header hdr;
-    if (!read_pack_header(fname, fd.get(), st, hdr, err)) return false;
+    if (!read_pack_header(bound ? b.pack : fname, fd, st, hdr, err)) {
+        if (bound) err = "its pack '" + b.pack + "': " + err;
+        return false;
+    }
+    if (bound && (hdr.common.checksum != b.pack_checksum || hdr.num_entries != b.ids.size() || hdr.num_roots != b.roots.size())) {
+        err = "it binds another pack than '" + b.pack + "'"; return false;
+    }
+    if (!bound && (hdr.flags & pack_flag_bound)) { err = "it is read through bindings only"; return false; }
     if (!p.init_header(hdr)) { err = "corrupt"; return false; }
     void * addr = reinterpret_cast<void *>(p.hdr.base_addr);
     // (not reserved: the pack is backed by its file, and larger than the memory of small machines)
@@ -806,7 +979,7 @@ bool load_pack_core(std::string const & fname, loaded_pack & p, std::string & er
         ;
     // Writable like the mappings of single files: the parts of a chain read from disk fix their
     // own pointers, never the pack's, but this keeps the two kinds of regions interchangeable.
-    void * m = mmap(addr, p.hdr.size, PROT_READ | PROT_WRITE, flags, fd.get(), 0);
+    void * m = mmap(addr, p.hdr.size, PROT_READ | PROT_WRITE, flags, fd, 0);
     if (m == MAP_FAILED || m != addr) {
         int error = errno;
         if (m != MAP_FAILED) munmap(m, p.hdr.size);
@@ -823,9 +996,14 @@ bool load_pack_core(std::string const & fname, loaded_pack & p, std::string & er
                         reinterpret_cast<uint64_t const *>(sums));
     p.blocks = p.block_table.get();
     p.set_tables(p.begin + p.hdr.entries_off);
-    for (uint64_t i = 0; i < p.hdr.num_roots; i++) {
-        if (!p.used(p.root_strings[i]) || !p.valid_str(p.root_strings[i])) { err = "corrupt"; return false; }
-        p.roots.emplace_back(resolve_root(fname, std::string(p.str(p.root_strings[i]))));
+    if (bound) {
+        p.roots = std::move(b.roots);
+        p.bound = std::move(b.ids);
+    } else {
+        for (uint64_t i = 0; i < p.hdr.num_roots; i++) {
+            if (!p.used(p.root_strings[i]) || !p.valid_str(p.root_strings[i])) { err = "corrupt"; return false; }
+            p.roots.emplace_back(resolve_root(fname, std::string(p.str(p.root_strings[i]))));
+        }
     }
     err.clear();
     p.root_fds.reset(new std::atomic<int>[p.roots.size()]);
@@ -844,6 +1022,8 @@ bool load_pack_core(std::string const & fname, loaded_pack & p, std::string & er
     p.module_state = states(p.hdr.num_modules);
     p.part_state = states(p.hdr.num_entries);
     p.names_state = states(p.hdr.num_entries);
+    p.edge_targets.reset(new std::atomic<uint32_t>[p.hdr.num_edges]);
+    for (uint64_t j = 0; j < p.hdr.num_edges; j++) p.edge_targets[j].store(g_target_unknown, std::memory_order_relaxed);
     p.warned.reset(new std::atomic<bool>(false));
     return true;
 }
@@ -867,10 +1047,24 @@ bool load_pack(std::string const & fname, loaded_pack & p, std::string & err) {
 }
 #endif
 
+// The packs and the import image that this process reads its own imports from where
+// `LEAN_OLEAN_PACK` is not set (`lean_paperlean_use_process_packs`), and whether it does.
+std::atomic<std::pair<std::string, std::string> *> g_process_packs{nullptr};
+std::atomic<bool> g_packs_of_process{false};
+
 void init_packs() {
     auto * packs = new std::vector<loaded_pack>();
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
-    if (char const * env = getenv("LEAN_OLEAN_PACK")) {
+    char const * env = getenv("LEAN_OLEAN_PACK");
+    bool quiet = false;
+    if (!env) {
+        if (auto * own = g_process_packs.load(std::memory_order_acquire)) {
+            env = own->first.c_str();
+            quiet = true;
+            g_packs_of_process.store(true, std::memory_order_release);
+        }
+    }
+    if (env) {
         std::string list(env);
         size_t start = 0;
         while (start <= list.size()) {
@@ -882,9 +1076,10 @@ void init_packs() {
             loaded_pack p;
             std::string err;
             if (load_pack(fname, p, err)) {
-                if (!err.empty()) side_file_warning("warning: olean pack '%s': %s\n", fname.c_str(), err.c_str());
+                p.quiet = quiet;
+                if (!err.empty() && !quiet) side_file_warning("warning: olean pack '%s': %s\n", fname.c_str(), err.c_str());
                 packs->push_back(std::move(p));
-            } else {
+            } else if (!quiet) {
                 side_file_warning("warning: ignoring olean pack '%s': %s\n", fname.c_str(), err.c_str());
             }
         }
@@ -949,7 +1144,7 @@ uint8_t check_chain_files(loaded_pack & p, uint32_t chain) {
             return 2;
         memcpy(rel, p.strings + ce.path.off, ce.path.len);
         rel[ce.path.len] = 0;
-        if (fstatat(root_fd, rel, &st, 0) != 0 || !same_file_id(ce, st))
+        if (fstatat(root_fd, rel, &st, 0) != 0 || !(p.identity(i) == identity_of(st)))
             return 2;
     }
     return 1;
@@ -1083,14 +1278,118 @@ bool serve_chain(loaded_pack & p, uint32_t chain) {
 }
 }
 
-bool find_in_packs(std::string const & fname, std::vector<region_view> const & deps, pack_hit & hit) {
-    std::call_once(g_packs_once, init_packs);
-    scoped_import_timer timer(counter_pack_lookup);
+namespace {
+struct pack_root_aliases {
+    uint32_t generation = 0;
+    std::vector<std::string> search_roots;
+    std::vector<std::pair<std::string, std::string>> aliases;
+    bool ready = false;
+    bool fast = true;
+};
+thread_local std::unique_ptr<pack_root_aliases> t_pack_root_aliases;
+
+std::string root_spelling(std::string s) {
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
+bool below_directory(std::string const & path, std::string const & root) {
+    return path.size() > root.size() + 1 && path.compare(0, root.size(), root) == 0 && path[root.size()] == '/';
+}
+
+bool overlap_directories(std::string const & a, std::string const & b) {
+    return a == b || below_directory(a, b) || below_directory(b, a);
+}
+
+// Resolve roots once per import, after packs are loaded at their original first-use point. No
+// filenames are canonicalized: the relative path below a whole-directory alias is kept verbatim.
+pack_root_aliases * current_pack_aliases() {
+    if (!t_pack_root_aliases) return nullptr;
+    pack_root_aliases & a = *t_pack_root_aliases;
+    uint32_t generation = g_pack_generation.load(std::memory_order_acquire);
+    if (a.generation != generation) {
+        a.generation = generation;
+        a.ready = false;
+    }
+    if (a.ready) return &a;
+    a.aliases.clear();
+    a.fast = true;
+    a.ready = true;
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    auto * packs = g_packs.load(std::memory_order_acquire);
+    if (!packs || packs->empty()) return &a;
+    std::vector<std::string> roots;
+    for (loaded_pack const & p : *packs)
+        for (std::string const & r : p.roots)
+            if (std::find(roots.begin(), roots.end(), r) == roots.end()) roots.push_back(r);
+    std::unordered_map<std::string, std::string> resolved;
+    auto real = [&](std::string const & dir) -> std::string const & {
+        auto it = resolved.find(dir);
+        if (it != resolved.end()) return it->second;
+        char path[PATH_MAX];
+        std::string actual;
+        if (realpath(dir.empty() ? "." : dir.c_str(), path)) actual = path;
+        return resolved.emplace(dir, std::move(actual)).first->second;
+    };
+    for (std::string const & search : a.search_roots) {
+        std::string const & actual = real(search);
+        if (actual.empty()) continue;
+        std::vector<std::string> targets;
+        for (std::string const & root : roots)
+            if (real(root) == actual) targets.push_back(root);
+        // Repeated or overlapping literal roots are normal. Only an actual alternate spelling
+        // needs an alias decision; ambiguous ones leave the table traversal to Lean's path.
+        bool alias = std::any_of(targets.begin(), targets.end(), [&](auto const & root) { return root != search; });
+        if (!alias) continue;
+        if (targets.size() != 1) a.fast = false;
+        for (std::string const & root : roots)
+            if (overlap_directories(search, root)) a.fast = false;
+        for (std::string const & root : targets)
+            if (root != search) a.aliases.emplace_back(search, root);
+    }
+    for (size_t i = 0; i < a.aliases.size(); i++)
+        for (size_t j = 0; j < i; j++)
+            if (a.aliases[i].first != a.aliases[j].first &&
+                overlap_directories(a.aliases[i].first, a.aliases[j].first)) a.fast = false;
+#endif
+    return &a;
+}
+}
+
+// Called before either traversal, including the legacy-first import oracle. Recording paths does
+// not load packs or emit their warnings; those still happen at the first actual pack operation.
+extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_search_path(b_obj_arg paths) {
+    if (!t_pack_root_aliases) t_pack_root_aliases.reset(new pack_root_aliases());
+    pack_root_aliases & a = *t_pack_root_aliases;
+    a.generation = g_pack_generation.load(std::memory_order_acquire);
+    a.search_roots.clear();
+    a.aliases.clear();
+    a.ready = false;
+    for (size_t i = 0; i < lean_array_size(paths); i++)
+        a.search_roots.push_back(root_spelling(lean_string_cstr(lean_array_get_core(paths, i))));
+    return lean_box(0);
+}
+
+extern "C" LEAN_EXPORT uint8_t lean_paperlean_pack_aliases_unambiguous() {
+    auto * a = current_pack_aliases();
+    return !a || a->fast;
+}
+
+char const * process_import_image() {
+    std::call_once(g_packs_once, init_packs);
+    if (!g_packs_of_process.load(std::memory_order_acquire)) return nullptr;
+    auto * own = g_process_packs.load(std::memory_order_acquire);
+    return own && !own->second.empty() ? own->second.c_str() : nullptr;
+}
+
+namespace {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+// Existing literal-path precedence, also used after rewriting a proven directory alias.
+bool find_literal_pack(std::string const & fname, std::vector<region_view> const & deps, pack_hit & hit,
+                       std::string const * selected, bool & below_root, bool & decided) {
     // The first pack that has the file below the first of its roots that is a prefix of its path
     // decides (`module_here` follows the same rule); a later pack can then add files below the same
     // root or replace files that changed (`paperlean build --prepare`).
-    bool below_root = false;
     for (loaded_pack & p : *g_packs.load(std::memory_order_acquire)) {
         for (size_t r = 0; r < p.roots.size(); r++) {
             std::string const & root = p.roots[r];
@@ -1102,9 +1401,15 @@ bool find_in_packs(std::string const & fname, std::vector<region_view> const & d
             if (idx == -2) p.damaged();
             if (idx < 0)
                 break;
+            decided = true;
             pack_entry const & e = p.entries[idx];
             if (e.chain >= p.hdr.num_chains) p.damaged();
             bool deps_match = e.chain < p.hdr.num_chains && chain_unchanged(p, e.chain);
+            // The directory alias may have changed since its roots were resolved.
+            if (deps_match && selected) {
+                file_identity current;
+                deps_match = stat_identity(selected->c_str(), current) && current == p.identity(static_cast<uint64_t>(idx));
+            }
             // checking the chain checked its entries, among them `e` if it is part `e.part` of it
             if (deps_match && (e.part >= p.chains[e.chain].count ||
                                static_cast<uint64_t>(p.chains[e.chain].first) + e.part != static_cast<uint64_t>(idx))) {
@@ -1126,6 +1431,32 @@ bool find_in_packs(std::string const & fname, std::vector<region_view> const & d
             return true;
         }
     }
+    return false;
+}
+#endif
+}
+
+bool find_in_packs(std::string const & fname, std::vector<region_view> const & deps, pack_hit & hit) {
+    std::call_once(g_packs_once, init_packs);
+    scoped_import_timer timer(counter_pack_lookup);
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    bool below_root = false, decided = false;
+    if (find_literal_pack(fname, deps, hit, nullptr, below_root, decided)) return true;
+    if (decided) return false;
+    if (auto * aliases = current_pack_aliases()) {
+        for (auto const & alias : aliases->aliases) {
+            std::string path;
+            if (alias.first.empty()) {
+                if (fname.empty() || fname[0] == '/') continue;
+                path = alias.second + "/" + fname;
+            } else {
+                if (!below_directory(fname, alias.first)) continue;
+                path = alias.second + fname.substr(alias.first.size());
+            }
+            if (find_literal_pack(path, deps, hit, &fname, below_root, decided)) return true;
+            if (decided) return false;
+        }
+    }
     // (a file that does not exist, such as the `.ir.sig` of a file that is not a `module`, is not read)
     struct stat st;
     if (below_root && stat(fname.c_str(), &st) == 0) count_served(false);
@@ -1145,38 +1476,37 @@ bool in_packs(void const * addr) {
 
 void extension_name_key(b_obj_arg n, std::string & key) { ext_name_key(n, key); }
 
-void for_each_first_pack_ext_entries(b_obj_arg ext_name, std::function<void(object *)> const & f) {
+void for_each_pack_ext_entries(b_obj_arg ext_name, std::function<void(object *)> const & f) {
     std::call_once(g_packs_once, init_packs);
-    std::vector<loaded_pack> & packs = *g_packs.load(std::memory_order_acquire);
-    if (packs.empty()) return;
     std::string key;
     ext_name_key(ext_name, key);
-    loaded_pack & p = packs[0];
-    std::vector<char> match(p.hdr.num_ext_names, 0);
-    for (uint64_t i = 0; i < p.hdr.num_ext_names; i++) {
-        std::string k;
-        ext_name_key(reinterpret_cast<object *>(p.ext_names[i].name), k);
-        match[i] = k == key;
+    for (loaded_pack & p : *g_packs.load(std::memory_order_acquire)) {
+        std::vector<char> match(p.hdr.num_ext_names, 0);
+        for (uint64_t i = 0; i < p.hdr.num_ext_names; i++) {
+            std::string k;
+            ext_name_key(reinterpret_cast<object *>(p.ext_names[i].name), k);
+            match[i] = k == key;
+        }
+        for (uint64_t e = 0; e < p.hdr.num_ext_entries; e++)
+            if (match[p.ext_entries[e].name]) f(reinterpret_cast<object *>(p.ext_entries[e].entries));
     }
-    for (uint64_t e = 0; e < p.hdr.num_ext_entries; e++)
-        if (match[p.ext_entries[e].name]) f(reinterpret_cast<object *>(p.ext_entries[e].entries));
 }
 
-bool first_pack_identity(uint64_t & checksum, uint64_t & base, uint64_t & size) {
+std::vector<pack_range> loaded_pack_ranges() {
     std::call_once(g_packs_once, init_packs);
-    std::vector<loaded_pack> & packs = *g_packs.load(std::memory_order_acquire);
-    if (packs.empty()) return false;
-    checksum = packs[0].hdr.common.checksum;
-    base = packs[0].hdr.base_addr;
-    size = packs[0].hdr.size;
-    return true;
+    std::vector<pack_range> out;
+    for (loaded_pack const & p : *g_packs.load(std::memory_order_acquire))
+        out.push_back(pack_range { p.hdr.common.checksum, p.hdr.base_addr, p.hdr.size });
+    return out;
 }
 
-char const * first_pack_damaged() {
+char const * packs_damaged() {
     std::call_once(g_packs_once, init_packs);
-    std::vector<loaded_pack> & packs = *g_packs.load(std::memory_order_acquire);
-    if (packs.empty()) return nullptr;
-    static char const * why = packs[0].check_all();
+    static char const * why = [] {
+        for (loaded_pack const & p : *g_packs.load(std::memory_order_acquire))
+            if (char const * w = p.check_all()) return w;
+        return static_cast<char const *>(nullptr);
+    }();
     return why;
 }
 
@@ -1190,16 +1520,16 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_stats() {
 
 /*
 OLeanPack.writeCore (chains : @& Array (Array String)) (roots storedRoots : @& Array String) (out : @& String)
-  (baseAddr : USize) (sync : Bool) : IO Nat
+  (baseAddr : USize) (sync bound : Bool) : IO Nat
 
 Each chain lists the parts of one module in loading order; every file must lie below one of
 `roots`, which the pack records as `storedRoots` (see `resolve_root`). Chains with a file that cannot
 be packed (unreadable, or containing closures, whose function pointers are relocated per process)
-are left out. With `sync`, the pack is on the disk before it gets its name. Returns the number of
-packed files.
+are left out. With `sync`, the pack is on the disk before it gets its name; with `bound`, it is read
+only through bindings. Returns the number of packed files.
 */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains, b_obj_arg oroots, b_obj_arg ostored,
-                                                     b_obj_arg oout, size_t base, uint8_t sync) {
+                                                     b_obj_arg oout, size_t base, uint8_t sync, uint8_t bound) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
     std::string out(lean_string_cstr(oout));
     std::string tmp = out + ".tmp." + std::to_string(getpid());
@@ -1390,6 +1720,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 size_t size = pt.st.st_size;
                 if (pread(fds[j]->get(), slot, size, 0) != static_cast<ssize_t>(size))
                     throw exception((sstream() << "failed to read '" << pt.path << "'").str());
+                content_hash content = hash_content_core(slot, size);
                 region_reader reader(pt.data_size, slot + pt.data_off,
                                      reinterpret_cast<char *>(pt.orig_base) + pt.data_off,
                                      deps, {}, {});
@@ -1427,6 +1758,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 e.orig_base = pt.orig_base;
                 e.root = e.region_root = reinterpret_cast<uint64_t>(root);
                 set_file_id(e, pt.st);
+                e.content = content;
                 e.path = add_string(pt.path.substr(roots[pt.root_idx].size() + 1));
                 e.root_idx = pt.root_idx;
                 e.chain = static_cast<uint32_t>(chain_table.size());
@@ -1639,6 +1971,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 throw exception((sstream() << "its index is inconsistent: " << why).str());
         }
         hdr.validated = g_pack_validated;
+        if (bound) hdr.flags |= pack_flag_bound;
         write_at(roots_area.data(), roots_area.size(), roots_area_off);
         write_at(names.data(), names.size(), names_off);
         write_at(index.data(), index.size(), hdr.entries_off);
@@ -1678,7 +2011,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
         return io_result_mk_error((sstream() << "failed to create olean pack '" << out << "': " << ex.what()).str());
     }
 #else
-    (void)ochains; (void)oroots; (void)base; (void)sync;
+    (void)ochains; (void)oroots; (void)base; (void)sync; (void)bound;
     return io_result_mk_error((sstream() << "failed to create olean pack '" << lean_string_cstr(oout)
                                          << "': not supported on this platform").str());
 #endif
@@ -1703,14 +2036,21 @@ loaded_pack * pack_of(uint32_t id, uint32_t & idx) {
     return &packs[pi];
 }
 
+// The path of a packed part, with a search-path alias kept for its CompactedRegion metadata.
+std::string pack_part_path(loaded_pack const & p, pack_entry const & e, char const * read_root = nullptr) {
+    std::string path = read_root ? read_root : p.roots[e.root_idx] + "/";
+    if (read_root && !path.empty() && path.back() != '/') path += '/';
+    path.append(p.begin + p.hdr.strings_off + e.path.off, e.path.len);
+    return path;
+}
+
 // The parts of `chain` as `(ModuleData × CompactedRegion)` pairs, served like `lean_compacted_region_read`.
-obj_res pack_chain_parts(loaded_pack & p, uint32_t chain, size_t count) {
+obj_res pack_chain_parts(loaded_pack & p, uint32_t chain, size_t count, char const * read_root = nullptr) {
     pack_chain const & c = p.chains[chain];
     object * parts = lean_alloc_array(0, count);
     for (uint32_t i = c.first; i < c.first + count; i++) {
         pack_entry const & e = p.entries[i];
-        std::string path = p.roots[e.root_idx] + "/" +
-            std::string(p.begin + p.hdr.strings_off + e.path.off, e.path.len);
+        std::string path = pack_part_path(p, e, read_root);
         object * opath = lean_mk_string_from_bytes(path.data(), path.size());
         object * root = reinterpret_cast<object *>(e.root);
         object * pair = lean_alloc_ctor(0, 2, 0);
@@ -1784,9 +2124,7 @@ bool stat_identity(char const * path, file_identity & id) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
     struct stat st;
     if (stat(path, &st) != 0) return false;
-    pack_entry e;
-    set_file_id(e, st);
-    id = file_identity { e.dev, e.ino, e.size, e.mtime_sec, e.mtime_nsec, e.ctime_sec, e.ctime_nsec };
+    id = identity_of(st);
     return true;
 #else
     (void)path; (void)id;
@@ -1806,7 +2144,9 @@ uint32_t module_file_kind_of(std::string_view path) {
     return num_module_file_kinds;
 }
 
-bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint32_t, file_identity>> & files) {
+content_hash hash_content(void const * data, size_t size) { return hash_content_core(data, size); }
+
+bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint32_t, content_hash>> & files) {
     files.clear();
     uint32_t m = lean_paperlean_pack_module_find(n);
     if (m == g_no_pack_module) return false;
@@ -1826,7 +2166,7 @@ bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint
             pack_entry const & e = p->entries[i];
             uint32_t kind = module_file_kind_of(std::string_view(p->begin + p->hdr.strings_off + e.path.off, e.path.len));
             if (kind == num_module_file_kinds) return false;
-            files.push_back({ kind, file_identity { e.dev, e.ino, e.size, e.mtime_sec, e.mtime_nsec, e.ctime_sec, e.ctime_nsec } });
+            files.push_back({ kind, e.content });
         }
     }
     std::sort(files.begin(), files.end(), [](auto const & a, auto const & b) { return a.first < b.first; });
@@ -1837,9 +2177,10 @@ bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint
 
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
 namespace {
-// A pack's index, read without mapping the pack, for `packStaleness` and `packFreshFiles`.
+// A pack's index, read without mapping the pack (through a binding, if given one), for
+// `packStaleness`, `packFreshFiles` and bindings.
 struct pack_index_file {
-    std::string fname;
+    std::string fname;      // the pack's
     pack_header hdr;
     std::vector<char> index;
     pack_entry const * entries = nullptr;
@@ -1847,18 +2188,35 @@ struct pack_index_file {
     pack_string const * roots = nullptr;
     pack_module const * modules = nullptr;
     char const * strings = nullptr;
-    std::vector<std::string> root_paths;  // resolved
+    std::vector<std::string> root_paths;  // resolved, or the binding's
     std::vector<int> root_fds;
+    std::vector<file_identity> bound;     // the binding's identities
 
     ~pack_index_file() { for (int rfd : root_fds) if (rfd >= 0) close(rfd); }
     bool str_ok(pack_string x) const { return x.off <= hdr.strings_size && x.len <= hdr.strings_size - x.off; }
     std::string str(pack_string x) const { return std::string(strings + x.off, x.len); }
+    file_identity identity(uint64_t i) const { return bound.empty() ? entry_identity(entries[i]) : bound[i]; }
 
-    // Reads the index of the pack `name`; `err` says why it cannot.
-    bool read(std::string const & name, std::string & err) {
+    // Reads the index of the pack `name`, or of the pack that the binding `name` binds; `err` says
+    // why it cannot.
+    bool read(std::string const & name, std::string & err, bool through_binding = true) {
         fname = name;
         file_descriptor fd(open(fname.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
         if (!fd) { err = strerror(errno); return false; }
+        binding b;
+        if (through_binding && is_binding(fd.get())) {
+            if (!read_binding(name, fd.get(), b, err)) return false;
+            if (!read(b.pack, err, false)) { err = "its pack '" + b.pack + "': " + err; return false; }
+            if (hdr.common.checksum != b.pack_checksum || hdr.num_entries != b.ids.size() || hdr.num_roots != b.roots.size()) {
+                err = "it binds another pack than '" + b.pack + "'"; return false;
+            }
+            for (int rfd : root_fds) if (rfd >= 0) close(rfd);
+            root_fds.clear();
+            root_paths = std::move(b.roots);
+            for (std::string const & r : root_paths) root_fds.push_back(open(r.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            bound = std::move(b.ids);
+            return true;
+        }
         struct stat st;
         if (fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode) ||
             pread(fd.get(), &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr))) {
@@ -1912,13 +2270,21 @@ struct pack_index_file {
                 return true;
             memcpy(rel, strings + e.path.off, e.path.len);
             rel[e.path.len] = 0;
-            if (fstatat(root_fds[e.root_idx], rel, &fst, 0) != 0 || !same_file_id(e, fst)) return true;
+            if (fstatat(root_fds[e.root_idx], rel, &fst, 0) != 0 || !(identity(i) == identity_of(fst))) return true;
         }
         return false;
     }
 };
 }
 #endif
+
+/* OLeanPack.useForProcess (packs image : @& String) : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_use_process_packs(b_obj_arg packs, b_obj_arg image) {
+    auto * own = new std::pair<std::string, std::string>(lean_string_cstr(packs), lean_string_cstr(image));
+    std::pair<std::string, std::string> * none = nullptr;
+    if (!g_process_packs.compare_exchange_strong(none, own, std::memory_order_acq_rel)) delete own;
+    return io_result_mk_ok(lean_box(0));
+}
 
 /* packStaleness (pack : @& String) : IO (Nat × Nat)
    For `paperlean status`: the number of modules of the pack whose files changed since packing (so that
@@ -1929,11 +2295,32 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_staleness(b_obj_arg opath) {
     std::string err;
     if (!pf.read(lean_string_cstr(opath), err))
         return io_result_mk_error(err.c_str());
-    size_t stale = 0;
-    for (uint64_t m = 0; m < pf.hdr.num_modules; m++)
-        if (pf.chain_changed(pf.modules[m].olean_chain) || pf.chain_changed(pf.modules[m].ir_chain)) stale++;
+    uint64_t n = pf.hdr.num_modules;
+    std::atomic<size_t> stale{0};
+    auto count = [&](uint64_t from, uint64_t to) {
+        size_t s = 0;
+        for (uint64_t m = from; m < to; m++)
+            if (pf.chain_changed(pf.modules[m].olean_chain) || pf.chain_changed(pf.modules[m].ir_chain)) s++;
+        stale += s;
+    };
+    // (a `stat` per file: two threads take less time, more take more CPU time than they save)
+    unsigned threads = n < 2048 || std::thread::hardware_concurrency() < 2 ? 1 : 2;
+    auto bound = [&](unsigned t) { return n * t / threads; };
+    std::vector<std::thread> workers;
+    unsigned t = 1;
+    for (; t < threads; t++) {
+        try {
+            workers.emplace_back(count, bound(t), bound(t + 1));
+        } catch (std::system_error &) {
+            break;
+        }
+    }
+    // this thread counts the first range and those that no thread took
+    count(0, bound(1));
+    count(bound(t), n);
+    for (std::thread & w : workers) w.join();
     object * r = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(r, 0, lean_usize_to_nat(stale));
+    lean_ctor_set(r, 0, lean_usize_to_nat(stale.load()));
     lean_ctor_set(r, 1, lean_usize_to_nat(pf.hdr.num_modules));
     return io_result_mk_ok(r);
 #else
@@ -1943,13 +2330,23 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_staleness(b_obj_arg opath) {
 }
 
 /* OLeanPack.whyIgnored (pack : @& String) : BaseIO String
-   Why Lean ignores the pack `pack` as a whole, or "" if it does not, from its header and identity. */
+   Why Lean ignores the pack or binding `pack` as a whole, or "" if it does not, from its header and
+   identity (and those of the pack that it binds; a pack read through bindings only is not ignored). */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_why_ignored(b_obj_arg opath) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
     std::string path = lean_string_cstr(opath), err;
     file_descriptor fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
     struct stat st;
     pack_header hdr;
+    if (fd && is_binding(fd.get())) {
+        binding b;
+        if (!read_binding(path, fd.get(), b, err)) return mk_string(err);
+        file_descriptor pfd(open(b.pack.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+        if (!read_pack_header(b.pack, pfd.get(), st, hdr, err)) return mk_string("its pack '" + b.pack + "': " + err);
+        if (hdr.common.checksum != b.pack_checksum || hdr.num_entries != b.ids.size() || hdr.num_roots != b.roots.size())
+            return mk_string("it binds another pack than '" + b.pack + "'");
+        return mk_string("");
+    }
     read_pack_header(path, fd.get(), st, hdr, err);
     return mk_string(err);
 #else
@@ -2104,13 +2501,22 @@ extern "C" LEAN_EXPORT uint32_t lean_paperlean_pack_module_num_edges(uint32_t id
 }
 
 /* packModuleEdgeTarget (m j : UInt32) : UInt32
-   The module imported by edge `j` of `m` if it is in the same pack. */
+   The pack module imported by edge `j` of `m`: `packModuleFind` of its name, which an edge records if
+   the module is in the same pack, and which is looked up once otherwise. */
 extern "C" LEAN_EXPORT uint32_t lean_paperlean_pack_module_edge_target(uint32_t id, uint32_t j) {
     uint32_t idx;
     loaded_pack * p = pack_of(id, idx);
     if (!p || j >= p->modules[idx].num_edges) return g_no_pack_module;
-    pack_edge const & e = p->edges[p->modules[idx].first_edge + j];
-    if (e.target < 0) return g_no_pack_module;
+    uint64_t k = static_cast<uint64_t>(p->modules[idx].first_edge) + j;
+    pack_edge const & e = p->edges[k];
+    if (e.target < 0) {
+        uint32_t t = p->edge_targets[k].load(std::memory_order_acquire);
+        if (t == g_target_unknown) {
+            t = lean_paperlean_pack_module_find(reinterpret_cast<object *>(e.module));
+            p->edge_targets[k].store(t, std::memory_order_release);
+        }
+        return t;
+    }
     uint8_t s = module_status(*g_packs.load(std::memory_order_acquire), id >> 24, static_cast<uint32_t>(e.target));
     if (!(s & module_valid) || !(s & module_here) || !(p->modules[e.target].flags & pack_module_edges))
         return g_no_pack_module;
@@ -2193,19 +2599,30 @@ extern "C" LEAN_EXPORT uint8_t lean_paperlean_pack_module_is_module(uint32_t id)
     return p && (p->modules[idx].flags & pack_module_is_module);
 }
 
-/* packModuleParts (m : UInt32) (ir : Bool) (count : UInt32) :
+/* packModuleParts (m : UInt32) (ir : Bool) (count : UInt32) (readRoot? : @& Option String) :
      BaseIO (Option (Array (ModuleData × CompactedRegion)))
    The first `count` parts of the `.olean` or IR chain of `m` as `readModuleDataParts` reads them, if
    the chain is packed and that long, and not known to have changed: one not checked yet is checked
-   by `packJoin`. */
-extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_module_parts(uint32_t id, uint8_t ir, uint32_t count) {
+   by `packJoin`. With `readRoot?`, each selected alias file must match its entry too, and its spelling
+   is kept in the region's metadata. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_module_parts(uint32_t id, uint8_t ir, uint32_t count,
+                                                               b_obj_arg read_root_opt) {
     scoped_import_timer timer(counter_pack_parts);
     uint32_t idx;
     loaded_pack * p = pack_of(id, idx);
     if (!p) return lean_box(0);
     int32_t chain = ir ? p->modules[idx].ir_chain : p->modules[idx].olean_chain;
     if (chain < 0 || count == 0 || count > p->chains[chain].count || !serve_chain(*p, chain)) return lean_box(0);
-    return mk_option_some(pack_chain_parts(*p, chain, count));
+    char const * read_root = lean_is_scalar(read_root_opt) ? nullptr : lean_string_cstr(lean_ctor_get(read_root_opt, 0));
+    if (read_root) {
+        pack_chain const & c = p->chains[chain];
+        for (uint32_t i = c.first; i < c.first + count; i++) {
+            std::string path = pack_part_path(*p, p->entries[i], read_root);
+            file_identity current;
+            if (!stat_identity(path.c_str(), current) || !(current == p->identity(i))) return lean_box(0);
+        }
+    }
+    return mk_option_some(pack_chain_parts(*p, chain, count, read_root));
 }
 
 // =======================================
@@ -2329,6 +2746,251 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_imported_entries_arrays(b_obj_arg 
     object * r = lean_alloc_array(k, k);
     for (size_t e = 0; e < k; e++) lean_array_cptr(r)[e] = arrays[e];
     return r;
+}
+
+// =======================================
+// Content hashes of files, and bindings
+
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+namespace {
+// `hashFiles` keeps what it found in a record, a side file of kind `hash-record`: per file, its
+// identity and the hash of its contents, so that a file that still has the identity is not read again.
+// A file is hashed between two `stat`s of it that must agree.
+constexpr char g_record_kind[] = "hash-record";
+constexpr uint64_t g_max_record_size = uint64_t(1) << 32;
+struct record_header {
+    side_file_header common;    // `common.checksum`: of this header with the field zero, then the rest
+    uint64_t size, num_files, files_off, strings_off, strings_size;
+};
+struct record_file { pack_string path; file_identity id; content_hash hash; };
+
+typedef std::unordered_map<std::string, std::pair<file_identity, content_hash>> hash_record;
+
+uint64_t record_checksum(record_header hdr, char const * rest, size_t size) {
+    hdr.common.checksum = 0;
+    return side_file_checksum4(rest, size, side_file_checksum(&hdr, sizeof(hdr)));
+}
+
+// The record in `path`; empty if there is none or it cannot be read.
+hash_record read_record(std::string const & path) {
+    hash_record r;
+    file_descriptor fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+    struct stat st;
+    record_header hdr;
+    if (!fd || fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode) ||
+        pread(fd.get(), &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr)) ||
+        check_side_file_header(hdr.common, g_record_kind, sizeof(record_header)) ||
+        hdr.size != static_cast<uint64_t>(st.st_size) || hdr.size > g_max_record_size)
+        return r;
+    std::vector<char> rest(hdr.size - sizeof(hdr));
+    if (pread(fd.get(), rest.data(), rest.size(), sizeof(hdr)) != static_cast<ssize_t>(rest.size()) ||
+        record_checksum(hdr, rest.data(), rest.size()) != hdr.common.checksum ||
+        hdr.files_off != sizeof(hdr) || hdr.num_files > rest.size() / sizeof(record_file) ||
+        hdr.strings_off != sizeof(hdr) + hdr.num_files * sizeof(record_file) || hdr.strings_size != hdr.size - hdr.strings_off)
+        return r;
+    char const * strings = rest.data() + (hdr.strings_off - sizeof(hdr));
+    for (uint64_t i = 0; i < hdr.num_files; i++) {
+        record_file f;
+        memcpy(&f, rest.data() + i * sizeof(f), sizeof(f));
+        if (f.path.off > hdr.strings_size || f.path.len > hdr.strings_size - f.path.off) return hash_record();
+        r[std::string(strings + f.path.off, f.path.len)] = { f.id, f.hash };
+    }
+    return r;
+}
+
+void write_record(std::string const & path, hash_record const & r) {
+    std::vector<record_file> files;
+    std::string strings;
+    for (auto const & e : r) {
+        files.push_back(record_file { pack_string { strings.size(), e.first.size() }, e.second.first, e.second.second });
+        strings += e.first;
+    }
+    record_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    init_side_file_header(hdr.common, g_record_kind, sizeof(record_header));
+    hdr.num_files = files.size();
+    hdr.files_off = sizeof(hdr);
+    hdr.strings_off = sizeof(hdr) + files.size() * sizeof(record_file);
+    hdr.strings_size = strings.size();
+    hdr.size = hdr.strings_off + strings.size();
+    std::string rest(reinterpret_cast<char const *>(files.data()), files.size() * sizeof(record_file));
+    rest += strings;
+    hdr.common.checksum = record_checksum(hdr, rest.data(), rest.size());
+    std::string tmp = path + ".tmp." + std::to_string(getpid());
+    FILE * f = fopen(tmp.c_str(), "wb");
+    bool ok = f && fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr) && fwrite(rest.data(), 1, rest.size(), f) == rest.size();
+    ok = f && fclose(f) == 0 && ok;
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        throw exception((sstream() << "failed to write '" << path << "'").str());
+    }
+}
+
+// The identity and the content hash of the regular file at `path`, read into `buf`; false if it
+// cannot be read or changed meanwhile.
+bool hash_file(std::string const & path, std::vector<char> & buf, file_identity & id, content_hash & h) {
+    file_descriptor fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+    struct stat before, after, at_path;
+    if (!fd || fstat(fd.get(), &before) != 0 || !S_ISREG(before.st_mode)) return false;
+    size_t size = before.st_size;
+    if (buf.size() < size) buf.resize(size);
+    for (size_t got = 0; got < size;) {
+        ssize_t r = pread(fd.get(), buf.data() + got, size - got, got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        got += r;
+    }
+    if (fstat(fd.get(), &after) != 0 || stat(path.c_str(), &at_path) != 0 || !same_stat(before, after) ||
+        !same_stat(before, at_path))
+        return false;
+    id = identity_of(before);
+    h = hash_content_core(buf.data(), size);
+    return true;
+}
+
+std::string hash_hex(content_hash h) {
+    char buf[33];
+    snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(h.lo), static_cast<unsigned long long>(h.hi));
+    return buf;
+}
+
+// Runs `f(i)` for each `i < n` on `jobs` threads (this one among them).
+void parallel_for(size_t n, size_t jobs, std::function<void(size_t)> const & f) {
+    std::atomic<size_t> next{0};
+    auto work = [&]() { for (size_t i; (i = next.fetch_add(1)) < n;) f(i); };
+    std::vector<std::thread> threads;
+    try {
+        for (size_t t = 1; t < jobs && t < n; t++) threads.emplace_back(work);
+    } catch (std::system_error &) {}
+    work();
+    for (std::thread & t : threads) t.join();
+}
+}
+#endif
+
+/* OLeanPack.hashFiles (files scope : @& Array String) (record : @& String) (jobs : USize) :
+     IO (Array (ByteArray × String))
+   The identities (as `fileIdentity`) and content hashes (32 hexadecimal digits) of the regular files
+   `files`, both empty for a file that cannot be read or changed while it was read, on `jobs` threads.
+   A file is read only if the record `record` does not have its identity; then the record has what was
+   found of `files`, and keeps what it had of the other files, except those below a directory of
+   `scope`. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_hash_files(b_obj_arg ofiles, b_obj_arg oscope, b_obj_arg orecord, size_t jobs) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    try {
+        std::string record = lean_string_cstr(orecord);
+        hash_record old = read_record(record);
+        size_t n = lean_array_size(ofiles);
+        std::vector<file_identity> ids(n);
+        std::vector<content_hash> hashes(n);
+        std::vector<char> ok(n, 0);
+        parallel_for(n, std::max<size_t>(jobs, 1), [&](size_t i) {
+            thread_local std::vector<char> buf;
+            std::string path = lean_string_cstr(lean_array_get_core(ofiles, i));
+            struct stat st;
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return;
+            auto it = old.find(path);
+            if (it != old.end() && it->second.first == identity_of(st)) {
+                ids[i] = it->second.first;
+                hashes[i] = it->second.second;
+                ok[i] = 1;
+            } else {
+                ok[i] = hash_file(path, buf, ids[i], hashes[i]);
+            }
+            if (buf.size() > (size_t(64) << 20)) std::vector<char>().swap(buf);
+        });
+        hash_record out;
+        for (auto const & e : old) {
+            bool in_scope = false;
+            for (size_t k = 0; k < lean_array_size(oscope) && !in_scope; k++) {
+                std::string dir = lean_string_cstr(lean_array_get_core(oscope, k));
+                in_scope = e.first.size() > dir.size() && e.first.compare(0, dir.size(), dir) == 0 && e.first[dir.size()] == '/';
+            }
+            if (!in_scope) out.insert(e);
+        }
+        object * r = lean_alloc_array(0, n);
+        for (size_t i = 0; i < n; i++) {
+            std::string path = lean_string_cstr(lean_array_get_core(ofiles, i));
+            object * id = lean_alloc_sarray(1, ok[i] ? sizeof(file_identity) : 0, ok[i] ? sizeof(file_identity) : 0);
+            std::string hex;
+            if (ok[i]) {
+                uint64_t v[7] = { ids[i].dev, ids[i].ino, ids[i].size, static_cast<uint64_t>(ids[i].mtime_sec),
+                                  static_cast<uint64_t>(ids[i].mtime_nsec), static_cast<uint64_t>(ids[i].ctime_sec),
+                                  static_cast<uint64_t>(ids[i].ctime_nsec) };
+                memcpy(lean_sarray_cptr(id), v, sizeof(v));
+                hex = hash_hex(hashes[i]);
+                out[path] = { ids[i], hashes[i] };
+            }
+            object * pair = lean_alloc_ctor(0, 2, 0);
+            lean_ctor_set(pair, 0, id);
+            lean_ctor_set(pair, 1, mk_string(hex));
+            r = lean_array_push(r, pair);
+        }
+        write_record(record, out);
+        return io_result_mk_ok(r);
+    } catch (std::exception & ex) {
+        return io_result_mk_error((sstream() << "hashFiles: " << ex.what()).str());
+    }
+#else
+    (void)ofiles; (void)oscope; (void)orecord; (void)jobs;
+    return io_result_mk_error("hashFiles: not supported on this platform");
+#endif
+}
+
+/* OLeanPack.bind (pack : @& String) (roots storedRoots : @& Array String) (record out : @& String) :
+     IO (Nat × Nat)
+   Writes to `out`, unless it holds that already, the binding of the pack `pack` whose roots are
+   `roots`, which it records as `storedRoots` (`resolve_root`): an entry is bound to the file below its
+   root whose identity and content hash the record `record` has (`hashFiles`), if the file still has
+   that identity and the hash is that of the entry. Returns the number of entries bound and of all
+   entries. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_bind(b_obj_arg opack, b_obj_arg oroots, b_obj_arg ostored,
+                                                         b_obj_arg orecord, b_obj_arg oout) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    try {
+        pack_index_file pf;
+        std::string err;
+        if (!pf.read(lean_string_cstr(opack), err, false))
+            return io_result_mk_error((sstream() << "cannot bind '" << lean_string_cstr(opack) << "': " << err).str());
+        binding b;
+        b.pack = lean_string_cstr(opack);
+        b.pack_checksum = pf.hdr.common.checksum;
+        std::vector<std::string> roots;
+        for (size_t r = 0; r < lean_array_size(oroots); r++) {
+            std::string root = lean_string_cstr(lean_array_get_core(oroots, r));
+            while (root.size() > 1 && root.back() == '/') root.pop_back();
+            roots.push_back(root);
+            b.roots.push_back(r < lean_array_size(ostored) ? lean_string_cstr(lean_array_get_core(ostored, r)) : root);
+        }
+        if (b.roots.size() != pf.hdr.num_roots)
+            return io_result_mk_error((sstream() << "cannot bind '" << b.pack << "': it has " << pf.hdr.num_roots << " roots").str());
+        hash_record record = read_record(lean_string_cstr(orecord));
+        b.ids.assign(pf.hdr.num_entries, g_unbound);
+        std::atomic<size_t> bound{0};
+        parallel_for(pf.hdr.num_entries, 8, [&](size_t i) {
+            pack_entry const & e = pf.entries[i];
+            if (e.root_idx >= roots.size() || !pf.str_ok(e.path)) return;
+            std::string path = roots[e.root_idx] + "/" + pf.str(e.path);
+            auto it = record.find(path);
+            struct stat st;
+            if (it == record.end() || !(it->second.second == e.content) || stat(path.c_str(), &st) != 0 ||
+                !(identity_of(st) == it->second.first))
+                return;
+            b.ids[i] = it->second.first;
+            bound++;
+        });
+        write_binding(b, lean_string_cstr(oout));
+        object * r = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(r, 0, lean_usize_to_nat(bound.load()));
+        lean_ctor_set(r, 1, lean_usize_to_nat(pf.hdr.num_entries));
+        return io_result_mk_ok(r);
+    } catch (std::exception & ex) {
+        return io_result_mk_error(ex.what());
+    }
+#else
+    (void)opack; (void)oroots; (void)ostored; (void)orecord; (void)oout;
+    return io_result_mk_error("bind: packs are not supported on this platform");
+#endif
 }
 
 }

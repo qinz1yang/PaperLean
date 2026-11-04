@@ -17,6 +17,7 @@ import Lake.Build.Target
 import Init.Omega
 import Lake.PaperLean.BuildData
 import Lake.PaperLean.Schedule
+import Lake.PaperLean.SetupIndex
 import Lake.PaperLean.Env
 
 /-! # Module Build Definitions -/
@@ -55,6 +56,8 @@ def PaperLean.recFetchInputNoted (mod : Module) : FetchM (Job ModuleInput) := Jo
   -- cycle that this runs into is left to the walk to report, as without this
   PaperLean.Schedule.noteModule mod imports (·.module?) contents.utf8ByteSize
   if ← PaperLean.accelerated then
+    PaperLean.SetupIndex.note (← getWorkspace) mod header.isModule imports
+      (fun i => (i.toImport, i.module?.isSome))
     for imp in imports do
       if let some m := imp.module? then
         let s ← get
@@ -695,6 +698,36 @@ def mkModuleSetup (mod : Module) (presetup : ModulePreSetup) : FetchM ModuleSetu
     options := presetup.leanOptions
   }
 
+/--
+PaperLean: `mkModuleSetup`, under `paperlean build` with the artifacts of the transitive imports in
+the build's setup index (`Lake.PaperLean.SetupIndex`) if it can have them, listing only those of the
+modules whose artifacts are elsewhere. Its side file is then written here, as such a setup has no
+fallback in the conventional setup file (`Lake.compileLeanModule`).
+-/
+def PaperLean.moduleSetup (mod : Module) (presetup : ModulePreSetup) : FetchM ModuleSetup := do
+  if ← PaperLean.accelerated then
+    if let some (file, i) ← PaperLean.SetupIndex.indexFor (← getWorkspace).dir mod then
+      let moved ← PaperLean.SetupIndex.moved
+      let arts ← if moved.isEmpty then pure {} else
+        (·.filter fun n _ => moved.contains n) <$>
+          fetchTransImportArts presetup.directImports presetup.directImportArts !presetup.isModule
+      let setup : ModuleSetup := {
+        name := mod.name
+        isModule := presetup.isModule
+        package? := mod.pkg.id?
+        imports? := none
+        importArts := arts.insert .anonymous (Lean.PaperLean.SetupIndex.reference file i)
+        dynlibs := presetup.dynlibs.map (·.path)
+        plugins := presetup.plugins.map (·.path)
+        options := presetup.leanOptions
+      }
+      -- (`mod.setupFile.withExtension "paperlean"`)
+      let side := mod.irPath "setup.paperlean"
+      createParentDirs side
+      if ← PaperLean.writeSideFile side (Lean.PaperLean.setupToJsonCompact setup).compress then
+        return setup
+  mkModuleSetup mod presetup
+
 /-- Recursively compute the contents of a `setup.json` for the module. -/
 def Module.recFetchSetup (mod : Module) : FetchM (Job ModuleSetup) := ensureJob do
   withRegisterJob s!"{mod.name}:setup" do
@@ -1024,7 +1057,7 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-  let setup ← mkModuleSetup mod presetup
+  let setup ← PaperLean.moduleSetup mod presetup
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   -- PaperLean: packs modules compiled by this build for later ones (`Lake.PaperLean.BuildData`)
@@ -1171,7 +1204,7 @@ where
 
 /-- PaperLean: `recBuildLean`, the facet's build function, with the order of compiles of the build's
 scheduler and the packs of the modules built. -/
-def Module.recBuildLeanScheduled (mod : Module) : FetchM (Job ModuleOutputArtifacts) := do
+def PaperLean.recBuildLeanScheduled (mod : Module) : FetchM (Job ModuleOutputArtifacts) := do
   /-
   Remark: `withRegisterJob` must register `presetupJob` to display module builds
   in the job monitor. However, it must also include the fetching of the job to
@@ -1205,16 +1238,18 @@ def Module.recBuildLeanScheduled (mod : Module) : FetchM (Job ModuleOutputArtifa
     run presetup
 where
   run presetup : JobM ModuleOutputArtifacts := do
-    let arts ← recBuildLean.fetchCore mod presetup
-    let arts ← recBuildLean.trackOutputsIfEnabled mod arts
-    let arts ← recBuildLean.adjustMTime mod arts
+    let arts ← Module.recBuildLean.fetchCore mod presetup
+    let arts ← Module.recBuildLean.trackOutputsIfEnabled mod arts
+    let arts ← Module.recBuildLean.adjustMTime mod arts
     PaperLean.BuildData.moduleDone mod
+    PaperLean.SetupIndex.noteArtifacts mod presetup.isModule <| #[some arts.olean,
+      arts.oleanServer?, arts.oleanPrivate?, arts.irSig?, arts.ir?].filterMap (·.map (·.path))
     return arts
 
 /-- The `ModuleFacetConfig` for the builtin `leanArtsFacet`. -/
 -- PaperLean: (not inlined: its body refers to PaperLean's code)
 @[noinline] public def Module.leanArtsFacetConfig : ModuleFacetConfig leanArtsFacet :=
-  mkFacetJobConfig recBuildLeanScheduled
+  mkFacetJobConfig PaperLean.recBuildLeanScheduled
 
 @[inline] def Module.fetchOLeanCore
   (facet : String) (f : ModuleOutputArtifacts → Option Artifact) (errMsg : String) (mod : Module)

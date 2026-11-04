@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="356" viewBox="0 0 880 356" font-family="Helvetica, Arial, sans-serif" font-size="13">
-<style>.t{fill:#111111}.m{fill:#6b6b6b}.lean{fill:#e8590c}.pl{fill:#0ca678}.leans{stroke:#e8590c}.pls{stroke:#0ca678}.ref{stroke:#9a9a9a}.ax{stroke:#d0d0d0}.g{stroke:#ececec}.sep{stroke:#c8c8c8}@media (prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.lean{fill:#ff8c42}.pl{fill:#20c997}.leans{stroke:#ff8c42}.pls{stroke:#20c997}.ref{stroke:#6b6b6b}.ax{stroke:#3a3a3a}.g{stroke:#262626}.sep{stroke:#4a4a4a}}</style>
-<rect class="lean" x="290" y="336" width="10" height="10"/><text class="m" x="306" y="345">Lean v4.35.0-rc3</text>
-<rect class="pl" x="452" y="336" width="10" height="10"/><text class="pl" x="468" y="345">PaperLean v0.2.0</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="374.545" viewBox="0 0 880 412" font-family="Helvetica, Arial, sans-serif" font-size="13">
+<style>.t{fill:#111111}.m{fill:#6b6b6b}.lean{fill:#757A77}.pl{fill:#1f6feb}.leans{stroke:#757A77}.pls{stroke:#1f6feb}.ref{stroke:#9a9a9a}.ax{stroke:#d0d0d0}.g{stroke:#ececec}.sep{stroke:#c8c8c8}@media (prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.lean{fill:#A1A8A4}.pl{fill:#4493f8}.leans{stroke:#A1A8A4}.pls{stroke:#4493f8}.ref{stroke:#6b6b6b}.ax{stroke:#3a3a3a}.g{stroke:#262626}.sep{stroke:#4a4a4a}}.caption{fill:#777777}@media (prefers-color-scheme:dark){.caption{fill:#92999f}}</style>
+<text class="lean" x="428" y="345" text-anchor="end">Lean v4.35.0-rc3</text>
+<text class="pl" x="452" y="345">PaperLean v0.2.0</text>
 <line class="g" x1="58.0" y1="268.0" x2="416.0" y2="268.0"/>
 <text class="m" x="52.0" y="272.0" text-anchor="end" font-size="11">0</text>
 <line class="g" x1="58.0" y1="211.0" x2="416.0" y2="211.0"/>
@@ -45,11 +45,13 @@
 <text class="m" x="856.0" y="284" text-anchor="middle" font-size="11">40,000</text>
 <line class="ax" x1="498.0" y1="268.5" x2="856.0" y2="268.5"/>
 <text class="m" x="677.0" y="302" text-anchor="middle">Modules in the library besides Mathlib</text>
-<text class="t" x="677.0" y="26" text-anchor="middle" font-size="14">Whole library on Mathlib: total (h)</text>
+<text class="t" x="677.0" y="26" text-anchor="middle" font-size="14">Whole library: estimated time (h)</text>
 <polyline class="ref" fill="none" stroke-width="1.5" stroke-dasharray="5 4" points="498.0,268.0 856.0,131.8"/>
 <text class="m" x="858.0" y="147.8" text-anchor="end" font-size="11">linear growth</text>
 <polyline class="leans" fill="none" stroke-width="2" points="498.0,268.0 506.9,264.5 515.9,261.0 524.9,257.4 533.8,253.6 542.8,249.8 551.7,245.9 560.6,241.8 569.6,237.7 578.5,233.5 587.5,229.1 596.5,224.7 605.4,220.1 614.4,215.5 623.3,210.7 632.2,205.7 641.2,200.7 650.1,195.5 659.1,190.2 668.0,184.9 677.0,179.4 686.0,173.8 694.9,168.1 703.9,162.2 712.8,156.1 721.8,150.0 730.7,143.7 739.6,137.2 748.6,130.7 757.5,123.9 766.5,117.1 775.5,110.2 784.4,103.0 793.4,95.8 802.3,88.3 811.2,80.7 820.2,73.0 829.1,65.1 838.1,57.1 847.0,48.9 856.0,40.5"/>
 <text class="lean" x="858.0" y="32.5" text-anchor="end" font-size="12">59.9 h</text>
 <polyline class="pls" fill="none" stroke-width="2" points="498.0,268.0 506.9,267.4 515.9,266.7 524.9,266.0 533.8,265.3 542.8,264.5 551.7,263.7 560.6,262.8 569.6,261.9 578.5,261.0 587.5,260.0 596.5,258.8 605.4,257.6 614.4,256.2 623.3,254.8 632.2,253.3 641.2,251.8 650.1,250.2 659.1,248.6 668.0,246.9 677.0,245.1 686.0,243.2 694.9,241.3 703.9,239.3 712.8,237.2 721.8,235.0 730.7,232.8 739.6,230.5 748.6,228.1 757.5,225.7 766.5,223.1 775.5,220.6 784.4,217.9 793.4,215.1 802.3,212.3 811.2,209.4 820.2,206.4 829.1,203.3 838.1,200.2 847.0,196.9 856.0,193.6"/>
 <text class="pl" x="858.0" y="185.6" text-anchor="end" font-size="12">19.6 h</text>
+<text class="caption" x="440" y="378" font-size="12.1" text-anchor="middle">Synthetic library on Mathlib · Lean 4.35.0-rc3 · PaperLean 0.2.0</text>
+<text class="caption" x="440" y="395.6" font-size="12.1" text-anchor="middle">Single-file timings measured · whole-library times estimated from those measurements</text>
 </svg>

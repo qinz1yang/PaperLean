@@ -46,8 +46,9 @@ Released under Apache 2.0 license as described in the file LICENSE.
 /*
 Native libraries of packages: shared libraries compiled from the `.c` files of a package's modules,
 prepared locally, each with a manifest (`.paperlean`, kind `native-lib`) that records the library's
-file identity and, for every module compiled into it, the identities of the module's files
-(`.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir`) the `.c` file was generated with.
+file identity and, for every module compiled into it, the content hashes of the module's files
+(`.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir`) the `.c` file was generated with, so
+that a library serves every workspace whose packs hold these files (`Lake.PaperLean.Cache`).
 `PAPERLEAN_NATIVE_LIBS` is a `:`-separated list of manifests, dependencies first (on Linux and
 macOS).
 
@@ -56,8 +57,8 @@ When `finalizePersistentExtensions` starts, before the interpreter first runs fo
 native code of a library for it, as with `--load-dynlib`, or interprets it as without native
 libraries. It uses a library's code for a module only if
 - an import got the module's data from an olean pack (the data are the root of a packed part of
-  the module) and the files the pack recorded for the module, unchanged since packing, are exactly
-  those of the manifest;
+  the module) and the files the pack holds for the module, unchanged since packing (or binding), are
+  exactly those of the manifest;
 - the module's initializer resolves into that library, so that its symbols are the library's;
 - its native code does nothing that interpreting it would not (`native_differs`): it declares no
   `@[extern]` functions (whose native code would call whatever has their symbols, while the
@@ -107,7 +108,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_load_native_libs(b_obj_arg env, b_
 
 namespace {
 constexpr char g_native_kind[] = "native-lib";
-constexpr uint32_t g_native_format = 5;
+constexpr uint32_t g_native_format = 6;
 constexpr uint64_t g_max_manifest_size = uint64_t(1) << 30;
 // The most modules of each kind that an import tells the summary of a build about.
 constexpr size_t g_max_by_import = 100;
@@ -173,7 +174,7 @@ constexpr uint32_t native_meta_code_enters_meta = 256;
 // A file of a module; the files of a module are in increasing order of kind.
 struct native_part {
     uint32_t kind, unused;      // `module_file_kind`
-    file_identity id;
+    content_hash hash;          // of its contents
 };
 
 uint64_t native_checksum(native_header hdr, char const * body, size_t size) {
@@ -187,7 +188,7 @@ struct native_init {
     std::string module;
     std::string init_name;      // its initializer for all phases (`mkModuleInitializationFunctionName`)
     bool meta_only;             // only the module's `meta` code is used
-    std::vector<std::pair<uint32_t, file_identity>> files;  // `packed_module_files`
+    std::vector<std::pair<uint32_t, content_hash>> files;  // `packed_module_files`
 };
 // The imports of the environment being finalized on this thread (`lean_paperlean_env_imports_id`),
 // the module initializers of these libraries that its finalization may run, if it uses any, and the
@@ -215,7 +216,7 @@ std::atomic<uint64_t> g_finalizations{0};
 struct initialized_module {
     int32_t lib;
     bool meta_only;
-    std::vector<std::pair<uint32_t, file_identity>> files;
+    std::vector<std::pair<uint32_t, content_hash>> files;
     uint64_t serial;
 };
 std::unordered_map<std::string, initialized_module> * g_initialized_modules =
@@ -486,11 +487,11 @@ bool read_manifest(manifest & m, char const *& why) {
 }
 
 // Whether `files`, of `packed_module_files`, are the files of `mm`.
-bool same_files(manifest const & m, native_module const & mm, std::vector<std::pair<uint32_t, file_identity>> const & files) {
+bool same_files(manifest const & m, native_module const & mm, std::vector<std::pair<uint32_t, content_hash>> const & files) {
     if (files.size() != mm.num_parts) return false;
     for (uint32_t j = 0; j < mm.num_parts; j++) {
         native_part const & p = m.parts()[mm.first_part + j];
-        if (files[j].first != p.kind || !(files[j].second == p.id)) return false;
+        if (files[j].first != p.kind || !(files[j].second == p.hash)) return false;
     }
     return true;
 }
@@ -599,7 +600,7 @@ void note_by_import(by_import_notes & notes, object * names, size_t x, char cons
 // from a pack that did not change since has the files of that pack, of which alone the prepared data
 // holds what `paperlean prepare` found (`Lake.PaperLean.keptFindings`).
 char const * unlisted_why(object * names, object * datas, size_t x) {
-    std::vector<std::pair<uint32_t, file_identity>> files;
+    std::vector<std::pair<uint32_t, content_hash>> files;
     bool same = packed_module_files(lean_array_get_core(names, x), lean_array_get_core(datas, x), files);
     return same ? g_left_out : g_no_library;
 }
@@ -668,10 +669,10 @@ bool verify(b_obj_arg env, b_obj_arg opts, char const * list, native_modules & m
     // per module, the manifest that verified it, the flags it records and the module's files
     std::vector<int32_t> verified_by(n, -1);
     std::vector<uint32_t> init_flags(n, 0);
-    std::vector<std::vector<std::pair<uint32_t, file_identity>>> files_of(n);
+    std::vector<std::vector<std::pair<uint32_t, content_hash>>> files_of(n);
     // whether a manifest lists the module, verified or not: its code is then in that library too
     std::vector<bool> listed(n, false);
-    std::vector<std::pair<uint32_t, file_identity>> files;
+    std::vector<std::pair<uint32_t, content_hash>> files;
     for (size_t mi = 0; mi < ms.size(); mi++) {
         manifest & m = ms[mi];
         for (uint32_t i = 0; i < m.hdr.num_modules; i++) {
@@ -979,7 +980,7 @@ void * filter_native_symbol(b_obj_arg env, b_obj_arg fn, void * addr) {
     lean_inc(env); lean_inc(fn);
     uint32 idx = lean_paperlean_const_module_idx(env, fn);
     object * datas = imports_id(env);
-    std::vector<std::pair<uint32_t, file_identity>> files;
+    std::vector<std::pair<uint32_t, content_hash>> files;
     bool same = !im.files.empty() && idx != 0 && idx - 1 < array_size(datas) &&
         packed_module_files(mod.raw(), lean_array_get_core(datas, idx - 1), files) && files == im.files;
     if (!same) {
@@ -1589,9 +1590,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_load_error(b_obj_arg olib) {
 /* writeNativeManifestFiles (out lib : @& String) (deps : @& Array String)
      (modules : @& Array NativeManifestModule) (extSymbols : @& Array String) : IO (Array String)
    Writes the manifest of the native library `lib` of `modules`, each with the `.c` file compiled into
-   `lib`, the paths of its files by kind (`module_file_kind`, empty if it has none) and
-   `ModuleNativeData`; linked against the libraries of the manifests `deps`, whose modules have the
-   `meta` symbols `extSymbols`.
+   `lib`, the content hashes of its files by kind (`module_file_kind`; 32 hexadecimal digits, empty if
+   it has none) and `ModuleNativeData`; linked against the libraries of the manifests `deps`, whose
+   modules have the `meta` symbols `extSymbols`.
    Returns, per module, why it found that its native code is not to be used, if it did. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oout, b_obj_arg olib, b_obj_arg odeps,
                                                                     b_obj_arg omodules, b_obj_arg oext) {
@@ -1641,7 +1642,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oo
         object * p = lean_array_get_core(omodules, i);
         object * n = lean_ctor_get(p, 0);
         char const * cfile = lean_string_cstr(lean_ctor_get(p, 1));
-        object * paths = lean_ctor_get(p, 2);
+        object * hashes = lean_ctor_get(p, 2);
         bool differs = lean_ctor_get_uint8(lean_ctor_get(p, 3), 4 * sizeof(void *));
         native_module m;
         memset(&m, 0, sizeof(m));
@@ -1657,14 +1658,18 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oo
         m.name = add(name(n, true).to_string());
         m.name_hash = lean_name_hash(n);
         m.first_part = static_cast<uint32_t>(parts.size());
-        if (lean_array_size(paths) != num_module_file_kinds) return fail("expected a path per kind of file");
+        if (lean_array_size(hashes) != num_module_file_kinds) return fail("expected a hash per kind of file");
         for (uint32_t kind = 0; kind < num_module_file_kinds; kind++) {
-            char const * path = lean_string_cstr(lean_array_get_core(paths, kind));
-            if (!*path) continue;
+            char const * hex = lean_string_cstr(lean_array_get_core(hashes, kind));
+            if (!*hex) continue;
             native_part part;
             memset(&part, 0, sizeof(part));
             part.kind = kind;
-            if (!stat_identity(path, part.id)) return fail(std::string("cannot read ") + path);
+            unsigned long long lo, hi;
+            int used = 0;
+            if (strlen(hex) != 32 || sscanf(hex, "%16llx%16llx%n", &lo, &hi, &used) != 2 || used != 32)
+                return fail(std::string("not a content hash: ") + hex);
+            part.hash = content_hash { lo, hi };
             parts.push_back(part);
         }
         m.num_parts = static_cast<uint32_t>(parts.size()) - m.first_part;

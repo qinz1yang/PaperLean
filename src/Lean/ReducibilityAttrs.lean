@@ -76,16 +76,27 @@ builtin_initialize reducibilityExtraExt : SimpleScopedEnvExtension (Name × Redu
     finalizeImport := fun d => d.switch
   }
 
-def getReducibilityStatusCore (env : Environment) (declName : Name) : ReducibilityStatus :=
+-- PaperLean: keep the native lookup cache out of compiled importers.
+@[noinline] def getReducibilityStatusCore (env : Environment) (declName : Name) : ReducibilityStatus :=
   let m := reducibilityExtraExt.getState env
   if let some status := m.find? declName then
     status
-  else match env.getModuleIdxFor? declName with
-  | some modIdx =>
-    match (reducibilityCoreExt.getModuleEntries env modIdx).binSearch (declName, .semireducible) (fun a b => Name.quickLt a.1 b.1) with
-    | some (_, status) => status
-    | none => .semireducible
-  | none => (reducibilityCoreExt.getState (asyncDecl := declName) env).find? declName |>.getD .semireducible
+  else
+    -- PaperLean: (for an imported name, the status through this thread's cache of lookups; not
+    -- shared by a closure, which would change the order of the specializations)
+    let imported? := (PaperLean.nativePath env).select
+      (PaperLean.cachedLookup 1 env.importedModuleIdxs (reducibilityCoreExt.getImportedEntries env) declName
+        fun _ => env.getModuleIdxFor? declName |>.map fun modIdx =>
+          match (reducibilityCoreExt.getModuleEntries env modIdx).binSearch (declName, .semireducible) (fun a b => Name.quickLt a.1 b.1) with
+          | some (_, status) => status
+          | none => .semireducible)
+      (env.getModuleIdxFor? declName |>.map fun modIdx =>
+        match (reducibilityCoreExt.getModuleEntries env modIdx).binSearch (declName, .semireducible) (fun a b => Name.quickLt a.1 b.1) with
+        | some (_, status) => status
+        | none => .semireducible)
+    match imported? with
+    | some status => status
+    | none => (reducibilityCoreExt.getState (asyncDecl := declName) env).find? declName |>.getD .semireducible
 
 private def setReducibilityStatusCore (env : Environment) (declName : Name) (status : ReducibilityStatus) (attrKind : AttributeKind) (currNamespace : Name) : Environment :=
   if attrKind matches .global then

@@ -4,7 +4,9 @@
 # Tests `Meta.isProofQuick` (`Lean.Meta.InferType`), which decides on the type of a constant with
 # its universe parameters where that decides it for every instantiation: its answers for every
 # constant of `Init`, with parameters, zeros and ones as levels and applied to several numbers of
-# arguments, are official Lean's (the expected digest is official Lean 4.35.0-rc3's).
+# arguments, are official Lean's (the expected digest is official Lean 4.35.0-rc3's). And that an
+# instance of a class in `Type (max u v)`, a level that is never zero, is decided so (without the entry
+# of the cache of `instantiateTypeLevelParams` for it that Lean's path adds).
 
 cat > "$TMP_DIR/ProofQuick.lean" <<'EOF2'
 import Lean
@@ -41,3 +43,23 @@ cd "$TMP_DIR"
 lean ProofQuick.lean > proof_quick.out 2>&1 || fail "ProofQuick.lean failed: $(cat proof_quick.out)"
 echo "65972 constants, false/true/undef [138612, 622771, 228197], digest 8027908856257154066" |
   $DIFF -- - proof_quick.out || fail "isProofQuick answers otherwise than Lean"
+cat > NeverZero.lean <<'EOF2'
+import Lean
+open Lean Meta
+
+/-! `isProofQuick` of an instance of a class in `Type (max u v)`, and whether it instantiated the
+instance's universe parameters. -/
+
+universe u v
+class Two (α : Type u) (β : Type v) : Type (max u v) where
+instance instTwo {α : Type u} {β : Type v} : Two α β := ⟨⟩
+
+run_meta do
+  modifyThe Core.State fun s => { s with cache := {} }
+  let r ← isProofQuick (mkApp2 (.const ``instTwo [.zero, .zero]) (mkConst ``Nat) (mkConst ``Nat))
+  let r := match r with | .false => "false" | .true => "true" | .undef => "undef"
+  logInfo m!"{r}, instantiated: {(← getThe Core.State).cache.instLevelType.contains ``instTwo}"
+EOF2
+lean NeverZero.lean > never_zero.out 2>&1 || fail "NeverZero.lean failed: $(cat never_zero.out)"
+grep -q "false, instantiated: false$" never_zero.out ||
+  fail "a level that is never zero was not decided without instantiating: $(cat never_zero.out)"

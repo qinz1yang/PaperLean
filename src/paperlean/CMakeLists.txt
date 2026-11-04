@@ -31,7 +31,10 @@ add_library(
   import_state.cpp
   inst_lparams.cpp
   interp_cache.cpp
+  lookup_cache.cpp
+  mvars_probe.cpp
   native_libs.cpp
+  replace.cpp
   speculation.cpp
   system.cpp
 )

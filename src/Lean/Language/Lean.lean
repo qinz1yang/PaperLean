@@ -387,9 +387,12 @@ General notes:
   delayed by threadpool starvation. We track whether we are still on the fast-forwarding path using
   the `sync` parameter on `parseCmd` and spawn an elaboration task when we leave it.
 -/
-partial def process
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] partial def process
     (setupImports : HeaderSyntax → ProcessingT IO (Except HeaderProcessedSnapshot SetupImportsResult))
     (old? : Option InitialSnapshot) : ProcessingM InitialSnapshot := do
+  -- PaperLean: one frontend of a process reuses results (`Lean.PaperLean.Speculation`)
+  PaperLean.Speculation.noteFrontend (← read).fileName
   parseHeader old? |>.run (old?.map (·.ictx))
 where
   parseHeader (old? : Option HeaderParsedSnapshot) : LeanProcessingM HeaderParsedSnapshot := do
@@ -794,10 +797,13 @@ where
 /--
 Convenience function for tool uses of the language processor that skips header handling.
 -/
-def processCommands (inputCtx : Parser.InputContext) (parserState : Parser.ModuleParserState)
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def processCommands (inputCtx : Parser.InputContext) (parserState : Parser.ModuleParserState)
     (commandState : Command.State)
     (old? : Option (Parser.InputContext × CommandParsedSnapshot) := none) :
     BaseIO (Task CommandParsedSnapshot) := do
+  -- PaperLean: one frontend of a process reuses results (`Lean.PaperLean.Speculation`)
+  PaperLean.Speculation.noteFrontend inputCtx.fileName
   let prom ← IO.Promise.new
   let cancelTk ← IO.CancelToken.new
   process.parseCmd (old?.map (·.2)) parserState commandState prom (sync := true) cancelTk #[]

@@ -44,6 +44,10 @@ opaque processAlive (pid : UInt32) : BaseIO Bool
 @[extern "lean_paperlean_num_cpus"]
 opaque numCPUs : BaseIO Nat
 
+/-- The seconds since the epoch, as file times count them. -/
+@[extern "lean_paperlean_wall_seconds"]
+opaque wallSeconds : BaseIO Nat
+
 /-- The bytes of physical memory, `0` if unknown. -/
 @[extern "lean_paperlean_total_memory"]
 opaque totalMemory : BaseIO Nat

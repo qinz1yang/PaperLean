@@ -807,12 +807,18 @@ public structure EvalVerdicts where
   /-- The modules that are pure as long as their files have these identities (`moduleIdentities`).
   One that neither has is not known to be pure. -/
   certified : Std.HashMap System.FilePath (Array String) := {}
+  /-- The modules that cannot be imported, which the others import, by name, with the reason (to
+  follow the name). -/
+  missing : Array (String × String) := #[]
 
 /-- `v` with what a line of `EvalLog` says. -/
 public def EvalVerdicts.add (v : EvalVerdicts) (line : String) : EvalVerdicts :=
   match line.splitOn "\t" with
   | "ok" :: f :: ids => { v with certified := v.certified.insert (f : System.FilePath) ids.toArray }
   | "impure" :: f :: why => { v with impure := v.impure.push ((f : System.FilePath), "\t".intercalate why) }
+  | "missing" :: m :: why =>
+    -- (each process that `evalImpurities` runs tells them)
+    if v.missing.any (·.1 == m) then v else { v with missing := v.missing.push (m, "\t".intercalate why) }
   | _ => v
 
 /-- Tells that the module of `file`, which was read with the identities `ids`, is pure, unless the
@@ -824,20 +830,29 @@ private def certify (log : EvalLog) (file : System.FilePath) (ids : Array String
     log s!"impure\t{file}\tits files changed while it was analysed"
 
 /-- Evaluates the constants `constants` of each module, in one environment if they can be imported
-together, in the order of their imports, as a module's constants evaluate those that they use. -/
+together, in the order of their imports, as a module's constants evaluate those that they use. Modules
+that cannot be imported together are split in halves while `failures`, the number of imports that may
+still fail, lasts; then they are impure. -/
 private unsafe def evalConstants (modules : Array (Name × System.FilePath × Array Name × Array String))
-    (log : EvalLog) : IO Unit := do
+    (log : EvalLog) (failures : IO.Ref Nat) : IO Unit := do
   enableInitializersExecution
+  log s!"import\t{modules.size}"
   match ← (importModules (modules.map fun (m, _) => { module := m }) {} (leakEnv := true) (loadExts := true)).toBaseIO with
   | .error e =>
-    if modules.size ≤ 1 then
+    log s!"import-failed\t{modules.size}"
+    let left ← failures.modifyGet fun n => (n, n - 1)
+    if modules.size ≤ 1 || left == 0 then
+      let e := (toString e).replace "\n" " "
+      let why := if modules.size ≤ 1 then s!"it cannot be imported: {e}" else
+        s!"it cannot be imported with {modules.size - 1} other modules ({e}), and too many imports \
+          failed to tell whether it can be alone"
       for (_, f, _) in modules do
-        log s!"impure\t{f}\tit cannot be imported: {(toString e).replace "\n" " "}"
+        log s!"impure\t{f}\t{why}"
       return
     -- (modules that are never imported together can define the same declarations)
     let half := modules.size / 2
-    evalConstants modules[:half] log
-    evalConstants modules[half:] log
+    evalConstants modules[:half] log failures
+    evalConstants modules[half:] log failures
   | .ok env =>
     let order : Std.HashMap Name Nat := env.header.moduleNames.foldl (init := {}) fun m n => m.insert n m.size
     let sorted := modules.qsort fun a b => (order[a.1]?.getD 0) < (order[b.1]?.getD 0)
@@ -870,7 +885,7 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
   let mut loaded : Array EvalModule := #[]
   let mut seen : Std.HashSet Name := modules.foldl (fun s m => s.insert m.1) {}
   let mut seenFiles : Std.HashSet System.FilePath := modules.foldl (fun s m => s.insert m.2) {}
-  let mut frontier := modules.map (·.2)
+  let mut frontier := modules
   -- (the code of a primitive of Lean's can be in a module that the packages do not import)
   for m in [`Init, `Std, `Lean] do
     unless seen.contains m do
@@ -878,22 +893,54 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
       if let some f ← sp.findWithExt "olean" m then
         unless seenFiles.contains f do
           seenFiles := seenFiles.insert f
-          frontier := frontier.push f
+          frontier := frontier.push (m, f)
+  -- the modules that cannot be imported, as their `.olean` file is missing or cannot be read, with
+  -- why, and the imports of those that were read
+  let mut broken : Std.HashMap Name String := {}
+  let mut importsOf : Array (Name × Array Name) := #[]
   while !frontier.isEmpty do
-    let tasks ← frontier.mapM fun f => IO.asTask (readEvalModule f (!isOwn f))
-    let mut next : Array System.FilePath := #[]
-    for t in tasks do
-      -- (a file that cannot be read has no code, which the constants that run it are told by)
-      let .ok m := t.get | continue
-      loaded := loaded.push m
-      for i in m.imports do
-        unless seen.contains i do
-          seen := seen.insert i
-          if let some f ← sp.findWithExt "olean" i then
-            unless seenFiles.contains f do
-              seenFiles := seenFiles.insert f
-              next := next.push f
+    let tasks ← frontier.mapM fun (_, f) => IO.asTask (readEvalModule f (!isOwn f))
+    let mut next : Array (Name × System.FilePath) := #[]
+    for (n, f) in frontier, t in tasks do
+      match t.get with
+      | .error _ =>
+        -- (a file that cannot be read has no code, which the constants that run it are told by)
+        broken := broken.insert n <| if ← f.pathExists then "has an .olean file that cannot be read"
+          else "is not built (its .olean file does not exist)"
+      | .ok m =>
+        loaded := loaded.push m
+        importsOf := importsOf.push (n, m.imports)
+        for i in m.imports do
+          unless seen.contains i do
+            seen := seen.insert i
+            match ← sp.findWithExt "olean" i with
+            | some f =>
+              unless seenFiles.contains f do
+                seenFiles := seenFiles.insert f
+                next := next.push (i, f)
+            | none => broken := broken.insert i "is not built (its .olean file does not exist)"
     frontier := next
+  -- Of each module that imports one of `broken` directly or not, one of them: it cannot be imported
+  -- either, and evaluating its constants would try in vain.
+  let mut cause : Std.HashMap Name Name := {}
+  if !broken.isEmpty then
+    let mut importers : Std.HashMap Name (Array Name) := {}
+    for (n, imports) in importsOf do
+      for i in imports do
+        importers := if importers.contains i then importers.modify i (·.push n) else importers.insert i #[n]
+    let mut todo : Array Name := #[]
+    for (b, why) in broken do
+      log s!"missing\t{b}\t{why}"
+      cause := cause.insert b b
+      todo := todo.push b
+    while h : todo.size > 0 do
+      let b := todo[todo.size - 1]
+      todo := todo.pop
+      let c := cause.getD b b
+      for n in importers.getD b #[] do
+        unless cause.contains n do
+          cause := cause.insert n c
+          todo := todo.push n
   let mut decls : Std.HashMap Name (IR.Decl × Bool) := Std.HashMap.emptyWithCapacity (loaded.foldl (· + ·.decls.size) 0)
   let mut inits : Std.HashSet Name := {}
   let mut initFns : Std.HashMap Name Name := {}
@@ -932,14 +979,19 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
   let names : Std.HashMap System.FilePath Name := modules.foldl (fun m (n, f) => m.insert f n) {}
   let mut effects : Std.HashMap Name DeclEffects := {}
   -- (one that was not read has not been decided)
+  let loadedFiles : Std.HashSet System.FilePath := loaded.foldl (·.insert ·.file) {}
   for (_, f) in modules do
-    unless decided.contains f || loaded.any (·.file == f) do
+    unless decided.contains f || loadedFiles.contains f do
       log s!"impure\t{f}\tit cannot be read"
   let mut toEvaluate : Array (Name × System.FilePath × Array Name × Array String) := #[]
   let mut constants := 0
   for m in loaded do
     let some name := names[m.file]? | continue
     if decided.contains m.file then continue
+    if let some c := cause[name]? then
+      let why := broken.getD c ""
+      log s!"impure\t{m.file}\t{if c == name then s!"it {why}" else s!"it imports {c}, which {why}"}"
+      continue
     let mut why? : Option String := none
     let mut closed : Array Name := #[]
     for d in m.decls do
@@ -959,7 +1011,11 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
       toEvaluate := toEvaluate.push (name, m.file, closed, m.identities)
       constants := constants + closed.size
   log s!"static\t{loaded.size}\t{constants}\t{s.clashes.size}"
-  evalConstants toEvaluate log
+  -- (a module that cannot be imported with the others takes some halvings to find;
+  -- `PAPERLEAN_EVAL_FAILED_IMPORTS` replaces how many imports may fail, for tests)
+  let failures ← IO.mkRef <| ((← IO.getEnv "PAPERLEAN_EVAL_FAILED_IMPORTS").bind String.toNat?).getD
+    (2 * Nat.log2 (toEvaluate.size + 1) + 16)
+  evalConstants toEvaluate log failures
 
 /-- `evalImpuritiesCore`, which `log` is told the verdicts of. -/
 @[implemented_by evalImpuritiesCore]
@@ -1037,10 +1093,10 @@ public structure NativeManifestModule where
   name : Name
   /-- The `.c` file compiled into the library. -/
   cFile : String
-  /-- The paths of its files, which must be those the `.c` file was generated with, in the order
-  `.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir` (empty for a file the module does not
-  have). -/
-  files : Array String
+  /-- The content hashes (`OLeanPack.hashFiles`) of its files, which must be those the `.c` file was
+  generated with, in the order `.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir` (empty for
+  a file the module does not have). -/
+  hashes : Array String
   /-- `moduleNativeData` of its `.olean` parts. -/
   data : ModuleNativeData
 

@@ -290,7 +290,7 @@ check_out_contains "read from disk: 0"
 edit ext_name '
   my ($entries, $n, $strings, $parts, $exts, $base) = (u64($h, 176), u64($h, 184), u64($h, 224), u64($h, 272), u64($h, 280), u64($h, 160));
   ENTRY: for my $i (0 .. $n - 1) {
-    my $e = rd($entries + 120 * $i, 120);
+    my $e = rd($entries + 136 * $i, 136);
     next unless rd($strings + u64($e, 80), u64($e, 88)) =~ /\.olean$/;
     my $p = rd($parts + 72 * $i, 72);
     my ($num, $first) = (u32($p, 44), u32($p, 48));

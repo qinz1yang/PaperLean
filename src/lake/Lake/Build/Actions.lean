@@ -56,10 +56,12 @@ namespace Lake
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
   -- PaperLean: under `paperlean build`, compact in a side file, which saves writing and reading it,
-  -- unless that file cannot be written
+  -- unless that file cannot be written; that of a setup that refers to the build's setup index is
+  -- written with it (`Lake.PaperLean.moduleSetup`)
   let side := setupFile.withExtension "paperlean"
   let compact ← if ← PaperLean.accelerated then
-      PaperLean.writeSideFile side (PaperLean.setupToJsonCompact setup).compress
+      if PaperLean.SetupIndex.refersToIndex setup then pure true
+      else PaperLean.writeSideFile side (PaperLean.setupToJsonCompact setup).compress
     else pure false
   let setupPath := if compact then side else setupFile
   unless compact do

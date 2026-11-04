@@ -470,6 +470,7 @@ and of one without parameters (or metavariables), nothing changes. -/
 
 private def isAlwaysZeroRaw (u : Level) : Option LBool :=
   if isAlwaysZero u then some .true
+  else if u.isNeverZero then some .false
   else if u.hasParam || u.hasMVar then none
   else some .false
 

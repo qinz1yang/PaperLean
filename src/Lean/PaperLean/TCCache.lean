@@ -73,7 +73,8 @@ of the permanent cache of `isDefEq` mention a binder name with macro scopes of t
 differ from command to command) is reused only for the same names. A search whose problem holds
 syntax in metadata is not kept, as a key does not compare its positions. What is kept is worked out
 when a later problem first has the key of the search (`finished`), as about half of the searches
-never see theirs again.
+never see theirs again. A search of fewer heartbeats than `minHeartbeats` is not kept, as its reuse
+would cost about as much, and the next search with its key runs as Lean's, without being recorded.
 
 Only the threads that elaborate commands in order use the cache (`Speculation.onElabThread`; not the
 tasks that they start, e.g. of linters, nor the elaboration of declarations in the background), and
@@ -245,20 +246,13 @@ private unsafe def keyExprs (c : UInt8) (k : NonScalar) : Array Expr :=
     let k : SynthInstanceCacheKey := unsafeCast k
     k.localInsts.map (·.fvar) |>.push k.type
 
-/-- The key `k` of cache `c` with `f` applied to its expressions. -/
-private unsafe def mapKey (c : UInt8) (f : Expr → Expr) (k : NonScalar) : NonScalar :=
-  if (keyExprs c k).all fun e => !e.hasFVar then k
-  else if c == 0 || c == 3 then
-    let k : ExprConfigCacheKey := unsafeCast k
-    unsafeCast ({ k with expr := f k.expr } : ExprConfigCacheKey)
-  else if c == 1 then
-    let k : InfoCacheKey := unsafeCast k
-    unsafeCast ({ k with expr := f k.expr } : InfoCacheKey)
+/-- Whether an expression of a key of cache `c` satisfies `p` (`keyExprs`). -/
+@[inline] private unsafe def keyAny (c : UInt8) (k : NonScalar) (p : Expr → Bool) : Bool :=
+  if c == 0 || c == 3 then p (unsafeCast k : ExprConfigCacheKey).expr
+  else if c == 1 then p (unsafeCast k : InfoCacheKey).expr
   else
     let k : SynthInstanceCacheKey := unsafeCast k
-    unsafeCast ({ k with
-      localInsts := k.localInsts.map fun li => { li with fvar := f li.fvar }
-      type := f k.type } : SynthInstanceCacheKey)
+    k.localInsts.any (p ·.fvar) || p k.type
 
 /-- The expressions of a value of cache `c`. -/
 private unsafe def valueExprs (c : UInt8) (v : NonScalar) : Array Expr :=
@@ -268,12 +262,60 @@ private unsafe def valueExprs (c : UInt8) (v : NonScalar) : Array Expr :=
     | some r => r.mvars.push r.expr
     | none => #[]
 
+/-- Whether an expression of a value of cache `c` satisfies `p` (`valueExprs`). -/
+@[inline] private unsafe def valueAny (c : UInt8) (v : NonScalar) (p : Expr → Bool) : Bool :=
+  if c == 0 || c == 3 then p (unsafeCast v)
+  else if c == 1 then false
+  else match (unsafeCast v : Option AbstractMVarsResult) with
+    | some r => r.mvars.any p || p r.expr
+    | none => false
+
 /-- The value `v` of cache `c` with `f` applied to its expressions. -/
 private unsafe def mapValue (c : UInt8) (f : Expr → Expr) (v : NonScalar) : NonScalar :=
-  if (valueExprs c v).all fun e => !e.hasFVar then v
+  if !valueAny c v (·.hasFVar) then v
   else if c == 0 || c == 3 then unsafeCast (f (unsafeCast v))
   else unsafeCast ((unsafeCast v : Option AbstractMVarsResult).map fun r =>
     { r with mvars := r.mvars.map f, expr := f r.expr })
+
+/-- Results of mapping expression roots within one fixed free-variable renaming. The pointer map
+retains the input as its key, preventing address reuse. Never shared across calls. -/
+private unsafe abbrev ExprRemapMemo := PtrMap Expr Expr
+
+/-- The existing pure renaming `f`, memoized for roots shared by operations of one phase. Closed
+roots need no renaming and do not enter the memo. The traversal also memoizes shared subterms. -/
+private unsafe def remapExpr (f : Expr → Expr) (e : Expr) : StateM ExprRemapMemo Expr := do
+  if !e.hasFVar then return e
+  if let some result := PtrMap.find? (← get) e then return result
+  let result := f e
+  modify fun memo => PtrMap.insert memo e result
+  return result
+
+/-- The key `k` of cache `c` with `f` applied to its expressions, through the phase's root memo. -/
+private unsafe def mapKeyMemo (c : UInt8) (f : Expr → Expr) (k : NonScalar) :
+    StateM ExprRemapMemo NonScalar := do
+  if !keyAny c k (·.hasFVar) then return k
+  if c == 0 || c == 3 then
+    let k : ExprConfigCacheKey := unsafeCast k
+    return unsafeCast ({ k with expr := ← remapExpr f k.expr } : ExprConfigCacheKey)
+  else if c == 1 then
+    let k : InfoCacheKey := unsafeCast k
+    return unsafeCast ({ k with expr := ← remapExpr f k.expr } : InfoCacheKey)
+  else
+    let k : SynthInstanceCacheKey := unsafeCast k
+    return unsafeCast ({ k with
+      localInsts := ← k.localInsts.mapM fun li => return { li with fvar := ← remapExpr f li.fvar }
+      type := ← remapExpr f k.type } : SynthInstanceCacheKey)
+
+/-- `mapValue` with the same phase-local root memo. -/
+private unsafe def mapValueMemo (c : UInt8) (f : Expr → Expr) (v : NonScalar) :
+    StateM ExprRemapMemo NonScalar := do
+  if !valueAny c v (·.hasFVar) then return v
+  if c == 0 || c == 3 then return unsafeCast (← remapExpr f (unsafeCast v))
+  else
+    let r? : Option AbstractMVarsResult := unsafeCast v
+    let r? ← r?.mapM fun r => do
+      return { r with mvars := ← r.mvars.mapM (remapExpr f), expr := ← remapExpr f r.expr }
+    return unsafeCast r?
 
 private unsafe def findIn (c : UInt8) (cache : Meta.Cache) (k : NonScalar) : Option NonScalar :=
   if c == 0 then unsafeCast (cache.inferType.find? (unsafeCast k))
@@ -384,6 +426,9 @@ structure Entry where
   names : Nat
   /-- The search's operations on Lean's caches that a reuse checks or repeats, in order. -/
   ops : Array CacheOp
+  /-- Whether replay can need to fill a missing `funInfo` entry. Computed once from `ops`, so an
+  unrecorded replay without fills or an oracle need not build an unused trace of its operations. -/
+  mayFill : Bool
   /-- For a search that found nothing, what a reuse repeats on the caches of `isDefEq`. -/
   defEq : DefEqEffect
   /-- Whether the result, the keys and values in `ops` and the keys in `defEq.perm` mention no binder
@@ -411,10 +456,46 @@ structure Pending where
 inductive Stored where
   | pending (p : Pending)
   | entry (e : Entry)
+  /-- The last search of the key cost fewer heartbeats than `minHeartbeats`: the next one is not
+  recorded. -/
+  | cheap
 
--- (the value of a global reference is multi-threaded, hence never exclusive: an insertion copies
--- what it changes, which in a `PersistentHashMap` is one path, not the whole map)
-private builtin_initialize entriesRef : IO.Ref (PersistentHashMap Key (Array Stored)) ← IO.mkRef {}
+/-- What is kept of the searches, by problem. -/
+private abbrev Entries := PersistentHashMap Key (Array Stored)
+
+/-- The entries (`empty` if none were put yet), out of the native store where they are kept
+(`speculation.cpp`), which leaves it taken; none if it is taken, which turns reuse off. Unlike the
+value of a global reference, which is marked multi-threaded, the entries and the objects that they
+share with Lean's caches and terms are not, nor is the map, which an insertion then changes in place:
+one thread at a time uses them (`getEntries?`). -/
+@[extern "lean_paperlean_take_store"]
+private opaque takeEntries (slot : UInt8) (empty : Entries) : BaseIO (Option Entries)
+
+/-- Puts `m` into the native store of the entries, which `takeEntries` left taken. -/
+@[extern "lean_paperlean_put_store"]
+private opaque putEntries (slot : UInt8) (m : Entries) : BaseIO Unit
+
+/-- The entries, which stay in the store while the caller uses them; none if it is taken.
+
+One thread at a time uses the stores of reuse (also `SectionVars.takeEntries`) and their objects,
+which are not marked multi-threaded, so a use needs to hold no store. Only threads on which
+`Speculation.onElabThread` holds use them: in `doElab` of `Language.Lean.process`, for the one
+frontend of the process that reuses, the first, of the command-line `lean`; any other frontend turns
+reuse off before it elaborates (`Speculation.noteFrontend`). That frontend elaborates its commands
+one after another, each once the one before has returned, in the same task or one chained after it.
+The tasks that a command starts run on other threads, not marked as ones of reuse; a thread that
+waits for a task does not run another one; what a thread hands to another (a task's closure, a
+promise's value, a reference's value) is marked multi-threaded first, by that thread. The take and
+the put of the store also see a second thread at once, which would be a defect, and turn reuse
+off. -/
+private def getEntries? : BaseIO (Option Entries) := do
+  let some m ← takeEntries 0 {} | return none
+  putEntries 0 m
+  return some m
+
+private def modifyEntries (f : Entries → Entries) : BaseIO Unit := do
+  if let some m ← takeEntries 0 {} then
+    putEntries 0 (f m)
 
 /-- Reused, searched (cache missed), and searched because an entry's dependencies did not hold. -/
 private builtin_initialize statsRef : IO.Ref (Nat × Nat × Nat) ← IO.mkRef (0, 0, 0)
@@ -446,6 +527,12 @@ private def noteReason (why : String) : MetaM Unit := do
   Speculation.noteExclusion kind fun _ => posOf fileMap ref
 
 private def maxEntriesPerKey := 4
+
+/-- The fewest heartbeats of a search that is kept (`PAPERLEAN_REUSE_MIN_HEARTBEATS` sets another, for
+testing). A reuse (its lookup, checks and replay) costs about what a search of this many heartbeats
+does, and recording a search slows it down by about a fifth. -/
+private builtin_initialize minHeartbeats : Nat ← do
+  return ((← IO.getEnv "PAPERLEAN_REUSE_MIN_HEARTBEATS").bind String.toNat?).getD 1024
 
 /-- The `i`-th free variable of a problem, in `Key` and `Entry`. -/
 private def canonFVar (i : Nat) : Expr :=
@@ -555,6 +642,43 @@ Lean's. -/
 private def maxDecls := 24
 private def maxContext := 64
 
+/-- The free variables that `key?` finds, in the order found: `collectFVars`, but for the terms
+visited, which are told apart by their addresses (comparing two equal terms costs about as much as
+visiting one again, which finds no other free variable), and the free variables visited, by their
+identifiers, which finds the same variables in the same order. -/
+private structure Found where
+  fvarSet : FVarIdSet := {}
+  fvarIds : Array FVarId := #[]
+  visited : Std.HashSet USize := {}
+  visitedFVars : Std.HashSet FVarId := {}
+
+private local instance : Inhabited Found := ⟨{}⟩
+
+private def Found.add (s : Found) (id : FVarId) : Found :=
+  { s with fvarSet := s.fvarSet.insert id, fvarIds := s.fvarIds.push id }
+
+mutual
+/-- `CollectFVars.visit`. -/
+private unsafe def Found.visit (e : Expr) (s : Found) : Found :=
+  if !e.hasFVar then s else
+  match e with
+  | .fvar id =>
+    if s.visitedFVars.contains id then s else { s.add id with visitedFVars := s.visitedFVars.insert id }
+  | _ =>
+    let p := ptrAddrUnsafe e
+    if s.visited.contains p then s else Found.main e { s with visited := s.visited.insert p }
+
+/-- `CollectFVars.main`, of `collectFVars`. -/
+private unsafe def Found.main : Expr → Found → Found
+  | .proj _ _ e, s => Found.visit e s
+  | .forallE _ d b _, s | .lam _ d b _, s => Found.visit b (Found.visit d s)
+  | .letE _ t v b _, s => Found.visit b (Found.visit v (Found.visit t s))
+  | .app f a, s => Found.visit a (Found.visit f s)
+  | .mdata _ b, s => Found.visit b s
+  | .fvar id, s => s.add id
+  | _, s => s
+end
+
 /-- The problem `type` with local instances `localInsts` as a `Key`, and the free variables in the
 order of their numbers, unless the problem has metavariables, the context it reaches has unassigned
 ones (or ones that `canonRaw` does not number), or that context is large (`maxDecls`,
@@ -567,14 +691,11 @@ private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Na
   if lctx.contains wildcardFVarId then
     return .error 4
   -- (the free variables reached, in the order found: one state, so that subterms shared between
-  -- declarations are visited once)
-  let mut cs : CollectFVars.State := collectFVars {} type
+  -- declarations are visited once; the terms visited stay alive, in `reached`)
+  let mut cs : Found := unsafe Found.main type {}
   for li in localInsts do
     if !cs.fvarSet.contains li.fvar.fvarId! then
       cs := cs.add li.fvar.fvarId!
-  -- (these are reached: the loop below would find the context large too)
-  if (cs.fvarIds.filter (· != wildcardFVarId)).size > maxDecls then
-    return .error 6
   -- (each declaration with its type and value instantiated, in one metavariable context, so that
   -- what the declarations share is instantiated once)
   let mctx ← getMCtx
@@ -582,20 +703,22 @@ private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Na
   let mut reached : Array (LocalDecl × Expr × Option Expr) := #[]
   let mut next := 0
   while h : next < cs.fvarIds.size do
+    -- (the free variables found are all reached: the context is large as soon as they are too many,
+    -- before the declarations not yet visited are instantiated)
+    if cs.fvarIds.size - (if cs.fvarSet.contains wildcardFVarId then 1 else 0) > maxDecls then
+      return .error 6
     let id := cs.fvarIds[next]
     next := next + 1
     if id == wildcardFVarId then continue
-    if reached.size == maxDecls then
-      return .error 6
     let some d := lctx.find? id | return .error 4
     let (some t, m) := instantiated? imctx d.type | return .error 4
     imctx := m
-    cs := collectFVars cs t
+    cs := unsafe Found.main t cs
     let mut v? := none
     if let some v := d.value? then
       let (some v, m) := instantiated? imctx v | return .error 4
       imctx := m
-      cs := collectFVars cs v
+      cs := unsafe Found.main v cs
       v? := some v
     reached := reached.push (d, t, v?)
   let decls := reached.qsort (·.1.index < ·.1.index)
@@ -603,7 +726,9 @@ private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Na
   let mut num : Std.HashMap FVarId Nat := {}
   for h : i in [0:fvars.size] do
     num := num.insert fvars[i] i
-  let canon (e : Expr) : Expr := e.replace fun
+  let canon (e : Expr) : Expr := e.replace fun e =>
+    if !e.hasFVar then some e else
+    match e with
     | .fvar id => if id == wildcardFVarId then none else some (canonFVar (num.getD id 0))
     | _ => none
   let type : ExactExpr := ⟨canon type⟩
@@ -652,15 +777,23 @@ private def key? (localInsts : LocalInstances) (type : Expr) (maxResultSize : Na
     isExporting := (← getEnv).isExporting }
   return .ok (key, fvars)
 
+/-- Replace free-variable leaves, stopping at subexpressions without free variables. -/
+@[extern "lean_paperlean_tc_replace_fvars"]
+private def replaceFVarLeaves (e : @& Expr) (f : @& (Expr → Option Expr)) : Expr :=
+  if !e.hasFVar then e else e.replace fun t =>
+    if !t.hasFVar then some t else if t.isFVar then f t else none
+
 /-- The free variables `fvars` replaced by their numbers in `e` (which has no other ones). -/
 private def canonExpr (num : Std.HashMap FVarId Nat) (e : Expr) : Expr :=
-  if !e.hasFVar then e else e.replace fun
+  if !e.hasFVar then e else replaceFVarLeaves e fun e =>
+    match e with
     | .fvar id => num[id]?.map canonFVar
     | _ => none
 
 /-- `e` (from an `Entry`) with the free variables `fvars` put back. -/
 private def restoreExpr (fvars : Array FVarId) (e : Expr) : Expr :=
-  if !e.hasFVar then e else e.replace fun
+  if !e.hasFVar then e else replaceFVarLeaves e fun e =>
+    match e with
     | .fvar ⟨.num p i⟩ => if p == `_paperlean_tc then fvars[i]?.map mkFVar else none
     | _ => none
 
@@ -699,12 +832,14 @@ private partial def levelMentions (p : Name → Bool) : Level → Bool
 /-- Whether `e` has a free variable whose identifier satisfies `pf`, or a metavariable or universe
 metavariable whose name satisfies `pm`. -/
 private def mentions (pf : FVarId → Bool) (pm : Name → Bool) (e : Expr) : Bool :=
-  (e.hasFVar || e.hasMVar) && (e.find? fun
-    | .fvar id => pf id
-    | .mvar id => pm id.name
-    | .sort u => u.hasMVar && levelMentions pm u
-    | .const _ us => us.any fun u => u.hasMVar && levelMentions pm u
-    | _ => false).isSome
+  (e.hasFVar || e.hasMVar) && (e.findExt? fun e =>
+    if !e.hasFVar && !e.hasMVar then .done else
+    match e with
+    | .fvar id => if pf id then .found else .done
+    | .mvar id => if pm id.name then .found else .done
+    | .sort u => if u.hasMVar && levelMentions pm u then .found else .done
+    | .const _ us => if us.any fun u => u.hasMVar && levelMentions pm u then .found else .done
+    | _ => .visit).isSome
 
 /-- The binder names with macro scopes in `es`, and whether `es` hold syntax in metadata (e.g. the
 pattern of `Expr.patternWithRef?`, which a type may hold), which compares without its position. -/
@@ -829,46 +964,68 @@ private def isMadeOrOther (num : Std.HashMap FVarId Nat) (made : Name → Bool) 
   (mentions (made ·.name) made,
    mentions (fun id => !num.contains id && !made id.name && id != wildcardFVarId) (!made ·))
 
+/-- Whether an expression mentions a name that the search made or a variable that is not of the
+problem (`num`): one of `isMadeOrOther`, in one pass. -/
+private def isMadeOrOtherEither (num : Std.HashMap FVarId Nat) (made : Name → Bool) : Expr → Bool :=
+  mentions (fun id => made id.name || (!num.contains id && id != wildcardFVarId)) fun _ => true
+
 /--
 The operations `ops` (`EnvAccess.cache`, in order) of a search, as kept with its entry: the lookups
 that found an entry that was there before the search, or that found none, and the insertions, with
 the free variables `num` of the problem replaced by their numbers; the lookups of pure keys in the
 environment `env` as `pureLookup`. The operations on entries whose keys mention a name that the
 search made (`made`) are left out: no later lookup can find these. Fails if an operation mentions a
-variable that is neither of the problem nor made by the search.
+variable that is neither of the problem nor made by the search. The phase worker keeps `rename`
+as an unknown function parameter, so specializing the loop cannot reconstruct its capturing
+partial application on every operation.
 -/
-private unsafe def keptOps (env : Environment) (ops : Array EnvAccess)
+@[noinline, nospecialize]
+private unsafe def keptOpsUsing (rename : Expr → Expr) (env : Environment) (ops : Array EnvAccess)
     (num : Std.HashMap FVarId Nat) (made : Name → Bool) : Except String (Array CacheOp) := do
-  let (isMade, isOther) := isMadeOrOther num made
+  let (isMade, _) := isMadeOrOther num made
+  let either := isMadeOrOtherEither num made
   -- (the entries that the search inserted)
   let mut inserted : Meta.Cache := {}
   let mut kept := #[]
+  let mut memo : ExprRemapMemo := mkPtrMap 8
   for op in ops do
     let .cache c o k v := op | continue
     if c > 3 then throw "an operation on another cache"
-    let ks := keyExprs c k
-    let dead := ks.any isMade
-    if !dead && ks.any isOther then
+    -- (a key that mentions either, but no name that the search made, mentions another variable)
+    let mentioned := keyAny c k either
+    let dead := mentioned && keyAny c k isMade
+    if mentioned && !dead then
       throw "an operation on a cache with other variables"
     if o == 0 then
       -- (a lookup: `v` is what it found; an entry that the search inserted is found again on reuse,
       -- where it is inserted again)
-      let found? : Option NonScalar := unsafeCast v
+      let mut found? : Option NonScalar := unsafeCast v
       if dead || (found?.isSome && (findIn c inserted k).isSome) then continue
-      let found? ← found?.mapM fun w => do
-        if (valueExprs c w).any fun e => isMade e || isOther e then
+      if let some w := found? then
+        if valueAny c w either then
           throw "a cache entry with other variables"
-        return mapValue c (canonExpr num) w
-      let k := mapKey c (canonExpr num) k
+        let (w, next) := (mapValueMemo c rename w).run memo
+        memo := next
+        found? := some w
+      let (k, next) := (mapKeyMemo c rename k).run memo
+      memo := next
       kept := kept.push <|
         if pureKey env c k then .pureLookup c k found? none else .lookup c k found?
     else
       inserted := insertIn c inserted k v
       if dead then continue
-      if (valueExprs c v).any fun e => isMade e || isOther e then
+      if valueAny c v either then
         throw "a cache entry with other variables"
-      kept := kept.push (.insert c (mapKey c (canonExpr num) k) (mapValue c (canonExpr num) v))
+      let (k, next) := (mapKeyMemo c rename k).run memo
+      memo := next
+      let (v, next) := (mapValueMemo c rename v).run memo
+      memo := next
+      kept := kept.push (.insert c k v)
   return withInsertAt env kept
+
+private unsafe def keptOps (env : Environment) (ops : Array EnvAccess)
+    (num : Std.HashMap FVarId Nat) (made : Name → Bool) : Except String (Array CacheOp) :=
+  keptOpsUsing (canonExpr num) env ops num made
 
 /-- A key of the caches of `isDefEq` that no lookup finds: `mark` puts it there, and an `isDefEq`
 removes it with all else. -/
@@ -942,7 +1099,9 @@ private unsafe def opsMakeCaches (ops : Array EnvAccess) (cache0 cache1 : Meta.C
 The caches after repeating the operations `ops` (of an entry) on `cache` with the free variables
 `fvars` of the problem, the operations as made, and the `funInfo` entries that Lean's search computes
 again (`fill`) with the values that the recorded search found; `none` if a lookup does not find what
-the search found.
+the search found. `keepMade` keeps the insertions needed by a recording, oracle or possible `funInfo`
+fill; `keepLookups` keeps lookups, needed only by an enclosing recording. Neither flag controls
+checking or replaying an op.
 
 The lookups of pure keys may find otherwise: Lean's search finds the same values either way, and
 then makes the same operations on other keys. One that found an entry and finds none now is a miss
@@ -951,38 +1110,53 @@ pure keys): `fill` does it for `funInfo`, whose computation may report something
 `inferType` are left out. One that found none and finds an entry now, with the value that the
 search inserted under the key, is a hit of Lean's search, which then neither makes the operations
 up to that insertion (on pure keys only, `insertAt?`) nor the insertion.
+`rename` is the phase's free-variable restoration, kept as a runtime closure across this compilation
+boundary and shared by all operations.
 -/
-private unsafe def replayOps (fvars : Array FVarId) (ops : Array CacheOp) (cache : Meta.Cache) :
+@[noinline, nospecialize]
+private unsafe def replayOpsUsing (rename : Expr → Expr) (ops : Array CacheOp) (cache : Meta.Cache)
+    (keepMade keepLookups : Bool) :
     Option (Meta.Cache × Array (UInt8 × UInt8 × NonScalar × NonScalar) ×
       Array (NonScalar × NonScalar)) := Id.run do
   let mut cache := cache
-  let mut made := #[]
+  let mut made : Array (UInt8 × UInt8 × NonScalar × NonScalar) := #[]
   let mut fills := #[]
+  let mut memo : ExprRemapMemo := mkPtrMap 8
   let mut i := 0
   while h : i < ops.size do
     match ops[i] with
     | .lookup c k found? =>
-      let k := mapKey c (restoreExpr fvars) k
+      let (k, next) := (mapKeyMemo c rename k).run memo
+      memo := next
       let now? := findIn c cache k
       match now?, found? with
-      | some v, some w => unless sameValue c v (mapValue c (restoreExpr fvars) w) do return none
+      | some v, some w =>
+        let (w, next) := (mapValueMemo c rename w).run memo
+        memo := next
+        unless sameValue c v w do return none
       | none, none => pure ()
       | _, _ => return none
-      made := made.push (c, 0, k, unsafeCast now?)
+      if keepLookups then made := made.push (c, 0, k, unsafeCast now?)
     | .insert c k v =>
-      let k := mapKey c (restoreExpr fvars) k
-      let v := mapValue c (restoreExpr fvars) v
+      let (k, next) := (mapKeyMemo c rename k).run memo
+      memo := next
+      let (v, next) := (mapValueMemo c rename v).run memo
+      memo := next
       cache := insertIn c cache k v
-      made := made.push (c, 1, k, v)
+      if keepMade then made := made.push (c, 1, k, v)
     | .pureLookup c k found? insertAt? =>
-      let k := mapKey c (restoreExpr fvars) k
+      let (k, next) := (mapKeyMemo c rename k).run memo
+      memo := next
       let now? := findIn c cache k
       match now?, found? with
-      | some v, some w => unless sameValue c v (mapValue c (restoreExpr fvars) w) do return none
+      | some v, some w =>
+        let (w, next) := (mapValueMemo c rename w).run memo
+        memo := next
+        unless sameValue c v w do return none
       | none, none => pure ()
       | none, some w =>
         if c == 1 then
-          let w := mapValue c (restoreExpr fvars) w
+          let w := mapValue c rename w
           fills := fills.push (k, w)
           cache := insertIn c cache k w
         i := i + 1
@@ -990,13 +1164,21 @@ private unsafe def replayOps (fvars : Array FVarId) (ops : Array CacheOp) (cache
       | some v, none =>
         let some j := insertAt? | return none
         let some (.insert _ _ w) := ops[j]? | return none
-        unless sameValue c v (mapValue c (restoreExpr fvars) w) do return none
-        made := made.push (c, 0, k, unsafeCast now?)
+        let (w, next) := (mapValueMemo c rename w).run memo
+        memo := next
+        unless sameValue c v w do return none
+        if keepLookups then made := made.push (c, 0, k, unsafeCast now?)
         i := j + 1
         continue
-      made := made.push (c, 0, k, unsafeCast now?)
+      if keepLookups then made := made.push (c, 0, k, unsafeCast now?)
     i := i + 1
   return some (cache, made, fills)
+
+private unsafe def replayOps (fvars : Array FVarId) (ops : Array CacheOp) (cache : Meta.Cache)
+    (keepMade keepLookups : Bool) :
+    Option (Meta.Cache × Array (UInt8 × UInt8 × NonScalar × NonScalar) ×
+      Array (NonScalar × NonScalar)) :=
+  replayOpsUsing (restoreExpr fvars) ops cache keepMade keepLookups
 
 /-- Lean's `getFunInfo` of the keys `fills` (`realizedKey`, with the configuration key of the
 lookup), which Lean's search computes again where the recorded search found an entry: whether each
@@ -1086,9 +1268,12 @@ private unsafe def Pending.finish (env : Environment) (p : Pending) : Except Str
     num := num.insert p.fvars[i] i
   let made := madeBy p.ngen0 p.ngenEnd
   let ops ← keptOps env deps.cacheOps num made
+  let mayFill := ops.any fun
+    | .pureLookup c _ (some _) _ => c == 1
+    | _ => false
   let defEq ← DefEqEffect.of p num made
   return {
-    key := p.key, deps := { deps with cacheOps := #[] }, result, names := p.ngenEnd - p.ngen0.idx, ops
+    key := p.key, deps := { deps with cacheOps := #[] }, result, names := p.ngenEnd - p.ngen0.idx, ops, mayFill
     defEq, namesFree := !opsMention names result ops defEq.perm }
 
 /-- `stored` (of the key `key`) as entries, those that were pending now finished, and put back; what
@@ -1099,6 +1284,7 @@ private def finished (env : Environment) (key : Key) (stored : Array Stored) :
     return #[]
   let mut entries := #[]
   let mut changed := false
+  let mut cheap := false
   for s in stored do
     match s with
     | .entry e => entries := entries.push e
@@ -1107,8 +1293,9 @@ private def finished (env : Environment) (key : Key) (stored : Array Stored) :
       match envWithoutRecording fun _ => unsafe p.finish env with
       | .ok e => entries := entries.push e
       | .error why => noteReason s!"not kept: {why}"
+    | .cheap => cheap := true
   if changed then
-    entriesRef.modify (·.insert key (entries.map .entry))
+    modifyEntries (·.insert key ((if cheap then #[.cheap] else #[]) ++ entries.map .entry))
   return entries
 
 /-- The state of the problem's search before a reuse, for `PAPERLEAN_REUSE_ORACLE`. -/
@@ -1257,7 +1444,13 @@ def withCache (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat)
       noteExcluded kind
       setHeartbeats heartbeats
       return (← search)
-  let entries ← finished env key ((← entriesRef.get).findD key #[])
+  -- (an update of the key's entries inserts the key found, which compares with it at once)
+  let some all ← getEntries? |
+    noteExcluded 0
+    setHeartbeats heartbeats
+    return (← search)
+  let (key0, stored) := (all.findEntry? key).getD (key, #[])
+  let entries ← finished env key0 stored
   let ns ← getCurrNamespace
   let openDecls ← getOpenDecls
   let mut failed := false
@@ -1273,7 +1466,11 @@ def withCache (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat)
       noteReason "not reused: other binder names with macro scopes"
       continue
     -- (the search's lookups in Lean's caches find what they found: its path is the same)
-    let some (cache, made, fills) := unsafe replayOps fvars e.ops (← get).cache |
+    -- (a different witness from the fresh `envRecording key` below: do not common its probe)
+    -- (oracle runs with reuse off; fills inspect imported constants, neither starts a recording)
+    let keepLookups := envRecording e
+    let keepMade := e.mayFill || Speculation.reuseOracle || keepLookups
+    let some (cache, made, fills) := unsafe replayOps fvars e.ops (← get).cache keepMade keepLookups |
       noteReason "not reused: a lookup in a cache finds something else"
       continue
     -- (Lean's search from the same state, which the oracle leaves as it was)
@@ -1304,6 +1501,15 @@ def withCache (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat)
     setHeartbeats heartbeats
     return r
   statsRef.modify fun (r, n, f) => (r, n + 1, if entries.isEmpty then f else f + 1)
+  if stored.any (· matches .cheap) then
+    noteReason "not recorded: the last search was cheaper than a reuse"
+    setHeartbeats heartbeats
+    let r ← search
+    let after ← IO.getNumHeartbeats
+    if after - heartbeats ≥ minHeartbeats then
+      modifyEntries fun m => m.insert key0 (entries.map .entry)
+    setHeartbeats after
+    return r
   let core0 ← getThe Core.State
   let meta0 ← get
   let marked := mark meta0.cache
@@ -1317,13 +1523,17 @@ def withCache (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat)
     discard rec_.stop
     emptied.set (← unsafe unmark meta0.cache marked)
     setHeartbeats heartbeats
-  let heartbeats ← IO.getNumHeartbeats
-  match ← pending? key fvars core0 meta0 r (← rec_.stop) (← emptied.get) with
+  let after ← IO.getNumHeartbeats
+  if after - heartbeats < minHeartbeats then
+    noteReason "not kept: cheaper than a reuse"
+    modifyEntries fun m =>
+      m.insert key0 ((#[Stored.cheap] ++ entries.map Stored.entry).take maxEntriesPerKey)
+  else match ← pending? key fvars core0 meta0 r (← rec_.stop) (← emptied.get) with
   | .ok p =>
     let stored := #[Stored.pending p] ++ entries.map .entry
-    entriesRef.modify fun m => m.insert key (stored.take maxEntriesPerKey)
+    modifyEntries fun m => m.insert key0 (stored.take maxEntriesPerKey)
   | .error why => noteReason s!"not kept: {why}"
-  setHeartbeats heartbeats
+  setHeartbeats after
   return r
 
 end Lean.PaperLean.TCCache

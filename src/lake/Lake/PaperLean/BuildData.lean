@@ -10,6 +10,7 @@ public import Lake.Config.Workspace
 import Lake.Config.Env
 import Lake.PaperLean.Env
 import Lake.PaperLean.BuildEnv
+import Lake.PaperLean.Cache
 import Lean.PaperLean.OLeanPack
 import Lean.PaperLean.System
 import Lean.Data.NameMap.Basic
@@ -19,8 +20,9 @@ Olean packs written during a build, for the `lean` processes that the build star
 runs for a `paperlean` command (`Lake.PaperLean.accelerated`), the workspace has no prepared data
 (`Lake.PaperLean.Env`) and a build has compiled `minModules` modules, Lake packs the modules that the
 build compiles, in batches as they finish (`moduleDone`),
-and uses a pack of the toolchain's library, which it writes once into the user's cache directory
-(or `PAPERLEAN_CACHE_DIR`; `toolchainPack`) and again only when the library changed. Every `lean`
+and uses a pack of the toolchain's library, which it writes once into PaperLean's cache directory
+(`Cache.root?`; `toolchainPack`) and again only when the library changed, and which prepared data uses
+too. Every `lean`
 that the build starts afterwards reads its imports from the packs written so far
 (`Lake.PaperLean.BuildEnv`, `LEAN_OLEAN_PACK`). A pack only changes how files are read, so what a
 module compiles to does not depend on which packs exist when it starts. (No import image is
@@ -125,12 +127,6 @@ where
 private def rootString (dir : FilePath) : String :=
   (dir.toString.dropEndWhile (· == '/')).toString
 
-/-- PaperLean's directory in the user's cache directory, or `PAPERLEAN_CACHE_DIR`. -/
-private def cacheDir? : BaseIO (Option FilePath) := do
-  if let some dir ← IO.getEnv "PAPERLEAN_CACHE_DIR" then
-    return some (FilePath.mk dir)
-  return (· / "paperlean") <$> (← getSystemCacheHome?)
-
 /-- A stamp of the files of `chains`: their names, sizes and modification times; and their total
 size. -/
 private def stamp (chains : Array (Array String)) : IO (UInt64 × Nat) := do
@@ -181,52 +177,51 @@ private def cleanToolchainPacks (dir current : FilePath) : IO Unit := do
     catch _ => pure ()
 
 /--
-The pack of the toolchain's library `leanLibDir` in PaperLean's cache directory, used by later `lean`
-processes of the build as soon as written. Its name holds a stamp of the library's files and
-PaperLean's version and build, so that a pack is only used for the library as it was packed, by the
-build that packed it. Its writer renames it into place once it is on the disk, so that concurrent
-builds and later ones see a whole pack, and locks it until its identity is recorded, which they wait
-for at their shared lock. One that cannot be read, or some of whose files changed since it was written
-(a toolchain installed again keeps their names, sizes and modification times), is written again,
-unless another build uses it: then this one does too, as every packed file is checked before it is
-served. It is not written without the disk space for it (and a tenth more).
+The pack of the toolchain's library `leanLibDir` in PaperLean's cache directory `cache`, relative to
+it, if there is or can be one. Its name holds a stamp of the library's files and PaperLean's version
+and build, so that a pack is only used for the library as it was packed, by the build that packed it.
+Its writer renames it into place once it is on the disk, so that concurrent builds and later ones see
+a whole pack, and locks it until its identity is recorded, which they wait for at their shared lock. One
+that cannot be read, or some of whose files changed since it was written (a toolchain installed again
+keeps their names, sizes and modification times), is written again, unless another build uses it:
+then this one does too, as every packed file is checked before it is served. It is not written without
+the disk space for it (and a tenth more). With `keep`, the shared lock stays held until the build
+ends (`finish`), so that no other build removes the pack meanwhile.
 -/
-private def toolchainPack (leanLibDir : FilePath) : IO Unit := do
-  let some cache ← cacheDir? | return
+public def toolchainPack (cache leanLibDir : FilePath) (keep : Bool) : IO (Option String) := do
   let root := rootString leanLibDir
   let chains := (← chainsBelow leanLibDir).qsort fun a b => a[0]! < b[0]!
-  if chains.isEmpty then return
+  if chains.isEmpty then return none
   let dir := cache / "toolchain-packs"
   let (h, size) ← stamp chains
   let stampHex := String.ofList (Nat.toDigits 16 h.toNat)
   let name := s!"lib-{hash root}-{stampHex}-{Lean.PaperLean.version}+{Lean.PaperLean.build}"
   let pack := dir / s!"{name}.paperlean"
+  let rel := s!"toolchain-packs/{name}.paperlean"
   IO.FS.createDirAll dir
   cleanToolchainPacks dir pack
+  let use (h : IO.FS.Handle) : IO (Option String) := do
+    if keep then lockRef.set (some h) else h.unlock
+    return some rel
   for _ in [0:2] do
     unless ← pack.pathExists do
-      if size + size / 10 > (← availableSpace dir) then return
+      if size + size / 10 > (← availableSpace dir) then return none
       discard <| Lean.PaperLean.OLeanPack.createOf chains #[root] pack toolchainBaseAddr
     let h ← IO.FS.Handle.mk pack .read
     h.lock (exclusive := false)
     -- unless another build removed it before this one held the lock
     if ← pack.pathExists then
-      if ← usable pack then
-        lockRef.set (some h)
-        BuildEnv.addPack pack.toString
-        return
+      if ← usable pack then return ← use h
       unless ← h.tryLock (exclusive := true) do
         -- (a failed conversion of the lock may have released it, and another build may have removed
         -- the pack meanwhile)
         h.lock (exclusive := false)
-        if ← pack.pathExists then
-          lockRef.set (some h)
-          BuildEnv.addPack pack.toString
-          return
+        if ← pack.pathExists then return ← use h
         h.unlock
         continue
       removePack pack
       h.unlock
+  return none
 where
   usable (pack : FilePath) : IO Bool := do
     try
@@ -293,7 +288,10 @@ private def start (wsDir leanLibDir : FilePath) : IO Unit := do
     catch _ => pure none
   let first ← stateRef.modifyGet fun st => if st.isSome then (false, st) else (true, some state?)
   unless first && state?.isSome do return
-  let t ← IO.asTask (prio := .dedicated) (toolchainPack leanLibDir)
+  let t ← IO.asTask (prio := .dedicated) do
+    let some cache ← Cache.root? | return
+    if let some pack ← toolchainPack cache leanLibDir (keep := true) then
+      BuildEnv.addPack (cache / pack).toString
   tasksRef.modify (·.push t)
   let early ← earlyRef.swap #[]
   let now ← IO.monoMsNow

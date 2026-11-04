@@ -4,7 +4,8 @@
 """Runs Lean's own test files with reuse and its oracle on (`PAPERLEAN_REUSE`, `PAPERLEAN_REUSE_ORACLE`)
 and with nothing reused (`PAPERLEAN_EXACT`), with proofs in tasks and on the elaboration thread
 (`-DElab.async=false`, where far more is reused), and compares exit code, messages, `.olean` (with its
-parts), `.ilean` and `.c`. The messages leave out only the times that are printed (`normalize`).
+parts), `.ilean` and `.c`. The messages leave out only the times that are printed and PaperLean's notice
+that a further frontend turns reuse off (`normalize`).
 
 A finding of the oracle in any run, and a run with reuse that a signal ends where none ended a run without,
 fail the suite: no other run takes them back. Where the runs differ otherwise, both are repeated, and all
@@ -45,13 +46,17 @@ PILES = {
 SKIP = {"async_select_channel.lean", "sync_mutex.lean"}
 VARIANTS = {
     "exact": {"PAPERLEAN_EXACT": "1"},
-    "oracle": {"PAPERLEAN_REUSE": "1", "PAPERLEAN_REUSE_ORACLE": "1"},
+    # (every search kept, as the problems of these files are small)
+    "oracle": {"PAPERLEAN_REUSE": "1", "PAPERLEAN_REUSE_ORACLE": "1", "PAPERLEAN_REUSE_MIN_HEARTBEATS": "0"},
 }
 ARTIFACTS = ["olean", "olean.server", "olean.private", "ilean", "c"]
 TIMEOUT = 600
 REPEATS = 3
 # What `lean` prints for a finding of the oracle (`lean_paperlean_speculation_fail`), then it exits.
 ORACLE_FINDING = b"PaperLean: the reuse oracle found a difference:"
+# PaperLean's notice that a frontend that a test starts turns reuse off (`Lean.PaperLean.Speculation`).
+FURTHER_FRONTEND = re.compile(rb"^PaperLean: a further frontend in this process \(.*\): reuse of results and its "
+                              rb"oracle are off from here on\n", re.M)
 # A time as Lean prints it (`display_profiling_time`), with no space, of 3 digits, so also `1e+03ms`.
 TIME = rb"\d+(?:\.\d+)?(?:e[-+]?\d+)?(?:ms|s)"
 # The lines of the profiler (`time_task.cpp`), which it prints only above a threshold of time ...
@@ -76,9 +81,10 @@ def digest(path):
 
 
 def normalize(output):
-    """`output` without the times that Lean and the benchmarks print, and nothing else: the profiler's lines
-    go, as they come and go, and the others keep their names. Each format is matched as a whole line: a number
-    before `s` may be mathematics (`hasLength 0 s = true`)."""
+    """`output` without the times that Lean and the benchmarks print and PaperLean's notice of a further
+    frontend, and nothing else: the profiler's lines go, as they come and go, and the others keep their names.
+    Each format is matched as a whole line: a number before `s` may be mathematics (`hasLength 0 s = true`)."""
+    output = FURTHER_FRONTEND.sub(b"", output)
     output = PROFILER.sub(b"", output)
     output = CUMULATIVE.sub(b"cumulative profiling times:\n", output)
     output = MEASUREMENT.sub(rb"measurement: \1 ...", output)

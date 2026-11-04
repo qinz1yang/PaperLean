@@ -62,11 +62,15 @@ Lean.KeyedDeclsAttribute.addBuiltin._redArg
 Lean.KeyedDeclsAttribute.getEntries._redArg
 Lean.Meta.SynthInstance.getInstances._lam_0
 Lean.Meta.whnfEasyCases._at_.Lean.Meta.whnfImp.spec_3
+Lean.Meta.whnfEasyCases._at_._private.Lean.Meta.WHNF.0.Lean.Meta.whnfCore.go.spec_3
 Lean.ScopedEnvExtension.getState._redArg
 Lean.registerScopedEnvExtensionUnsafe._redArg
+_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop._at_.Lean.Elab.Command.runLinters.spec_4
+_private.Init.Data.Array.Basic.0.Array.forIn'Unsafe.loop._at_.Lean.Elab.Command.runLinters.spec_5
 _private.Lake.Build.Library.0.Lake.LeanLib.recCollectLocalModules._lam_0
 _private.Lean.Environment.0.Lean.EnvExtension.getStateUnsafe._redArg
 _private.Lean.Environment.0.Lean.setImportedEntries.unsafe_1._lam_0
+_private.Lean.Meta.ExprDefEq.0.Lean.Meta.cacheResult._redArg
 _private.Lean.Meta.WHNF.0.Lean.Meta.cache._redArg
 EOF2
 grep '^calls ' abi.differ | awk '{print $2}' > calls.differ || true

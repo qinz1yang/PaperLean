@@ -61,12 +61,12 @@ capture lake paperlean prepare -j 2
 check_out_contains "Prepared"
 check_out_contains "Compiling the native library of dep"
 [ -f .lake/paperlean/env.json ] || fail "prepare did not write env.json"
-ls .lake/paperlean/deps-*/deps.paperlean .lake/paperlean/deps-*/deps.image.paperlean \
-  .lake/paperlean/native-*/dep.paperlean > /dev/null || fail "prepare did not write its files"
-[ -e .lake/paperlean/deps-*/tmp ] && fail "prepare left its temporary directory"
+ls .lake/paperlean/bind/dep-*.paperlean .lake/paperlean/image-*/image.paperlean \
+  "$PAPERLEAN_CACHE_DIR"/prepared/*/native/dep-*/dep.paperlean > /dev/null || fail "prepare did not write its files"
+[ -e .lake/paperlean/image-*/tmp ] && fail "prepare left its temporary directory"
 capture lake paperlean status
 check_out_contains "prepared data"
-check_out_contains "used: 1 pack(s), an import image, 1 native libraries"
+check_out_contains "used: 2 pack(s), an import image, 1 native libraries"
 check_out_contains "native library of dep: 2 modules"
 
 # Plain `lake` does not use the data; the Lake of `paperlean` commands passes it to the `lean`
@@ -75,41 +75,44 @@ capture_exit 1 lake env printenv LEAN_OLEAN_PACK
 capture env PAPERLEAN_IMPORT_TIMING=1 lake lean Root/Main.lean
 ! grep -q "modules.fast packed=[1-9]" "$CAPTURED.out.produced" || fail "plain lake used prepared data"
 capture env PAPERLEAN_ACCELERATE=1 lake env printenv LEAN_OLEAN_PACK
-check_out_matches "$WS/.lake/paperlean/deps-[0-9]*/deps.paperlean"
+check_out_matches "$WS/.lake/paperlean/bind/dep-[0-9a-f]+\.paperlean"
 capture env PAPERLEAN_ACCELERATE=1 lake env printenv LEAN_IMPORT_IMAGE
-check_out_matches "$WS/.lake/paperlean/deps-[0-9]*/deps.image.paperlean"
+check_out_matches "$WS/.lake/paperlean/image-[0-9]*/image.paperlean"
 capture env PAPERLEAN_IMPORT_TIMING=1 env PAPERLEAN_ACCELERATE=1 lake lean Root/Main.lean
 check_out_matches "paperlean-timing modules.fast packed=[1-9]"
 check_out_contains "paperlean-timing native libs=1 modules=2"
-# A moved project keeps its data: packs record the project's roots, and manifests their library,
-# relative to themselves.
+# A moved project keeps its data: bindings record the project's roots relative to themselves (the
+# packs and libraries are in the cache).
 cd "$TMP_DIR"; mv ws ws2; cd ws2
 capture env PAPERLEAN_IMPORT_TIMING=1 env PAPERLEAN_ACCELERATE=1 lake lean Root/Main.lean
 check_out_matches "paperlean-timing modules.fast packed=[1-9]"
 check_out_contains "paperlean-timing native libs=1 modules=2"
 cd "$TMP_DIR"; mv ws2 ws; cd ws
 
-# A run that writes new data deletes the old; a `.c` file that does not match its module's trace is
+# The entry of the cache that the data uses, `pack` or `native`.
+entry() { grep -o "\"prepared/[^\"]*/$1/dep-[0-9a-f]*" .lake/paperlean/env.json | head -1; }
+# A run that writes new data replaces the old; a `.c` file that does not match its module's trace is
 # left out of the native library.
-OLD=$(ls -d .lake/paperlean/deps-*)
+OLD=$(entry native)
 echo "/* changed */" >> ../dep/.lake/build/ir/Dep/A.c
 capture lake paperlean prepare
 check_out_contains "1 modules, 1 left out"
 check_out_contains "Dep.A: .c does not match the trace"
-[ -e "$OLD" ] && fail "prepare kept the data it replaced"
+[ "$(entry native)" != "$OLD" ] || fail "prepare kept the library it replaced"
 # Dep imports Dep.A, whose code would be its native callee: neither is native now
 capture env PAPERLEAN_IMPORT_TIMING=1 env PAPERLEAN_ACCELERATE=1 lake lean Root/Main.lean
 check_out_contains "paperlean-timing native libs=0 modules=0 meta=0 verified=1 importsNotUsed=1"
 perl -i -ne 'print unless eof' ../dep/.lake/build/ir/Dep/A.c
 capture lake paperlean prepare
-check_out_contains "native library of dep" ; check_out_contains "2 modules"
+check_out_contains "dep: 2 modules (from the cache)"
+[ "$(entry native)" = "$OLD" ] || fail "prepare did not take the library from the cache again"
 
 # The files of a module that no longer exists (Lake keeps them, e.g. after an update renamed the
 # module) are left out of packs and native libraries; here they define the same symbols as Dep.A.
-PACKED=$(grep -o "[0-9]* files" "$CAPTURED.out.produced" | head -1)
+PACKED=$(entry pack)
 for f in ../dep/.lake/build/lib/lean/Dep/A.* ../dep/.lake/build/ir/Dep/A.*; do cp "$f" "${f/\/A./\/Old.}"; done
 capture lake paperlean prepare
-check_out_contains "  $PACKED"
+[ "$(entry pack)" = "$PACKED" ] || fail "the files of a module that no longer exists were packed"
 check_out_contains "2 modules"
 ! grep -Fq "could not be built" "$CAPTURED.out.produced" || fail "a module that no longer exists broke the native library"
 rm ../dep/.lake/build/lib/lean/Dep/Old.* ../dep/.lake/build/ir/Dep/Old.*
@@ -172,7 +175,7 @@ capture lake paperlean build
 check_out_contains "PaperLean prepared data: used"
 # What `lean` warns about the prepared data goes to a file, not into Lake's traces, from which later
 # builds, also official ones, would repeat it.
-PACK=$(ls .lake/paperlean/deps-*/deps.paperlean | head -1)
+PACK=$(ls .lake/paperlean/bind/dep-*.paperlean | head -1)
 mv "$PACK" "$PACK.saved"
 echo garbage > "$PACK"
 echo "-- warned" >> Root/Main.lean
@@ -183,7 +186,13 @@ case $WARNINGS in */.lake/paperlean-warnings-[0-9]*.paperlean) ;; *) fail "no wa
 # PaperLean's files in `.lake` are its data directory and side files
 side_files_only() {
   for f in .lake/paperlean*; do
-    case $f in .lake/paperlean|*.paperlean) ;; *) fail "PaperLean data outside .lake/paperlean and side files: $f" ;; esac
+    case $f in
+      .lake/paperlean|*.paperlean) ;;
+      .lake/paperlean-setup)
+        [ -d "$f" ] && [ -z "$(ls -A "$f")" ] || fail "the build left setup indexes: $f"
+        ;;
+      *) fail "PaperLean data outside .lake/paperlean and side files: $f" ;;
+    esac
   done
 }
 side_files_only
@@ -192,31 +201,35 @@ grep -q "ignoring olean pack" "$WARNINGS" || fail "the warning is not in the fil
 capture lake build
 ! grep -q "ignoring olean pack" "$CAPTURED.out.produced" || fail "Lake repeated the warning"
 # A pack that every `lean` ignores is not reported as used, also when nothing is compiled, and a user
-# can read why: here one that is no pack, and one that has another identity, as after a copy.
+# can read why: here a binding that is no binding, and a pack of the cache that has another identity,
+# as after a copy, which `prepare` writes again.
 capture lake paperlean status
-check_out_contains "not used: "
+check_out_contains "used in part: 1 of 2 pack(s), but not "
 check_out_contains "not a PaperLean side file; run \`paperlean prepare\`"
 capture lake paperlean build
-check_out_contains "PaperLean prepared data: not used: "
+check_out_contains "PaperLean prepared data: used in part: "
 mv -f "$PACK.saved" "$PACK"
+CACHED=$(ls "$PAPERLEAN_CACHE_DIR"/prepared/*/pack/dep-*/pack.paperlean)
+cp -p "$CACHED" "$TMP_DIR/pack.copy"
+mv -f "$TMP_DIR/pack.copy" "$CACHED"
 capture lake paperlean status
 check_out_contains "it changed since it was written; run \`paperlean prepare\`"
 ! grep -q "packStaleness" "$CAPTURED.out.produced" || fail "status shows an internal name"
 capture lake paperlean build
-check_out_contains "PaperLean prepared data: not used: "
-! grep -q "PaperLean prepared data: used" "$CAPTURED.out.produced" || fail "an ignored pack is reported as used"
+check_out_contains "PaperLean prepared data: used in part: "
 perl -i -ne 'print unless eof' Root/Main.lean
 capture lake paperlean prepare -j 2
 check_out_contains "Prepared"
+check_out_contains "Packing dep"
 capture lake paperlean status
-check_out_contains "used: 1 pack(s), an import image, 1 native libraries"
+check_out_contains "used: 2 pack(s), an import image, 1 native libraries"
 # a run without warnings keeps no file, and the files of runs that ended are removed
 capture lake paperlean build
 ! grep -q "warning(s) about the prepared data" "$CAPTURED.out.produced" || fail "warnings without a damaged pack"
 ls .lake/paperlean-warnings-* 2> /dev/null && fail "warnings files are left"
 touch ../dep/.lake/build/lib/lean/Dep/A.olean
 capture lake paperlean status
-check_out_matches "deps.paperlean: .*, 1 of [0-9]+ modules changed since packing"
+check_out_matches "package dep: prepared: pack dep-[0-9a-f]+ of the cache \([0-9]+ modules, 1 changed since and read from disk\)"
 capture lake paperlean build
 check_out_matches "1 of [0-9]+ packed modules changed since packing"
 # A dependency that asks for another Lean release: a note if this Lean built it (which decides whether
@@ -239,15 +252,20 @@ check_out_contains "Native libraries are not available for"
 check_out_contains "Prepared"
 ! grep -Fq "Compiling the native library" "$CAPTURED.out.produced" || fail "prepare compiled native code"
 capture lake paperlean status
-check_out_contains "used: 1 pack(s), an import image"
+check_out_contains "used: 2 pack(s), an import image"
 ! grep -Fq "native libraries" "$CAPTURED.out.produced" || fail "native libraries in use"
 
-# Not enough disk space: nothing changes.
+# Not enough disk space for what is not in the cache: nothing changes. (What is in the cache needs none.)
 cp .lake/paperlean/env.json "$TMP_DIR/env.before"
+run env PAPERLEAN_FREE_SPACE=1000 lake paperlean prepare --no-native
+cmp .lake/paperlean/env.json "$TMP_DIR/env.before" || fail "prepare with everything in the cache changed the data"
+mv "$PAPERLEAN_CACHE_DIR/prepared" "$TMP_DIR/prepared.saved"
 capture_exit 1 env PAPERLEAN_FREE_SPACE=1000 lake paperlean prepare
 check_out_contains "of disk space in"
 check_out_contains "Nothing was changed"
 cmp .lake/paperlean/env.json "$TMP_DIR/env.before" || fail "prepare changed the data without disk space"
+rm -rf "$PAPERLEAN_CACHE_DIR/prepared"
+mv "$TMP_DIR/prepared.saved" "$PAPERLEAN_CACHE_DIR/prepared"
 # While another process holds the lock (the operating system's lock on
 # `.lake/paperlean-lock.paperlean`, as `paperlean` commands take it), prepare and clean refuse at once
 # and change nothing.
@@ -340,7 +358,7 @@ if [ -e .lake/paperlean/env.json ]; then
       fail "after commands started together, ${d##*/} is left, which env.json does not refer to"
   done
   capture lake paperlean status --verify
-  check_out_contains "used: 1 pack(s), an import image"
+  check_out_contains "used: 2 pack(s), an import image"
   check_out_contains ", verified"
   ! grep -Eq ": missing|not usable" "$CAPTURED.out.produced" || fail "commands started together left damaged data"
 else
@@ -349,13 +367,13 @@ fi
 capture lake paperlean prepare --no-native
 check_out_contains "Prepared"
 capture lake paperlean status
-check_out_contains "used: 1 pack(s), an import image"
+check_out_contains "used: 2 pack(s), an import image"
 
 # --all packs the root package too; clean deletes everything.
 capture lake paperlean prepare --all --no-native
 check_out_contains "of root"
 capture env PAPERLEAN_ACCELERATE=1 lake env printenv LEAN_OLEAN_PACK
-check_out_matches "$WS/.lake/paperlean/deps-[0-9]*/deps.paperlean:$WS/.lake/paperlean/root-[0-9]*/root.paperlean"
+check_out_matches "$WS/.lake/paperlean/root-[0-9]*/root.paperlean:$WS/.lake/paperlean/bind/dep-[0-9a-f]+\.paperlean:"
 # the root package's pack is kept when only the dependencies are prepared again
 capture lake paperlean prepare --no-native
 capture env PAPERLEAN_ACCELERATE=1 lake env printenv LEAN_OLEAN_PACK

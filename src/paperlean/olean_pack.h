@@ -27,7 +27,8 @@ bool find_in_packs(std::string const & fname, std::vector<region_view> const & d
 // Whether `addr` lies in a pack.
 bool in_packs(void const * addr);
 
-// The identity of a file, as packs record it: device, inode, size, modification and change times.
+// The identity of a file, as packs and bindings record it: device, inode, size, modification and
+// change times.
 struct file_identity {
     uint64_t dev, ino, size;
     int64_t mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
@@ -38,26 +39,37 @@ struct file_identity {
 };
 // The identity of the file at `path`.
 bool stat_identity(char const * path, file_identity & id);
+// What packs and native library manifests know a file's contents by: two 64-bit hashes of its bytes
+// by different functions.
+struct content_hash {
+    uint64_t lo, hi;
+    bool operator==(content_hash const & o) const { return lo == o.lo && hi == o.hi; }
+};
+content_hash hash_content(void const * data, size_t size);
 // The files of a module: `.olean`, `.olean.server`, `.olean.private`, `.ir.sig` and `.ir`.
 enum module_file_kind : uint32_t { file_olean, file_olean_server, file_olean_private, file_ir_sig, file_ir, num_module_file_kinds };
 // The kind of the file at `path` by its extension, or `num_module_file_kinds`.
 uint32_t module_file_kind_of(std::string_view path);
 // For native libraries (`native_libs.cpp`): if `data` is the root of a part of the packed module
-// named `n`, so that an import got it from the pack, the files of the module that the pack recorded
-// with their identities, by kind, provided none changed since packing and the pack can serve all
-// files that an import may read. A module file must have both IR files packed: an import reads
-// them from disk otherwise.
-bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint32_t, file_identity>> & files);
+// named `n`, so that an import got it from the pack, the contents of the module's files that the pack
+// holds, by kind, provided none changed since packing (or binding) and the pack can serve all files
+// that an import may read. A module file must have both IR files packed: an import reads them from
+// disk otherwise.
+bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint32_t, content_hash>> & files);
 
-// For import images (`import_state.cpp`), which describe the first pack: the entries arrays of
-// extension `ext_name` of all parts of the first pack, the identity of the first pack, and a string
-// that identifies an extension name.
-void for_each_first_pack_ext_entries(b_obj_arg ext_name, std::function<void(object *)> const & f);
-bool first_pack_identity(uint64_t & checksum, uint64_t & base, uint64_t & size);
+// For import images (`import_state.cpp`), which describe the packs of a process: the entries arrays
+// of extension `ext_name` of all parts of the packs, the packs' checksums and address ranges, and a
+// string that identifies an extension name.
+struct pack_range { uint64_t checksum, base, size; };
+void for_each_pack_ext_entries(b_obj_arg ext_name, std::function<void(object *)> const & f);
+std::vector<pack_range> loaded_pack_ranges();
+// The import image that this process reads its own imports with, along with the packs that it
+// reads them from where `LEAN_OLEAN_PACK` is not set (`OLeanPack.useForProcess`), if it does so.
+char const * process_import_image();
 void extension_name_key(b_obj_arg n, std::string & key);
-// For writing an import image: why the index of the first pack is not as its writer left it, if it is
-// not (readers check only the entries they use).
-char const * first_pack_damaged();
+// For writing an import image: why the index of a pack is not as its writer left it, if one is not
+// (readers check only the entries they use).
+char const * packs_damaged();
 
 // In `library/module.cpp`: the `.olean` format and regions.
 size_t olean_header_size();

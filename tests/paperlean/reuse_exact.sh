@@ -25,6 +25,8 @@
 # stops with an error that names it and points to `lake build`.
 
 export PAPERLEAN_REUSE=1
+# (every search is kept: these problems are small)
+export PAPERLEAN_REUSE_MIN_HEARTBEATS=0
 cd "$TMP_DIR"
 header='import Lean.Elab.ElabRules
 open Lean Elab Term'

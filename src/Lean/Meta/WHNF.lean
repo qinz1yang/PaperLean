@@ -545,6 +545,19 @@ def projectCore? (e : Expr) (i : Nat) : MetaM (Option Expr) := do
     else
       return none
 
+set_option compiler.ignoreBorrowAnnotation true in
+@[extern "lean_paperlean_whnf_proj"]
+private opaque whnfProjNative (e : Expr) (i : Nat) : MetaM (Expr ⊕ Expr)
+
+/--
+PaperLean: `.inl (← whnf e)`, or `.inr f` where `some f` is `projectCore? (← whnf e) i`, when `whnf e`
+ends by unfolding a definition into a constructor application that it does not cache: then only the
+field `f` of the definition's value is instantiated (`whnfProjImp`, which the stage0 `lean` that
+interprets stage1's code does not have).
+-/
+private def whnfProj (e : Expr) (i : Nat) : MetaM (Expr ⊕ Expr) :=
+  if PaperLean.nativeAvailable e then whnfProjNative e i else .inl <$> whnf e
+
 def project? (e : Expr) (i : Nat) : MetaM (Option Expr) := do
   projectCore? (← whnf e) i
 
@@ -615,6 +628,40 @@ partial def consumeUnusedLet (e : Expr) (consumeNondep : Bool := false) : Expr :
   | .letE _ _ _ b nondep => if b.hasLooseBVars || (nondep && !consumeNondep) then e else consumeUnusedLet b consumeNondep
   | _ => e
 
+/-- PaperLean: `instantiate` in native code (`src/paperlean/replace.cpp`): the kernel's computation,
+with a faster cache. -/
+@[extern "lean_paperlean_expr_instantiate"]
+opaque _root_.Lean.PaperLean.exprInstantiate (e : @& Expr) (subst : @& Array Expr) : Expr
+
+/-- PaperLean: `instantiateRange` in native code, as `PaperLean.exprInstantiate`. -/
+@[extern "lean_paperlean_expr_instantiate_range"]
+opaque _root_.Lean.PaperLean.exprInstantiateRange (e : @& Expr) (beginIdx endIdx : @& Nat)
+  (subst : @& Array Expr) : Expr
+
+/-- PaperLean: `f.betaRev revArgs (preserveMData := preserveMData)`, instantiating in native code
+(`PaperLean.exprInstantiate`) where it is available. -/
+private partial def _root_.Lean.PaperLean.betaRev (f : Expr) (revArgs : Array Expr) (preserveMData := false) :
+    Expr :=
+  if !PaperLean.nativeAvailable f then f.betaRev revArgs (preserveMData := preserveMData)
+  else if revArgs.size == 0 then f
+  else
+    let sz := revArgs.size
+    let rec go (e : Expr) (i : Nat) : Expr :=
+      let done (_ : Unit) : Expr :=
+        let n := sz - i
+        Expr.mkAppRevRange (PaperLean.exprInstantiateRange e n sz revArgs) 0 n revArgs
+      match e with
+      | .lam _ _ b _ => if i + 1 < sz then go b (i+1) else PaperLean.exprInstantiate b revArgs
+      | .mdata _ b => if preserveMData then done () else go b i
+      | _ => done ()
+    go f 0
+
+/-- PaperLean: `whnfProj` at the transparency of `whnfAtMostI`. -/
+private def whnfProjAtMostI (e : Expr) (i : Nat) : MetaM (Expr ⊕ Expr) := do
+  match (← getTransparency) with
+  | .all | .default | .implicit => withTransparency .instances <| whnfProj e i
+  | _ => whnfProj e i
+
 /--
 Apply beta-reduction, zeta-reduction (i.e., unfold let local-decls), iota-reduction,
 expand let-expressions, expand assigned meta-variables, unfold aux declarations.
@@ -651,7 +698,8 @@ where
         -/
         if f'.isLambda && (cfg.beta || !f.isLambda) then
           let revArgs := e.getAppRevArgs
-          go <| f'.betaRev revArgs
+          -- PaperLean: (instantiating in native code)
+          go <| PaperLean.betaRev f' revArgs
         else if let some eNew ← whnfDelayedAssigned? f' e then
           go eNew
         else
@@ -680,12 +728,15 @@ where
           match (← projectCore? c i) with
           | some e => go e
           | none => return e
+        let kProj (r : Expr ⊕ Expr) := match r with
+          | .inl c => k c
+          | .inr f => go f
         match (← getConfig).proj with
         | .no => return e
         | .yes => k (← go c)
-        | .yesWithDelta => k (← whnf c)
+        | .yesWithDelta => kProj (← whnfProj c i)
         -- Remark: If the current transparency setting is `reducible`, we should not increase it to `instances`
-        | .yesWithDeltaI => k (← whnfAtMostI c)
+        | .yesWithDeltaI => kProj (← whnfProjAtMostI c i)
       | _ => unreachable!
 
 /--
@@ -1085,6 +1136,116 @@ partial def whnfImp (e : Expr) : MetaM Expr :=
           match (← unfoldDefinition? e') with
           | some e'' => cache useCache e (← whnfImp e'')
           | none => cache useCache e e'
+
+/-- PaperLean: the body of `v` under the `n > 0` leading `fun`s that `v.betaRev` consumes with `n`
+arguments. -/
+private def betaBody? (v : Expr) (n : Nat) : Option Expr :=
+  match v with
+  | .lam _ _ b _ => if n ≤ 1 then some b else betaBody? b (n - 1)
+  | .mdata _ b => betaBody? b n
+  | _ => none
+
+/-- PaperLean: with `PAPERLEAN_PROJ_ORACLE` set (for testing), each field that `whnfProj` gives is
+compared with the one of `whnf`, and the process exits on a difference. -/
+private builtin_initialize projOracle : Bool ← return (← IO.getEnv "PAPERLEAN_PROJ_ORACLE").isSome
+private builtin_initialize projOracleCount : IO.Ref Nat ← IO.mkRef 0
+
+/-- PaperLean: checks that `whnfImp r` caches nothing and gives `r`, whose field `i` is `f`; reports
+to the process's standard error, which elaboration does not capture. -/
+private def checkProjOracle (r f : Expr) (i : Nat) : MetaM Unit := do
+  let r' ← whnfImp r
+  let f' ← projectCore? r i
+  let ok := !(← useWHNFCache r) && r'.equal r && f'.any (·.equal f)
+  let n ← projOracleCount.modifyGet fun n => (n + 1, n + 1)
+  if !ok || (n &&& (n - 1)) == 0 then
+    let h ← IO.FS.Handle.mk "/dev/stderr" .append
+    h.putStrLn <| if ok then s!"PAPERLEAN_PROJ_ORACLE: {n} fields checked" else
+      s!"PAPERLEAN_PROJ_ORACLE: field {i} of {r}\nis {f'}, not {f}, whnf {r'}"
+    unless ok do IO.Process.exit 77
+
+/--
+PaperLean: `unfoldDefault fInfo us e` (`e` an application of `fInfo`) when its result is an
+application of a constructor, with all of its fields, that `whnf` leaves as it is: then `.inr` of its
+field `i` if `whnf` does not cache the application, where only that field of the value is
+instantiated, which gives the same expression. `none`, with no effect, for other results.
+-/
+private def unfoldDefaultProj? (fInfo : ConstantInfo) (us : List Level) (e : Expr) (i : Nat) :
+    MetaM (Option (Option Expr ⊕ Expr)) := do
+  let .defnInfo { value, .. } := fInfo | return none
+  let n := e.getAppNumArgs
+  let some b := betaBody? value n | return none
+  let .const ctor _ := b.getAppFn | return none
+  let some (.ctorInfo cval) := (← getEnv).find? ctor | return none
+  unless i < cval.numFields && b.getAppNumArgs == cval.numParams + cval.numFields &&
+      ctor != ``Nat.succ do
+    return none
+  -- (`whnfCore` of the application looks for a matcher, `whnfImp` raises the recursion depth)
+  if (← getMatcherInfo? ctor).isSome then return none
+  let max ← MonadRecDepth.getMaxRecDepth
+  if max != 0 && (← MonadRecDepth.getRecDepth) == max then return none
+  recordUnfold fInfo.name
+  let val ← instantiateValueLevelParams fInfo us
+  -- (`unfoldDefault`'s check of a class field, which leaves a constructor application as it is)
+  if backward.whnf.reducibleClassField.get (← getOptions) && (← getTransparency) matches .reducible then
+    discard <| isProjInst fInfo.name
+  let revArgs := e.getAppRevArgs
+  if let some b := betaBody? val n then
+    let f := PaperLean.exprInstantiate (b.getArg! (cval.numParams + i)) revArgs
+    if (← read).customCanUnfoldPredicate?.isSome || f.hasFVar || f.hasExprMVar then
+      if projOracle then checkProjOracle (val.betaRev revArgs) f i
+      return some (.inr f)
+  return some (.inl (PaperLean.betaRev val revArgs))
+
+/-- PaperLean: `unfoldDefault fInfo us e` for a definition with as many universe parameters as `us`,
+beta-reducing with `PaperLean.betaRev`. -/
+private def unfoldDefaultNative (fInfo : ConstantInfo) (us : List Level) (e : Expr) :
+    MetaM (Option Expr) := do
+  recordUnfold fInfo.name
+  let e := PaperLean.betaRev (← instantiateValueLevelParams fInfo us) e.getAppRevArgs
+  if !backward.whnf.reducibleClassField.get (← getOptions) then return some e
+  if !(← getTransparency) matches .reducible then return some e
+  if !(← isProjInst fInfo.name) then return some e
+  let some r ← withReducibleAndInstances <| reduceProj? e.getAppFn | return some e
+  return mkAppN r e.getAppArgs |>.headBeta
+
+/-- PaperLean: `unfoldDefinition? e`, or the field `i` of its result as `unfoldDefaultProj?` gives it. -/
+private def unfoldDefinitionProj? (e : Expr) (i : Nat) : MetaM (Option Expr ⊕ Expr) := do
+  -- (the steps of `unfoldDefinition?` for an application)
+  let .app f _ := e | return .inl (← unfoldDefinition? e)
+  let .const fn us := f.getAppFn | return .inl (← unfoldDefinition? e)
+  let some fInfo ← getUnfoldableConst? fn | return .inl (← unfoldProjInstWhenInstances? e)
+  if fInfo.levelParams.length != us.length then return .inl none
+  if smartUnfolding.get (← getOptions) then
+    if let some (.defnInfo _) := (← getEnv).find? (skipRealize := true) (mkSmartUnfoldingNameFor fn) then
+      return .inl (← unfoldDefinition? e)
+    if (← getMatcherInfo? fn).isSome then return .inl none
+  if let some r ← unfoldDefaultProj? fInfo us e i then return r
+  return .inl (← unfoldDefaultNative fInfo us e)
+
+set_option compiler.ignoreBorrowAnnotation true in
+/-- PaperLean: `whnfProj`, which takes the steps of `whnfImp e` itself through applications that
+`whnf` does not cache (with tracing, `whnf`'s trace shows the steps). -/
+@[export lean_paperlean_whnf_proj]
+private partial def whnfProjImp (e : Expr) (i : Nat) : MetaM (Expr ⊕ Expr) := do
+  if (← getOptions).hasTrace then return .inl (← whnf e)
+  match e with
+  | .mdata _ b => whnfProjImp b i
+  | .mvar mvarId =>
+    match (← getExprMVarAssignment? mvarId) with
+    | some v => whnfProjImp v i
+    | none => return .inl (← whnf e)
+  | .app .. =>
+    if (← useWHNFCache e) then return .inl (← whnf e)
+    -- `whnfImp e`, which caches nothing
+    withIncRecDepth do
+      checkSystem "whnf"
+      let e' ← whnfCore e
+      if let some v ← reduceNat? e' then return .inl v
+      match (← unfoldDefinitionProj? e' i) with
+      | .inl (some e'') => whnfProjImp e'' i
+      | .inl none => return .inl e'
+      | .inr f => return .inr f
+  | _ => return .inl (← whnf e)
 
 /-- If `e` is a projection function that satisfies `p`, then reduce it -/
 def reduceProjOf? (e : Expr) (p : Name → Bool) : MetaM (Option Expr) := do

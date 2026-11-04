@@ -427,6 +427,9 @@ class interpreter {
     };
     // caches symbol lookup successes _and_ failures
     name_hash_map<symbol_cache_entry> m_symbol_cache;
+    // PaperLean: `shared_key`
+    object * m_shared_key = nullptr;
+    bool m_shared_key_known = false;
 
     /** \brief Get current stack frame */
     inline frame & get_frame() {
@@ -870,7 +873,16 @@ private:
     // PaperLean: an entry for an imported declaration found by another interpreter
     // (`paperlean/interp_cache.h`), which is what this one would find
     void share(name const & fn, symbol_cache_entry const & e) {
-        share_symbol(m_env.raw(), fn.raw(), shared_symbol { e.m_decl.raw(), e.m_native.m_addr, e.m_native.m_boxed });
+        share_symbol(shared_key(), m_env.raw(), fn.raw(), shared_symbol { e.m_decl.raw(), e.m_native.m_addr, e.m_native.m_boxed });
+    }
+
+    // PaperLean: what identifies the imports of `m_env` for the shared entries, found once
+    object * shared_key() {
+        if (!m_shared_key_known) {
+            m_shared_key = shared_symbols_key(m_env.raw());
+            m_shared_key_known = true;
+        }
+        return m_shared_key;
     }
 
     symbol_cache_entry lookup_symbol(name const & fn) {
@@ -882,7 +894,7 @@ private:
         // (e.g. the probe of the boxed version)
         uncounted_heartbeats uncounted;
         shared_symbol sh;
-        if (find_shared_symbol(m_env.raw(), fn.raw(), sh)) {
+        if (find_shared_symbol(shared_key(), fn.raw(), sh)) {
             symbol_cache_entry e_new { decl(sh.decl, true), { sh.addr, sh.boxed } };
             m_symbol_cache.insert({ fn, e_new });
             return e_new;

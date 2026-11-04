@@ -7,9 +7,11 @@ module
 prelude
 public import Lake.Build.Trace
 import Init.While
+import Init.System.Promise
 import Lake.PaperLean.Env
 import Lean.PaperLean.System
 import Std.Data.HashMap.Basic
+import Std.Data.HashSet.Basic
 
 /-!
 The `.hash` files that builds under `paperlean` commands read (`Lake.fetchFileHash`): Lake reads those
@@ -20,26 +22,38 @@ size, modification and status change times: `Lean.PaperLean.fileIdentity`) in
 a file whose identity is still that recorded, which one `stat` costs. A file is only recorded if it
 was last changed well before the build started (`margin`, by the time of a file it writes then): any
 later write changes its identity, even where file systems keep coarse times, and the status change
-time cannot be set. The record holds only what the last build read; one that is missing, damaged, or
-of another build is ignored, and so is the record of a file that changed since;
-`PAPERLEAN_HASH_CACHE=0` turns it off.
+time cannot be set. The record holds what the last build read. What it held that a build did not read,
+as of another target, goes to `.lake/paperlean-hashes-kept.paperlean`, which a build reads only for a
+file that the record does not have (and takes it back into the record if it reads it); there an entry
+that no build read in `maxAge` changes of that file goes. A record that is missing, damaged, or of
+another build is ignored, and so is the entry of a file that changed since; `PAPERLEAN_HASH_CACHE=0`
+turns them off.
 -/
 
 open System Lean
 
 namespace Lake.PaperLean.HashCache
 
-/-- A `.hash` file as recorded: its identity and the hash it holds. -/
+/-- A `.hash` file as recorded: its identity and the hash it holds; in the kept record, also the
+generation of that record (how often it was written) when it was put there. -/
 structure Entry where
   identity : ByteArray
   hash : UInt64
+  gen : UInt32 := 0
 
-/-- The record of the build. -/
+/-- A record as read: its generation and its entries. -/
+abbrev Record := UInt32 × Std.HashMap String Entry
+
+/-- The records of the build. -/
 structure Loaded where
   file : FilePath
   entries : Std.HashMap String Entry
   /-- Files last changed before this time (s since the epoch) are recorded. -/
   before : Int
+  keptFile : FilePath
+  /-- Resolved by the first file that `entries` does not have: then `kept` reads the kept record. -/
+  wantKept : IO.Promise Unit
+  kept : Task Record
 
 private builtin_initialize loadedRef : IO.Ref (Option Loaded) ← IO.mkRef none
 
@@ -48,11 +62,24 @@ private builtin_initialize loadedRef : IO.Ref (Option Loaded) ← IO.mkRef none
 /-- The recorded files that this build took from the record. -/
 private builtin_initialize hitsRef : IO.Ref (List String) ← IO.mkRef []
 
+/-- The files that this build took from the kept record. -/
+private builtin_initialize keptHitsRef : IO.Ref (List String) ← IO.mkRef []
+
 /-- The files read during the build that are recorded. -/
 private builtin_initialize newRef : IO.Ref (List (String × Entry)) ← IO.mkRef []
 
+/-- The files whose entries no longer hold, as they changed. -/
+private builtin_initialize goneRef : IO.Ref (List String) ← IO.mkRef []
+
+/-- The record of a workspace that `prefetch` reads ahead of its build. -/
+private builtin_initialize prefetchRef : IO.Ref (Option (FilePath × Task Record)) ← IO.mkRef none
+
 /-- How long before the start of the build a file must have been last changed to be recorded (s). -/
 private def margin : Int := 2
+
+/-- The number of times the kept record is written before an entry that no build read since it was
+put there goes. -/
+private def maxAge : UInt32 := 32
 
 /-- The size of an identity (`Lean.PaperLean.fileIdentity`). -/
 private def identitySize : Nat := 56
@@ -74,40 +101,65 @@ private def padded (s : String) (n : Nat) : ByteArray :=
   let b := s.toUTF8.extract 0 n
   b ++ ByteArray.mk (Array.replicate (n - b.size) 0)
 
-/-- The header of a record, as that of PaperLean's side files (`src/paperlean/side_file.h`): magic,
-kind, the version and build of PaperLean and Lean's commit that wrote it, and its size, followed by
-the checksum of the entries. -/
-private def headerOf : ByteArray :=
-  padded "PAPERLEAN" 16 ++ padded "build-hashes" 16 ++
+/-- The header of a record of kind `kind`, as that of PaperLean's side files
+(`src/paperlean/side_file.h`): magic, kind, the version and build of PaperLean and Lean's commit that
+wrote it, and its size, followed by the checksum of the entries. -/
+private def headerOf (kind : String) : ByteArray :=
+  padded "PAPERLEAN" 16 ++ padded kind 16 ++
     padded s!"{Lean.PaperLean.version}+{Lean.PaperLean.build}" 64 ++ padded Lean.githash 40 |>
     le 4 (16 + 16 + 64 + 40 + 4 + 4 + 8) |> le 4 0
 
-/-- The entries of a record, if this build wrote it and it is whole: after the header, each a path's
-length (2 bytes) and bytes, its identity and its hash (8 bytes), little-endian. -/
-private def decode (b : ByteArray) : Option (Std.HashMap String Entry) := Id.run do
-  let h := headerOf
+/-- The kinds of the record and the kept record. -/
+private def recordKind : String := "build-hashes"
+private def keptKind : String := "kept-hashes"
+
+/-- The entries of a record of kind `kind`, if this build wrote it and it is whole: after the header,
+each a path's length (2 bytes) and bytes, its identity and its hash (8 bytes), little-endian. In the
+kept record (`gens`), the record's generation (4 bytes) comes first, and each entry ends with its own. -/
+private def decode (kind : String) (gens : Bool) (b : ByteArray) : Option Record := Id.run do
+  let h := headerOf kind
   if b.size < h.size + 8 || b.extract 0 h.size != h then return none
   let body := b.extract (h.size + 8) b.size
   if rd b h.size 8 != body.hash then return none
-  let mut i := 0
+  let tail := if gens then 4 else 0
+  if body.size < tail then return none
+  let gen := (rd body 0 tail).toUInt32
+  let mut i := tail
   let mut out : Std.HashMap String Entry := {}
   while i < body.size do
     if i + 2 > body.size then return none
     let n := (rd body i 2).toNat
     let j := i + 2 + n
-    if j + identitySize + 8 > body.size then return none
+    if j + identitySize + 8 + tail > body.size then return none
     let some path := String.fromUTF8? (body.extract (i + 2) j) | return none
     out := out.insert path
-      { identity := body.extract j (j + identitySize), hash := rd body (j + identitySize) 8 }
-    i := j + identitySize + 8
-  return some out
+      { identity := body.extract j (j + identitySize), hash := rd body (j + identitySize) 8
+        gen := (rd body (j + identitySize + 8) tail).toUInt32 }
+    i := j + identitySize + 8 + tail
+  return some (gen, out)
 
-private def encode (entries : Std.HashMap String Entry) : ByteArray :=
-  let body := entries.fold (init := .empty) fun out path e =>
+private def encode (kind : String) (gens : Bool) (gen : UInt32) (entries : Std.HashMap String Entry) :
+    ByteArray :=
+  let tail := if gens then 4 else 0
+  let body := entries.fold (init := le tail gen.toUInt64 .empty) fun out path e =>
     let p := path.toUTF8
     if p.size ≥ 65536 || e.identity.size != identitySize then out else
-    le 8 e.hash (le 2 p.size.toUInt64 out ++ p ++ e.identity)
-  le 8 body.hash headerOf ++ body
+    le tail e.gen.toUInt64 <| le 8 e.hash (le 2 p.size.toUInt64 out ++ p ++ e.identity)
+  le 8 body.hash (headerOf kind) ++ body
+
+/-- The record of kind `kind` in `file`; empty if there is none or it cannot be used. -/
+private def readRecord (kind : String) (gens : Bool) (file : FilePath) : BaseIO Record := do
+  if ← isSpecialFile file then return (0, {})
+  match ← (IO.FS.readBinFile file).toBaseIO with
+  | .ok b => return (decode kind gens b).getD (0, {})
+  | .error _ => return (0, {})
+
+/-- Makes `bytes` the contents of `file`: written to a temporary file and renamed into place. -/
+private def install (file : FilePath) (bytes : ByteArray) : BaseIO Unit := do
+  let tmp := file.addExtension s!"tmp.{← IO.Process.getPID}"
+  discard <| (do
+    IO.FS.writeBinFile tmp bytes
+    IO.FS.rename tmp file).toBaseIO
 
 /-- The modification and status change times (s) of an identity. -/
 private def changeTimes (id : ByteArray) : Int × Int :=
@@ -116,15 +168,32 @@ private def changeTimes (id : ByteArray) : Int × Int :=
 /-- The record of the workspace in `wsDir`. -/
 public def recordFile (wsDir : FilePath) : FilePath := wsDir / ".lake" / "paperlean-hashes.paperlean"
 
-/-- Starts using the record of the workspace in `wsDir`, at the start of a build under a `paperlean`
+/-- The kept record of the workspace in `wsDir`. -/
+public def keptFile (wsDir : FilePath) : FilePath :=
+  wsDir / ".lake" / "paperlean-hashes-kept.paperlean"
+
+/-- Starts reading the record of the workspace in `wsDir` for a build under a `paperlean` command
+that is about to start (`start` takes it), while Lake does something else, such as loading the
+workspace. -/
+public def prefetch (wsDir : FilePath) : BaseIO Unit := do
+  if (← IO.getEnv "PAPERLEAN_HASH_CACHE") == some "0" then return
+  let file := recordFile wsDir
+  let t ← BaseIO.asTask (prio := .dedicated) (readRecord recordKind false file)
+  prefetchRef.set (some (file, t))
+
+/-- Starts using the records of the workspace in `wsDir`, at the start of a build under a `paperlean`
 command (`accelerated`). -/
 public def start (wsDir : FilePath) : BaseIO Unit := do
   loadedRef.set none
   hitsRef.set []
+  keptHitsRef.set []
   newRef.set []
+  goneRef.set []
+  let prefetched? ← prefetchRef.swap none
   unless ← accelerated do return
   if (← IO.getEnv "PAPERLEAN_HASH_CACHE") == some "0" then return
   let file := recordFile wsDir
+  let keptFile := keptFile wsDir
   let r ← (do
     IO.FS.createDirAll (wsDir / ".lake")
     -- the file system's time now
@@ -133,8 +202,14 @@ public def start (wsDir : FilePath) : BaseIO Unit := do
     IO.FS.writeFile clock ""
     let some id ← Lean.PaperLean.fileIdentity clock.toString | return none
     let (mt, ct) := changeTimes id
-    let entries ← try pure ((decode (← IO.FS.readBinFile file)).getD {}) catch _ => pure {}
-    return some { file, entries, before := min mt ct - margin : Loaded }).toBaseIO
+    let (_, entries) ← match prefetched? with
+      | some (f, t) => if f == file then IO.wait t else readRecord recordKind false file
+      | none => readRecord recordKind false file
+    let wantKept : IO.Promise Unit ← IO.Promise.new
+    let kept ← BaseIO.mapTask (t := wantKept.result?) (prio := .dedicated) fun
+      | some () => readRecord keptKind true keptFile
+      | none => pure (0, {})
+    return some { file, entries, before := min mt ct - margin, keptFile, wantKept, kept : Loaded }).toBaseIO
   if let .ok (some l) := r then loadedRef.set (some l)
 
 /-- The hash in the `.hash` file `hashFile`, as `Hash.load?` reads it, without reading the file if
@@ -144,10 +219,19 @@ public def load? (hashFile : FilePath) : BaseIO (Option Hash) := do
   let path := hashFile.toString
   -- (the file is read after this, so that a write after it changes the identity recorded)
   let some id ← Lean.PaperLean.fileIdentity path | Hash.load? hashFile
-  if let some e := l.entries[path]? then
+  match l.entries[path]? with
+  | some e =>
     if e.identity == id then
       hitsRef.modify (path :: ·)
       return some ⟨e.hash⟩
+    goneRef.modify (path :: ·)
+  | none =>
+    l.wantKept.resolve ()
+    if let some e := (← IO.wait l.kept).2[path]? then
+      if e.identity == id then
+        keptHitsRef.modify (path :: ·)
+        return some ⟨e.hash⟩
+      goneRef.modify (path :: ·)
   let h? ← Hash.load? hashFile
   if let some h := h? then
     let (mt, ct) := changeTimes id
@@ -155,21 +239,44 @@ public def load? (hashFile : FilePath) : BaseIO (Option Hash) := do
       newRef.modify ((path, { identity := id, hash := h.val }) :: ·)
   return h?
 
-/-- Writes the record at the end of the build, of the files that the build read, if it changed. -/
+/-- Writes the records at the end of the build, if they changed: the record of the files that the
+build read, and the kept record of those that the record had and the build did not read, with what it
+kept before, less what the build read of it, what changed and what is too old. -/
 public def finish : BaseIO Unit := do
   let some l ← loadedRef.swap none | return
   let hits ← hitsRef.swap []
+  let keptHits ← keptHitsRef.swap []
   let new ← newRef.swap []
+  let gone ← goneRef.swap []
   removeStaleTemps l.file
+  -- (a file that is read twice counts twice: then the record may keep an entry that was not read)
+  if new.isEmpty && keptHits.isEmpty && gone.isEmpty && hits.length ≥ l.entries.size then return
+  let goneSet : Std.HashSet String := gone.foldl (·.insert ·) {}
   let read : Std.HashMap String Entry := hits.foldl (init := {}) fun m p =>
     match l.entries[p]? with
     | some e => m.insert p e
     | none => m
-  if new.isEmpty && read.size == l.entries.size then return
-  let entries := new.foldl (fun m (p, e) => m.insert p e) read
-  let tmp := l.file.addExtension s!"tmp.{← IO.Process.getPID}"
-  discard <| (do
-    IO.FS.writeBinFile tmp (encode entries)
-    IO.FS.rename tmp l.file).toBaseIO
+  let unread := l.entries.fold (init := #[]) fun out p e =>
+    if read.contains p || goneSet.contains p then out else out.push (p, e)
+  -- (read if the build looked up a file there, or if it gets the unread entries)
+  let kept? ← if unread.isEmpty && !(← IO.hasFinished l.kept) then pure none else do
+    l.wantKept.resolve ()
+    pure (some (← IO.wait l.kept))
+  let mut entries := read
+  if let some (_, k) := kept? then
+    entries := keptHits.foldl (init := entries) fun m p =>
+      match k[p]? with
+      | some e => m.insert p { e with gen := 0 }
+      | none => m
+  entries := new.foldl (fun m (p, e) => m.insert p e) entries
+  install l.file (encode recordKind false 0 entries)
+  let some (gen, k) := kept? | return
+  if unread.isEmpty && keptHits.isEmpty && !gone.any k.contains && !new.any (k.contains ·.1) then
+    return
+  removeStaleTemps l.keptFile
+  let gen := gen + 1
+  let k := k.filter fun p e => !entries.contains p && !goneSet.contains p && gen - e.gen ≤ maxAge
+  let k := unread.foldl (init := k) fun k (p, e) => k.insert p { e with gen }
+  install l.keptFile (encode keptKind true gen k)
 
 end Lake.PaperLean.HashCache

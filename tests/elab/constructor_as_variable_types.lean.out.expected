@@ -1,0 +1,36 @@
+constructor_as_variable_types.lean:22:8-22:9: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:22:32-22:33: warning: Local variable 'z' resembles constructor 'B.z' - write '.z' (with a dot) or 'B.z' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:25:8-25:9: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:28:8-28:9: warning: Local variable 'z' resembles constructor 'B.z' - write '.z' (with a dot) or 'B.z' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:30:29-30:30: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:32:15-32:16: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:37:4-37:5: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:37:7-37:8: warning: Local variable 'z' resembles constructor 'B.z' - write '.z' (with a dot) or 'B.z' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:41:4-41:5: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:43:12-43:13: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:45:39-45:43: warning: Local variable 'none' resembles constructor 'Option.none' - write '.none' (with a dot) or 'Option.none' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
+constructor_as_variable_types.lean:54:16-54:17: warning: Local variable 'x' resembles constructor 'B.x' - write '.x' (with a dot) or 'B.x' to use the constructor.
+
+Note: This linter can be disabled with `set_option linter.constructorNameAsVariable false`
