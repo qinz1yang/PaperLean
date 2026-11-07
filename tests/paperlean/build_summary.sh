@@ -430,7 +430,7 @@ check_status() {
   interpreted Plain.Mid "it imports one that does"
   interpreted Plain "it imports one that does"
   interpreted Ext.Base "it declares the \`@[extern]\` function review_external_base"
-  interpreted Ext.Up "it refers to review_external_base, which nothing defines"
+  interpreted Ext.Up "its C uses inputs outside the relocatable generated-C profile"
   interpreted Ext.Builtin "it has \`builtin_initialize\` declarations"
   interpreted Ext.Both "it has \`[init]\` declarations of both phases"
   interpreted Gone "no .c"

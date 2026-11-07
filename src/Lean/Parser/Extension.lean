@@ -345,6 +345,80 @@ private def ParserExtension.OLeanEntry.toEntry (s : State) : OLeanEntry → Impo
     let (leading, p) ← mkParserOfConstant s.categories declName
     return Entry.parser catName declName leading p prio
 
+private abbrev ParserRows := Array (Array (ScopedEnvExtension.Entry ParserExtension.OLeanEntry))
+private abbrev ParserStack := ScopedEnvExtension.StateStack
+  ParserExtension.OLeanEntry ParserExtension.Entry ParserExtension.State
+
+-- A verified packed row can supply the profitability decision: 0 means unavailable,
+-- 1 sparse and 2 dense. Only prepare samples relocated entries within their verified bounds.
+@[extern "lean_paperlean_parser_row_density"]
+private opaque parserRowDensity (data : @& ModuleData)
+    (row : @& Array (ScopedEnvExtension.Entry ParserExtension.OLeanEntry)) : UInt8 := 0
+
+-- Missing, unknown and mismatched hints leave rows to the ordinary ordered fold. Never
+-- look ahead into raw parser entries: an earlier entry may already be an import error.
+private def hasRepeatedParserTokens (data : Array ModuleData) (rows : ParserRows) : Bool := Id.run do
+  for row in rows, d in data, _ in [:16] do
+    match parserRowDensity d row with
+    | 1 => return false
+    | 2 => return true
+    | _ => pure ()
+  return false
+
+-- Duplicate token insertion ordinarily returns all three original fields. Matching
+-- their pointers proves structural identity without traversing parser tables or closures.
+private def sameParserFields (a b : ParserExtension.State) : Bool :=
+  let ⟨tokens, kinds, categories⟩ := a
+  let ⟨tokens', kinds', categories'⟩ := b
+  unsafe ptrEq tokens tokens' && ptrEq kinds kinds' && ptrEq categories categories'
+
+private unsafe def addImportedParserEntries
+    (descr : ScopedEnvExtension.Descr ParserExtension.OLeanEntry ParserExtension.Entry ParserExtension.State)
+    (rows : ParserRows) : ImportM ParserStack := do
+  let mode ← PaperLean.importMode
+  if mode == 1 || !hasRepeatedParserTokens (← read).env.header.moduleData rows then
+    return ← PaperLean.addImportedFnFast descr rows
+  if ← PaperLean.importTimingEnabled then IO.eprintln "paperlean-counter parser.deduplicateGlobalTokens"
+  let inject ← if mode == 2 then
+    pure ((← IO.getEnv "PAPERLEAN_IMPORT_CHECK_FAULT") == some "state")
+  else pure false
+  ScopedEnvExtension.foldImported descr rows (mkPtrSet (α := String)) fun s seen entry => do
+    let insert := do return descr.addEntry s (← descr.ofOLeanEntry s entry)
+    match entry with
+    | .token tk =>
+      if tk.isEmpty then return (← insert, mkPtrSet)  -- invalid tokens may reset the trie
+      -- Keep the token alive and compare its address. Distinct objects take the stock path,
+      -- which need not read the full byte count advertised by a damaged compact string.
+      let (old, seen) := Std.HashSet.containsThenInsert seen ⟨tk⟩
+      unless old do return (← insert, seen)
+      -- This skip is the only deviation from the original fold. Compare both transitions
+      -- on the same state before proceeding, so parser loading and its effects run only once.
+      if mode == 2 then
+        let stock ← insert
+        unless !inject && sameParserFields s stock do
+          discard <| PaperLean.checkedImportedState descr.name s stock true
+      return (s, seen)
+    | .parser .. =>
+      let next ← insert
+      -- A failed parser insertion may reset the trie.
+      return (next, if unsafe ptrEq s.tokens next.tokens then seen else mkPtrSet)
+    | _ => return (← insert, seen)
+
+-- Install the specialized importer only on this builtin's persistent extension. Other extensions
+-- with different ofOLeanEntry or addEntry functions always retain their own registration.
+private unsafe def registerParserExtensionUnsafe
+    (descr : ScopedEnvExtension.Descr ParserExtension.OLeanEntry ParserExtension.Entry ParserExtension.State) :
+    IO ParserExtension := do
+  unless PaperLean.nativeAvailable descr do return ← Lean.registerScopedEnvExtension descr
+  PaperLean.registerScopedEnvExtensionWithImport descr (addImportedParserEntries descr)
+
+@[implemented_by registerParserExtensionUnsafe]
+-- Keep the original initializer spelling so precompiled references to its private
+-- generated callbacks still resolve. This private constructor accepts only the parser descriptor.
+private opaque registerScopedEnvExtension
+    (descr : ScopedEnvExtension.Descr ParserExtension.OLeanEntry ParserExtension.Entry ParserExtension.State) :
+    IO ParserExtension
+
 builtin_initialize parserExtension : ParserExtension ←
   registerScopedEnvExtension {
     mkInitial       := ParserExtension.mkInitial

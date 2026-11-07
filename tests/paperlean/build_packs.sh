@@ -69,7 +69,7 @@ export PAPERLEAN_ACCELERATE=1
 clean
 run lake build
 [ -z "$(packdirs)" ] || fail "a small build wrote packs: $(packdirs)"
-[ ! -e "$PAPERLEAN_CACHE_DIR" ] || fail "a small build packed the toolchain's library"
+[ ! -e "$PAPERLEAN_CACHE_DIR/toolchain-packs" ] || fail "a small build packed the toolchain's library"
 
 # `PAPERLEAN_BUILD_PACKS=0` packs nothing in a build large enough to pack, which does without it.
 mkdir "$TMP_DIR/many"
@@ -80,7 +80,7 @@ mkdir Many
 for i in $(seq 1 33); do echo "def m$i : Nat := $i" > Many/M$i.lean; echo "import Many.M$i" >> Many.lean; done
 run env PAPERLEAN_BUILD_PACKS=0 PAPERLEAN_BUILD_PACK_BATCH=3 PAPERLEAN_BUILD_PACKS_KEEP=1 lake build
 [ -z "$(packdirs)" ] || fail "PAPERLEAN_BUILD_PACKS=0 wrote packs: $(packdirs)"
-[ ! -e "$PAPERLEAN_CACHE_DIR" ] || fail "PAPERLEAN_BUILD_PACKS=0 packed the toolchain's library"
+[ ! -e "$PAPERLEAN_CACHE_DIR/toolchain-packs" ] || fail "PAPERLEAN_BUILD_PACKS=0 packed the toolchain's library"
 rm -rf .lake/build
 run env PAPERLEAN_BUILD_PACK_BATCH=3 PAPERLEAN_BUILD_PACKS_KEEP=1 lake build
 [ -n "$(packdirs)" ] || fail "a build of 34 modules wrote no packs"

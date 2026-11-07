@@ -49,7 +49,7 @@ slow=$!
 for _ in $(seq 600); do [ -e "$MARK" ] && break; sleep 0.1; done
 [ -e "$MARK" ] || { cat "$TMP_DIR/slow.out"; fail "Slow.A did not start compiling"; }
 indexes="$(ls .lake/paperlean-setup/*/setup-*.paperlean)"
-[ "$(echo "$indexes" | wc -l)" = 1 ] || fail "not the index of the first build: $indexes"
+[ "$(echo "$indexes" | wc -l)" -eq 1 ] || fail "not the index of the first build: $indexes"
 capture lake paperlean build Fast
 check_out_contains "Built Fast.A"
 [ -f "$indexes" ] || fail "the second build removed the index of the first"

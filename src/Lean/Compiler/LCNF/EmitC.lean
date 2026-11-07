@@ -1174,7 +1174,7 @@ def main : EmitM Unit := do
 public def emitCForDecls (modName : Name) (decls : Array Name) : CoreM String := do
   let (localDecls, otherModuleDecls) ← collectUsedDecls decls
   let env ← getEnv
-  let indexMap := getImpureDeclIndices env decls
+  let indexMap := getImpureDeclIndices env (localDecls.map (·.name))
   let localDecls := localDecls.qsort fun l r => indexMap[l.name]! < indexMap[r.name]!
   let (_, { buf, .. }) ←
     main

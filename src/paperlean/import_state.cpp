@@ -8,6 +8,8 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <exception>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -30,6 +32,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include "util/name.h"
 #include "paperlean/fast_import.h"
 #include "paperlean/side_file.h"
+#include "paperlean/side_file_output.h"
 #include "paperlean/olean_pack.h"
 
 /*
@@ -1678,6 +1681,44 @@ unsigned num_fields(state_kind kind) { return kind == state_kind::simp ? g_simp_
 // The number of entries from which a state is replayed on its own thread.
 constexpr size_t g_prefetch_min_entries = 1000;
 
+// Share a nonblocking process-wide limit between pure Lean extension folds and native
+// image replays. Successful acquisitions count running work, not previously finished results.
+static unsigned import_worker_limit() {
+    static unsigned const limit = [] {
+        unsigned fallback = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+        char const * text = std::getenv("PAPERLEAN_IMPORT_THREADS");
+        if (!text || !*text) return fallback;
+        unsigned n = 0;
+        for (; *text; ++text) {
+            if (*text < '0' || *text > '9') return fallback;
+            n = std::min(64u, n * 10 + static_cast<unsigned>(*text - '0'));
+        }
+        return n;
+    }();
+    return limit;
+}
+
+static std::atomic<unsigned> g_import_workers {0};
+
+static bool try_import_worker(b_obj_arg ext_name) {
+    unsigned cap = import_worker_limit();
+    unsigned n = g_import_workers.load(std::memory_order_relaxed);
+    while (n < cap) {
+        if (g_import_workers.compare_exchange_weak(n, n + 1, std::memory_order_relaxed)) {
+            if (import_timing_enabled())
+                fprintf(stderr, "paperlean-counter importWorker.admitted ext=%s active=%u limit=%u\n",
+                        name(ext_name).to_string().c_str(), n + 1, cap);
+            return true;
+        }
+    }
+    if (import_timing_enabled())
+        fprintf(stderr, "paperlean-counter importWorker.budget ext=%s limit=%u\n",
+                name(ext_name).to_string().c_str(), cap);
+    return false;
+}
+
+static void release_import_worker() { g_import_workers.fetch_sub(1, std::memory_order_relaxed); }
+
 // A replay started on another thread when `finalizePersistentExtensions` begins, or after it collects
 // the entries of extensions registered meanwhile; `ScopedEnvExtension.addImportedFn`, called by
 // `finalizePersistentExtensions` on the same thread, takes its state if it is called with the same
@@ -1685,16 +1726,23 @@ constexpr size_t g_prefetch_min_entries = 1000;
 // its thread when it ends, so no replay outlives the regions of the import. The thread reads only
 // the image, the entries arrays and the initial state, all persistent, calls pure Lean functions on
 // the entries that are not in the image (of the modules the image's pack does not have), and
-// allocates the state's objects, which pass to the importing thread when it joins.
+// allocates the state's objects. Only the replay worker owns its fresh nodes until it exits;
+// all shared inputs are already persistent. Joining transfers exclusive ownership of the result
+// to the importing thread, which can release it or make it persistent when it is taken.
 struct prefetch {
     std::thread::id owner;             // the importing thread
     std::string key;                   // `extension_name_key` of the extension
     object * initial = nullptr;        // owned
     std::vector<object *> arrays;      // the nonempty entries arrays, persistent
     object * result = nullptr;         // set by the thread: the state, `nullptr` if not replayed
+    bool persistent = false;          // make only the accepted state persistent
     std::unique_ptr<lthread> thread;
     void join() { if (thread) { thread->join(); thread.reset(); } }
-    ~prefetch() { join(); if (initial) lean_dec(initial); }
+    ~prefetch() {
+        join();
+        if (result) lean_dec(result);
+        if (initial) lean_dec(initial);
+    }
 };
 std::mutex g_prefetch_mutex;
 std::vector<std::unique_ptr<prefetch>> * g_prefetches = new std::vector<std::unique_ptr<prefetch>>();
@@ -1709,15 +1757,6 @@ template<class P> std::vector<std::unique_ptr<prefetch>> remove_prefetches(P con
         else ++it;
     }
     return r;
-}
-
-// Waits for prefetches and releases their states (a state marked persistent stays allocated).
-void drop_prefetches(std::vector<std::unique_ptr<prefetch>> & ps) {
-    for (auto & p : ps) {
-        p->join();
-        if (p->result) lean_dec(p->result);
-        p->result = nullptr;
-    }
 }
 
 // Whether the image's table of entries arrays of `x` can be searched by `image_array_of` before
@@ -1748,12 +1787,37 @@ object * take_prefetched(b_obj_arg ext_name, b_obj_arg initial, b_obj_arg as) {
             std::unique_ptr<scoped_import_timer> t(usable ? new scoped_import_timer(counter_prefetch_wait) : nullptr);
             p->join();
         }
-        if (!p->result) continue;
-        if (usable) r = p->result;
-        else lean_dec(p->result);
+        if (usable && p->result) {
+            if (p->persistent) lean_mark_persistent(p->result);
+            r = p->result;
+            p->result = nullptr;
+        }
     }
     return r;
 }
+}
+
+extern "C" obj_res lean_paperlean_try_dedicated_fold(obj_arg act);
+
+/* A started pure fold returns its slot in its Lean finalizer. On any miss, leave the
+   normal synchronous fold responsible and consume the action exactly once. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_start_import_fold(b_obj_arg ext_name, obj_arg act) {
+    if (!try_import_worker(ext_name)) {
+        lean_dec(act);
+        return lean_box(0);
+    }
+    object * task = lean_paperlean_try_dedicated_fold(act);
+    if (lean_is_scalar(task)) {
+        release_import_worker();
+        if (import_timing_enabled())
+            fprintf(stderr, "paperlean-counter importWorker.unavailable ext=%s\n",
+                    name(ext_name).to_string().c_str());
+    }
+    return task;
+}
+extern "C" LEAN_EXPORT obj_res lean_paperlean_release_import_worker() {
+    release_import_worker();
+    return lean_box(0);
 }
 
 /* enableImportedStateReplay : BaseIO Unit -- once `Lean.PaperLean.ImportState` is initialized */
@@ -1804,8 +1868,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_prefetch_imported_state(b_obj_arg 
     if (others > n) return skip("mostlyNotInImage");
     // `finalizePersistentExtensions` prefetches each extension once and drops the prefetches of its
     // thread when it ends, so a pending prefetch of the extension on this thread is stale
-    std::vector<std::unique_ptr<prefetch>> stale = remove_prefetches([&](prefetch const & p) { return p.key == key; });
-    drop_prefetches(stale);
+    // Removed records join and release their results outside the registry lock.
+    remove_prefetches([&](prefetch const & p) { return p.key == key; });
     lean_inc(ext_name);
     uint8 okind = lean_paperlean_imported_state_kind(ext_name);
     if (okind > 1 || g_image->exts[xi].kind != okind || !init_trie_empty()) return skip("kind");
@@ -1828,13 +1892,18 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_prefetch_imported_state(b_obj_arg 
     p->arrays = std::move(arrays);
     prefetch * q = p.get();
     uint32 i = static_cast<uint32>(xi);
-    bool mark = persistent != 0;
-    p->thread.reset(new lthread([q, i, kind, mark] {
-        if (!image_ext_usable(i)) return;
-        object * r = replay_state(kind, &g_image->exts[i], q->initial, q->arrays);
-        if (r && mark) lean_mark_persistent(r);
-        q->result = r;
-    }));
+    p->persistent = persistent != 0;
+    if (!try_import_worker(ext_name)) return lean_box(0);
+    try {
+        p->thread.reset(new lthread([q, i, kind] {
+            struct release_slot { ~release_slot() { release_import_worker(); } } slot;
+            if (!image_ext_usable(i)) return;
+            q->result = replay_state(kind, &g_image->exts[i], q->initial, q->arrays);
+        }));
+    } catch (std::exception const &) {
+        release_import_worker();
+        return skip("threadUnavailable");
+    }
     if (import_timing_enabled())
         fprintf(stderr, "paperlean-counter prefetch.started ext=%s entries=%zu\n", name(ext_name).to_string().c_str(), n);
     std::lock_guard<std::mutex> lock(g_prefetch_mutex);
@@ -1846,8 +1915,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_prefetch_imported_state(b_obj_arg 
    Waits for the prefetches of the current thread that were not taken and releases them; called when
    `finalizePersistentExtensions` ends. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_drop_prefetched_replays(b_obj_arg) {
-    std::vector<std::unique_ptr<prefetch>> mine = remove_prefetches([](prefetch const &) { return true; });
-    drop_prefetches(mine);
+    remove_prefetches([](prefetch const &) { return true; });
     return lean_box(0);
 }
 
@@ -1889,6 +1957,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_imported_state(b_obj_arg ext_name,
    Writes the import image of the olean packs in use for the extensions `exts` of the given kinds. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout, b_obj_arg oexts) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    if (strlen(lean_string_cstr(oout)) + 1 != lean_string_size(oout)) return mk_embedded_nul_error(oout);
     std::string out(lean_string_cstr(oout));
     image_header hdr = {};
     init_side_file_header(hdr.common, g_image_kind, sizeof(image_header));
@@ -1941,24 +2010,12 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_import_image(b_obj_arg oout,
     hdr.mtime_nsec = 0;
     hdr.common.checksum = image_checksum(hdr, file.data());
     memcpy(&file[0], &hdr, sizeof(hdr));
-    std::string tmp = out + ".tmp." + std::to_string(getpid());
-    // read-only: a tool writing to a mapped image in place fails
-    std::remove(tmp.c_str());
-    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444);
-    bool ok = fd >= 0;
-    for (size_t off = 0; ok && off < file.size();) {
-        ssize_t n = write(fd, file.data() + off, file.size() - off);
-        if (n < 0 && errno == EINTR) continue;
-        ok = n > 0;
-        if (ok) off += static_cast<size_t>(n);
-    }
-    // the modification time, set last: a write to the file changes it
-    ok = ok && side_file_set_mtime(fd, hdr.mtime_sec) && side_file_sync(fd);
-    if (fd >= 0 && close(fd) != 0) ok = false;
-    if (!ok || std::rename(tmp.c_str(), out.c_str()) != 0) {
-        std::remove(tmp.c_str());
+    // Readers map the complete read-only image and validate the mtime stored in
+    // its header. Set it and flush the owned descriptor before publishing.
+    side_file_output output(out);
+    if (!output.open(0444) || !output.write_bytes(file.data(), file.size()) ||
+        !side_file_set_mtime(output.fd(), hdr.mtime_sec) || !side_file_sync(output.fd()) || !output.publish())
         return io_result_mk_error("writeImportImage: failed to write '" + out + "'");
-    }
     return io_result_mk_ok(lean_usize_to_nat(num_entries));
 #else
     (void)oout;

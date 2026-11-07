@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Sofia Rodrigues, Henrik Böving
 */
 #include "runtime/uv/event_loop.h"
+#include "runtime/thread.h"
 
 
 /*
@@ -65,6 +66,14 @@ void event_loop_init(event_loop_t * event_loop) {
 
 // Locks the event loop for the side of the requesters.
 void event_loop_lock(event_loop_t * event_loop) {
+    // Proof-only processes never need a libuv worker. Concurrent first requesters
+    // share a single thread, and the loop's async handle is already initialized.
+    if (event_loop == &global_ev) {
+        [[maybe_unused]] static const bool started = [] {
+            lthread([] { event_loop_run_loop(&global_ev); });
+            return true;
+        }();
+    }
     if (uv_mutex_trylock(&event_loop->mutex) != 0) {
         event_loop->n_waiters++;
         event_loop_interrupt(event_loop);
@@ -83,8 +92,12 @@ void event_loop_unlock(event_loop_t * event_loop) {
 
 // Runs the loop and stops when it needs to register new requests.
 void event_loop_run_loop(event_loop_t * event_loop) {
-    while (uv_loop_alive(event_loop->loop)) {
+    for (;;) {
         uv_mutex_lock(&event_loop->mutex);
+        if (!uv_loop_alive(event_loop->loop)) {
+            uv_mutex_unlock(&event_loop->mutex);
+            return;
+        }
 
         while (event_loop->n_waiters != 0) {
             uv_cond_wait(&event_loop->cond_var, &event_loop->mutex);
@@ -101,8 +114,8 @@ void event_loop_run_loop(event_loop_t * event_loop) {
     }
 }
 
-/* Std.Internal.UV.Loop.configure (options : Loop.Options) : BaseIO Unit */
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(b_obj_arg options) {
+/* Std.Internal.UV.Loop.configureChecked (options : @& Loop.Options) : IO Unit */
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure_checked(b_obj_arg options) {
     bool accum = lean_ctor_get_uint8(options, 0);
     bool block = lean_ctor_get_uint8(options, 1);
 
@@ -110,19 +123,30 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(b_obj_arg optio
 
     if (accum) {
         int result = uv_loop_configure(global_ev.loop, UV_METRICS_IDLE_TIME);
-        if (result != 0) return lean_io_result_mk_error(lean_decode_uv_error(result, NULL));
+        if (result != 0) {
+            event_loop_unlock(&global_ev);
+            return lean_io_result_mk_error(lean_decode_uv_error(result, NULL));
+        }
     }
 
-    #if!defined(WIN32) && !defined(_WIN32)
+    #if !defined(WIN32) && !defined(_WIN32)
     if (block) {
         int result = uv_loop_configure(global_ev.loop, UV_LOOP_BLOCK_SIGNAL, SIGPROF);
-        if (result != 0) return lean_io_result_mk_error(lean_decode_uv_error(result, NULL));
+        if (result != 0) {
+            event_loop_unlock(&global_ev);
+            return lean_io_result_mk_error(lean_decode_uv_error(result, NULL));
+        }
+    }
+    #else
+    if (block) {
+        event_loop_unlock(&global_ev);
+        return io_result_mk_error("blocking SIGPROF is not supported on this platform");
     }
     #endif
 
     event_loop_unlock(&global_ev);
 
-    return lean_box(0);
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 /* Std.Internal.UV.Loop.alive : BaseIO Bool */
@@ -140,9 +164,9 @@ void initialize_libuv_loop() {
 
 #else
 
-/* Std.Internal.UV.Loop.configure (options : Loop.Options) : BaseIO Unit */
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(b_obj_arg options) {
-    return io_result_mk_error("lean_uv_event_loop_configure is not supported");
+/* Std.Internal.UV.Loop.configureChecked (options : @& Loop.Options) : IO Unit */
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure_checked(b_obj_arg options) {
+    return io_result_mk_error("lean_uv_event_loop_configure_checked is not supported");
 }
 
 /* Std.Internal.UV.Loop.alive : BaseIO Bool */
@@ -151,5 +175,14 @@ extern "C" LEAN_EXPORT uint8_t lean_uv_event_loop_alive() {
 }
 
 #endif
+
+// The rc3 BaseIO ABI consumes options and returns scalar Unit on every path.
+// configureChecked borrows options and owns its IOResult.
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(obj_arg options) {
+    lean_object * result = lean_uv_event_loop_configure_checked(options);
+    lean_dec(options);
+    lean_dec(result);
+    return lean_box(0);
+}
 
 }

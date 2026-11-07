@@ -135,7 +135,7 @@ to find candidate lemmas.
 -/
 @[reducible, expose] def CandidateFinder := Expr → MetaM (Array (Name × DeclMod))
 
-open LazyDiscrTree (InitEntry findMatches)
+open LazyDiscrTree (InitEntry)
 
 private def addImport (name : Name) (c : AsyncConstantInfo) :
     MetaM (Array (InitEntry (Name × DeclMod))) := do
@@ -158,7 +158,8 @@ private def addImport (name : Name) (c : AsyncConstantInfo) :
 an environment extension: the snapshot used by `--incr-load` compacts the whole environment object
 (including non-persistent extension state), and a mutable `IO.Ref` baked into the read-only mapped
 region is unsound to read or write. A process-global ref is rebuilt per process instead. -/
-private builtin_initialize ext : IO.Ref (Option (LazyDiscrTree (Name × DeclMod))) ←
+private builtin_initialize ext :
+    IO.Ref (Option (LazyDiscrTree (Name × DeclMod) × Array (Name × DeclMod))) ←
   IO.mkRef .none
 
 /--
@@ -177,31 +178,39 @@ initialization performance.
 -/
 private def constantsPerImportTask : Nat := 6500
 
-/-- Process-global cache for star-indexed lemmas (see `ext`); used as a fallback when primary search
-    finds nothing for fvar-headed goals. -/
-private builtin_initialize starLemmasExt : IO.Ref (Option (Array (Name × DeclMod))) ←
-  IO.mkRef .none
+/-- Initialize imported matches and their dropped entries together. Concurrent first queries
+may compute equivalent trees, but cannot append duplicate entries or observe half a cache. -/
+private def getImportTree :
+    MetaM (LazyDiscrTree (Name × DeclMod) × Array (Name × DeclMod)) := do
+  if let some cached ← ext.get then return cached
+  let cached ← profileitM Exception "lazy discriminator import initialization" (← getOptions) do
+    let cctx ← readThe Core.Context
+    let ngen ← LazyDiscrTree.getChildNgen
+    let tree ← LazyDiscrTree.createImportedDiscrTree (LazyDiscrTree.createTreeCtx cctx)
+      ngen (← getEnv) addImport (constantsPerTask := constantsPerImportTask)
+    let (stars, tree) ← LazyDiscrTree.extractKeys tree droppedKeys
+    return (tree, stars)
+  ext.set (some cached)
+  return cached
 
-/-- Create function for finding relevant declarations.
-    Also captures dropped entries in starLemmasExt for fallback search. -/
+/-- Create function for finding relevant declarations. -/
 def libSearchFindDecls (ty : Expr) : MetaM (Array (Name × DeclMod)) := do
-  let droppedRef := starLemmasExt
-  findMatches ext addImport
-      (droppedKeys := droppedKeys)
-      (constantsPerTask := constantsPerImportTask)
-      (droppedEntriesRef := some droppedRef)
-      ty
+  let moduleTreeRef ← LazyDiscrTree.createModuleTreeRef addImport droppedKeys
+  let moduleMatches ← LazyDiscrTree.findModuleMatches moduleTreeRef ty
+  let (tree, stars) ← getImportTree
+  let (importMatches, tree) ← tree.getMatch ty
+  ext.set (some (tree, stars))
+  return Array.mkEmpty (moduleMatches.size + importMatches.size)
+    |> moduleMatches.appendResultsAux (f := fun _ v => v)
+    |> importMatches.appendResultsAux (f := fun _ v => v)
 
-/-- Get star-indexed lemmas (lazily computed during tree initialization). -/
+/-- Get current-module star lemmas followed by the cached imported star lemmas.
+Local declarations are collected for each query so backtracking cannot leave stale entries. -/
 def getStarLemmas : MetaM (Array (Name × DeclMod)) := do
-  let ref := starLemmasExt
-  match ←ref.get with
-  | some lemmas => return lemmas
-  | none =>
-    -- If star lemmas aren't cached yet, trigger tree initialization by searching for a dummy type
-    -- This will populate starLemmasExt as a side effect
-    let _ ← libSearchFindDecls (mkConst ``True)
-    pure ((←ref.get).getD #[])
+  let localRef ← IO.mkRef (none : Option (Array (Name × DeclMod)))
+  let _ ← LazyDiscrTree.createModuleTreeRef addImport droppedKeys (some localRef)
+  let (_, importedStars) ← getImportTree
+  return (← localRef.get).getD #[] ++ importedStars
 
 /--
 Return an action that returns true when the remaining heartbeats is less

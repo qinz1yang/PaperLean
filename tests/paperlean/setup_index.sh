@@ -97,7 +97,7 @@ capture lake env lean "$TMP_DIR/probe.lean"
 check_out_contains 2
 [ ! -e .lake/build/ir/R/Top.setup.json ] || fail "paperlean build wrote the conventional setup file"
 indexes="$(ls .lake/paperlean-setup/*/setup-*.paperlean)"
-[ "$(echo "$indexes" | wc -l)" = 1 ] || fail "not one index: $indexes"
+[ "$(echo "$indexes" | wc -l)" -eq 1 ] || fail "not one index: $indexes"
 # Each setup refers to the index, and `ModuleSetup.load` gives the artifacts that `lake build` lists.
 for m in $MODS; do
   side="$(setup_file "$m")"
@@ -111,6 +111,8 @@ done
 # A missing or damaged index fails `lean`.
 side="$(setup_file R.Top)"
 cp "$indexes" "$TMP_DIR/index"
+# Generated indexes are immutable; deliberately break that contract for the corruption test.
+chmod u+w "$indexes"
 echo x >> "$indexes"
 capture_fail lake env lean --setup "$side" R/Top.lean
 check_out_contains "is damaged: its contents do not have the hash it is named by"
@@ -127,3 +129,29 @@ capture lake paperlean build
 [ -z "$(ls .lake/paperlean-setup/*/setup-*.paperlean 2>/dev/null | grep -v "$indexes")" ] ||
   fail "the build left its index: $(ls .lake/paperlean-setup/*)"
 capture_fail lake env lean --setup "$side" R/Top.lean
+
+# Package-qualified targets can have the same name but require different parts of an import.
+mkdir -p "$TMP_DIR/owners"/{aa,bb}
+cd "$TMP_DIR/owners"
+cat > lakefile.toml <<'END'
+name = "owners"
+[[require]]
+name = "aa"
+path = "aa"
+[[require]]
+name = "bb"
+path = "bb"
+END
+for pkg in aa bb; do
+  printf 'name = "%s"\n[[lean_lib]]\nname = "Clash"\n' "$pkg" > "$pkg/lakefile.toml"
+done
+printf '[[lean_lib]]\nname = "Shared"\n' >> bb/lakefile.toml
+printf 'module\npublic def visible : Nat := 42\n' > bb/Shared.lean
+printf 'module\nimport all Shared\nexample : visible = 42 := rfl\n' > aa/Clash.lean
+printf 'module\npublic import Shared\npublic def publicValue := visible\n' > bb/Clash.lean
+capture env PAPERLEAN_SETUP_INDEX_KEEP=1 lake paperlean build @aa/+Clash @bb/+Clash
+for pkg in aa bb; do
+  side="$pkg/.lake/build/ir/Clash.setup.paperlean"
+  lake query "@$pkg/+Clash:setup" --json | arts > "$TMP_DIR/$pkg.setup"
+  [ "$(arts "$side")" = "$(cat "$TMP_DIR/$pkg.setup")" ] || fail "wrong setup for $pkg/Clash"
+done

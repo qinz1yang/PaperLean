@@ -13,6 +13,7 @@ public import Lake.Config.Module
 public import Lake.Util.EquipT
 public import Lake.Util.Cycle
 import Lake.Build.Infos
+import Lake.PaperLean.SetupProviders
 
 /-! # Recursive Building
 
@@ -98,9 +99,27 @@ public abbrev FetchM := FetchT LogIO
     IO.Ref BuildStore → BuildContext → Log → BaseIO (EResult Log.Pos Log α)
 := fun fetch pkg? stack store ctx log => self.run fetch pkg? stack store ctx |>.run log
 
+@[noinline, nospecialize] private def observeResult (ctx : BuildContext) (store : IO.Ref BuildStore)
+    (info : BuildInfo) (job : Job (BuildData info.key)) : BaseIO Unit :=
+  PaperLean.SetupProviders.checkResult ctx store info job
+
 /-- Fetch the result associated with the info using the Lake build index. -/
 @[inline] public def BuildInfo.fetch (self : BuildInfo) [FamilyOut BuildData self.key α] : FetchM (Job α) :=
-  .mk fun build => cast (by simp) <| build self
+  .mk fun build pkg? stack store ctx => do
+    let job ← build self pkg? stack store ctx
+    observeResult ctx store self job
+    return cast (by simp) job
+
+/-- Keep the actual store update and its provider observation in the same build. -/
+public def PaperLean.saveSetupJob (info : BuildInfo) (job : Job (BuildData info.key)) :
+    FetchM (Job (BuildData info.key)) :=
+  .mk fun _ _ _ store ctx => PaperLean.SetupProviders.storeJob ctx store info job
+
+/-- Observe the relevant facet before running its provider in the normal recursive engine. -/
+public def PaperLean.observeSetupProvider (info : BuildInfo) (facet : Lean.Name) : FetchM Unit :=
+  .mk fun fetch _ _ store ctx => do
+    if PaperLean.SetupProviders.facets.contains facet then
+      PaperLean.SetupProviders.enterProvider ctx store info fetch (facet == Module.leanArtsFacet)
 
 export BuildInfo (fetch)
 

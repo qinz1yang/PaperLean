@@ -66,3 +66,17 @@ cd "$TMP_DIR"
 PAPERLEAN_PROJ_ORACLE=1 capture_exit 0 lean WhnfProj.lean
 check_out_contains "ok"
 check_out_matches "PAPERLEAN_PROJ_ORACLE: [0-9]*[0-9]{3} fields checked"
+
+# A failed check must print the counterexample even inside a captured command.
+cat > OracleMismatch.lean <<'EOF2'
+module
+import Lean
+import all Lean.Meta.WHNF
+open Lean Meta
+run_meta do
+  discard <| IO.FS.withIsolatedStreams <|
+    Lean.Meta.checkProjOracle (mkNatLit 0) (mkNatLit 0) 0
+EOF2
+capture_exit 77 lean OracleMismatch.lean
+check_out_contains "PAPERLEAN_PROJ_ORACLE: field 0"
+check_out_contains "is none"

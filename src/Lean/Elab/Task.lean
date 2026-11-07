@@ -49,7 +49,16 @@ def asTask (t : CoreM α) : CoreM (BaseIO Unit × Task (CoreM α)) := do
   let cancelToken ← IO.CancelToken.new
   -- Use wrapAsync to properly handle name generators and heartbeats,
   -- but modify it to return both the result and state
-  let wrappedAct ← Core.wrapAsync (fun () => do let a ← t; let s ← get; return (a, s)) (some cancelToken)
+  let wrappedAct ← Core.wrapAsync (fun () => do
+    -- wrapAsync has already allocated a deterministic child name-generator branch.
+    -- Keep its quotation context disjoint from the parent, siblings, and nested tasks.
+    -- Use one string component: numeric components are imported-scope separators in
+    -- the representation of hygienic names.
+    let branch := (← getNGen).namePrefix.toString
+    withReader (fun ctx => { ctx with quotContext := ctx.quotContext.str ("_task." ++ branch) }) do
+      let a ← t
+      let s ← get
+      return (a, s)) (some cancelToken)
   let task ← (wrappedAct ()).asTask
   -- Propagate parent cancel token to child: when the parent is cancelled,
   -- the child token is set too. This ensures that subtasks spawned via `asTask`

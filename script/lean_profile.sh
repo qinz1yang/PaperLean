@@ -86,11 +86,11 @@ cleanup() {
         kill "$SAMPLY_PID" 2>/dev/null || true
         wait "$SAMPLY_PID" 2>/dev/null || true
     fi
-    # Safety net: kill anything still on the symbolication port
-    lsof -ti :"$PORT" 2>/dev/null | xargs kill 2>/dev/null || true
     [ "${PROFILE_KEEP:-0}" = "1" ] || rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Step 1: Record
 echo "Recording profile (rate=${RATE} Hz)..." >&2

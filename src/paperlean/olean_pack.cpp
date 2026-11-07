@@ -45,6 +45,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include "util/name.h"
 #include "paperlean/olean_pack.h"
 #include "paperlean/side_file.h"
+#include "paperlean/side_file_output.h"
 #include "paperlean/fast_import.h"
 
 namespace lean {
@@ -286,7 +287,7 @@ inline uint64_t part_names_size(pack_part const & pp) {
 struct pack_ext_entry {
     uint64_t entries;       // address of the entries array
     uint32_t name;          // index into the table of extension names
-    uint32_t unused;
+    uint32_t parser_density; // zero for older packs, or a tagged parser density hint
 };
 
 // An extension name of the pack: one of its `Name` objects in the pack.
@@ -329,6 +330,43 @@ void set_file_id(pack_entry & e, struct stat const & st) {
 // Whether `a` and `b` are the same file, unchanged.
 bool same_stat(struct stat const & a, struct stat const & b) { return identity_of(a) == identity_of(b); }
 #endif
+
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+// Capture only regular inputs. A stable FIFO is never opened, and replacement during open
+// cannot block or turn a different descriptor into the file whose metadata was selected.
+int open_regular_input(char const * path) {
+    struct stat before, opened;
+    if (stat(path, &before) != 0) return -1;
+    if (!S_ISREG(before.st_mode)) { errno = EINVAL; return -1; }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return -1;
+    if (fstat(fd, &opened) != 0) {
+        int error = errno;
+        close(fd);
+        errno = error;
+        return -1;
+    }
+    if (!S_ISREG(opened.st_mode) || !same_stat(before, opened)) {
+        close(fd);
+        errno = EAGAIN;
+        return -1;
+    }
+    return fd;
+}
+#endif
+
+// A pack is a separately readable copy. Its provenance and freshness depend on the current
+// selected source pathname retaining the identity recorded when those bytes were packed.
+bool source_file_matches(std::string const & path, file_identity const & expected) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    if (path.find('\0') != std::string::npos) return false;
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && identity_of(st) == expected;
+#else
+    (void)path; (void)expected;
+    return false;
+#endif
+}
 
 content_hash hash_content_core(void const * data, size_t size) {
     return content_hash { hash_str(size, static_cast<unsigned char const *>(data), 11),
@@ -374,6 +412,66 @@ void ext_name_key(b_obj_arg n, std::string & key) {
         key += ':';
     }
 }
+
+// Old readers ignore this word. It only selects between equivalent parser folds.
+constexpr uint32_t g_parser_sparse = 0x50440101;
+constexpr uint32_t g_parser_dense = 0x50440102;
+
+std::string const & parser_extension_key() {
+    static std::string const key = [] {
+        std::string s;
+        name n(name(name("Lean"), "Parser"), "parserExtension");
+        ext_name_key(n.raw(), s);
+        return s;
+    }();
+    return key;
+}
+
+// Only inspect object payloads within relocated data of the chain's current/earlier parts.
+struct parser_span { uintptr_t start; size_t size; };
+size_t parser_available(object * o, std::vector<parser_span> const & regions) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(o);
+    if (addr % alignof(void *)) return 0;
+    for (auto r : regions)
+        if (addr >= r.start && addr - r.start < r.size)
+            return r.size - (addr - r.start);
+    return 0;
+}
+
+uint32_t parser_density_hint(object * row, std::vector<parser_span> const & regions) {
+    size_t bytes = parser_available(row, regions);
+    if (bytes < sizeof(lean_array_object) || !lean_is_array(row)) return 0;
+    size_t count = lean_array_size(row), capacity = lean_array_capacity(row);
+    if (count < 4096 || count > capacity || capacity > (bytes - sizeof(lean_array_object)) / sizeof(object *))
+        return 0;
+    size_t step = count / 64;
+    std::unordered_set<std::string_view> seen;
+    unsigned repeated = 0;
+    for (size_t i = 0; i < 64; ++i) {
+        object * scoped = lean_array_get_core(row, i * step);
+        size_t size = parser_available(scoped, regions);
+        if (size < sizeof(lean_object) || !lean_is_ctor(scoped)) return 0;
+        uint8_t tag = lean_ptr_tag(scoped);
+        if (tag == 1 && lean_ctor_num_objs(scoped) == 2 && size >= sizeof(lean_object) + 2 * sizeof(object *))
+            continue;
+        if (tag != 0 || lean_ctor_num_objs(scoped) != 1 || size < sizeof(lean_object) + sizeof(object *)) return 0;
+        object * e = lean_ctor_get(scoped, 0);
+        size = parser_available(e, regions);
+        if (size < sizeof(lean_object) || !lean_is_ctor(e) || lean_ptr_tag(e) > 3) return 0;
+        if (lean_ptr_tag(e) != 0) continue;
+        if (lean_ctor_num_objs(e) != 1 || size < sizeof(lean_object) + sizeof(object *)) return 0;
+        object * token = lean_ctor_get(e, 0);
+        size = parser_available(token, regions);
+        if (size < sizeof(lean_string_object) || !lean_is_string(token)) return 0;
+        size_t len = lean_string_size(token), cap = lean_string_capacity(token);
+        if (!len || len > 4096 || len > cap || cap > size - sizeof(lean_string_object) ||
+            lean_string_cstr(token)[len - 1] != 0) return 0;
+        if (len != 1 && !seen.emplace(lean_string_cstr(token), len - 1).second && ++repeated == 32)
+            return g_parser_dense;
+    }
+    return g_parser_sparse;
+}
+
 
 bool ends_with(std::string const & s, char const * suffix, std::string & prefix) {
     size_t n = strlen(suffix);
@@ -652,8 +750,6 @@ struct loaded_pack : pack_tables {
     // per edge: the module of another pack that it imports (`lean_paperlean_pack_module_edge_target`),
     // `g_target_unknown` until looked up
     std::unique_ptr<std::atomic<uint32_t>[]> edge_targets;
-    // the current descriptors of `roots`, negative if one cannot be opened
-    std::unique_ptr<std::atomic<int>[]> root_fds;
     // per chain: the generation of the imports (`g_pack_generation`) it was checked for << 2 | 0 = not
     // yet checked, 1 = unchanged, 2 = changed or damaged, 3 = being checked
     std::unique_ptr<std::atomic<uint32_t>[]> chain_state;
@@ -715,28 +811,6 @@ std::string resolve_root(std::string const & pack_file, std::string const & root
     return dir + root.substr(slash);
 }
 
-// A descriptor of the directory `r`, shared by all packs with that root (a build writes many), open
-// for the whole process and not passed to child processes; negative, with the error in `error`, if
-// `r` cannot be opened. With `again`, one that is no longer the directory at `r` is replaced (it stays
-// open, as other threads may be using it, so a process holds one more per replacement).
-int root_dir_fd(std::string const & r, int & error, bool again = false) {
-    static std::mutex mutex;
-    static std::unordered_map<std::string, int> fds;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = fds.find(r);
-    if (it != fds.end()) {
-        struct stat at_path, open_dir;
-        if (!again || (stat(r.c_str(), &at_path) == 0 && fstat(it->second, &open_dir) == 0 &&
-                       at_path.st_dev == open_dir.st_dev && at_path.st_ino == open_dir.st_ino))
-            return it->second;
-    }
-    int fd = open(r.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    error = fd < 0 ? errno : 0;
-    if (fd >= 0) fds[r] = fd;
-    else if (it != fds.end()) fds.erase(it);
-    return fd;
-}
-
 // The file next to the pack `pack` that records its identity (`pack_identity`): a `*.paperlean` file
 // that the names of packs (`lib-*`, `pack-*`, ...) do not match.
 std::string pack_identity_path(std::string const & pack) {
@@ -767,9 +841,9 @@ bool pack_identity_ok(std::string const & pack, uint64_t checksum, struct stat c
 }
 
 // Records the identity of the pack `pack`, as a file renamed into place.
-void write_pack_identity(std::string const & pack, uint64_t checksum, bool sync) {
+void write_pack_identity(std::string const & pack, int pack_fd, uint64_t checksum, bool sync) {
     struct stat st;
-    if (stat(pack.c_str(), &st) != 0)
+    if (fstat(pack_fd, &st) != 0)
         throw exception((sstream() << "failed to read '" << pack << "': " << strerror(errno)).str());
     file_identity e = identity_of(st);
     pack_identity id;
@@ -781,15 +855,10 @@ void write_pack_identity(std::string const & pack, uint64_t checksum, bool sync)
     id.ctime_sec = e.ctime_sec; id.ctime_nsec = e.ctime_nsec;
     id.common.checksum = pack_identity_checksum(id);
     std::string out = pack_identity_path(pack);
-    std::string tmp = out + ".tmp." + std::to_string(getpid());
-    std::remove(tmp.c_str());
-    file_descriptor fd(open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444));
-    bool ok = fd && write(fd.get(), &id, sizeof(id)) == static_cast<ssize_t>(sizeof(id)) &&
-        (!sync || side_file_sync(fd.get())) && std::rename(tmp.c_str(), out.c_str()) == 0;
-    if (!ok) {
-        std::remove(tmp.c_str());
+    side_file_output tmp(out);
+    if (!tmp.open(0444) || !tmp.write_bytes(&id, sizeof(id)) ||
+        (sync && !side_file_sync(tmp.fd())) || !tmp.publish())
         throw exception((sstream() << "failed to write '" << out << "': " << strerror(errno)).str());
-    }
 }
 
 // Reads the header of the pack `fname` open as `fd`; whether it is whole and the file has the identity
@@ -928,21 +997,9 @@ void write_binding(binding const & b, std::string const & out) {
             if (pread(fd.get(), &old[0], old.size(), 0) == static_cast<ssize_t>(old.size()) && old == file) return;
         }
     }
-    std::string tmp = out + ".tmp." + std::to_string(getpid());
-    std::remove(tmp.c_str());
-    file_descriptor fd(open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444));
-    bool ok = fd;
-    for (size_t done = 0; ok && done < file.size();) {
-        ssize_t w = write(fd.get(), file.data() + done, file.size() - done);
-        if (w < 0 && errno == EINTR) continue;
-        ok = w > 0;
-        if (ok) done += w;
-    }
-    if (!ok || std::rename(tmp.c_str(), out.c_str()) != 0) {
-        int e = errno;
-        std::remove(tmp.c_str());
-        throw exception((sstream() << "failed to write '" << out << "': " << strerror(e)).str());
-    }
+    side_file_output tmp(out);
+    if (!tmp.open(0444) || !tmp.write_bytes(file.data(), file.size()) || !tmp.publish())
+        throw exception((sstream() << "failed to write '" << out << "': " << strerror(errno)).str());
 }
 
 /*
@@ -1006,17 +1063,6 @@ bool load_pack_core(std::string const & fname, loaded_pack & p, std::string & er
         }
     }
     err.clear();
-    p.root_fds.reset(new std::atomic<int>[p.roots.size()]);
-    for (size_t r = 0; r < p.roots.size(); r++) {
-        int error = 0;
-        int rfd = root_dir_fd(p.roots[r], error);
-        // Files below a root that cannot be opened are read from disk.
-        if (rfd < 0 && err.empty())
-            err = error == EMFILE || error == ENFILE
-                ? "too many open files to open root '" + p.roots[r] + "', so its files are read from disk"
-                : "root '" + p.roots[r] + "' is not a directory, so its files are read from disk";
-        p.root_fds[r].store(rfd, std::memory_order_relaxed);
-    }
     auto states = [](uint64_t n) { return std::unique_ptr<std::atomic<uint8_t>[]>(new std::atomic<uint8_t>[n]()); };
     p.chain_state.reset(new std::atomic<uint32_t>[p.hdr.num_chains]());
     p.module_state = states(p.hdr.num_modules);
@@ -1041,7 +1087,6 @@ bool load_pack(std::string const & fname, loaded_pack & p, std::string & err) {
     if (!ok) {
         if (p.begin) munmap(p.begin, p.hdr.size);
         p.begin = nullptr;
-        p.root_fds.reset();
     }
     return ok;
 }
@@ -1137,14 +1182,8 @@ uint8_t check_chain_files(loaded_pack & p, uint32_t chain) {
         // a file that Lean would not load is read from the disk, which reports it as Lean does
         if (githash_checked && !(ce.flags & entry_githash_match))
             return 2;
-        char rel[PATH_MAX];
-        struct stat st;
-        int root_fd = p.root_fds[ce.root_idx].load(std::memory_order_relaxed);
-        if (ce.path.len >= sizeof(rel) || root_fd < 0)
-            return 2;
-        memcpy(rel, p.strings + ce.path.off, ce.path.len);
-        rel[ce.path.len] = 0;
-        if (fstatat(root_fd, rel, &st, 0) != 0 || !(p.identity(i) == identity_of(st)))
+        if (ce.path.len >= PATH_MAX ||
+            !source_file_matches(p.roots[ce.root_idx] + "/" + std::string(p.str(ce.path)), p.identity(i)))
             return 2;
     }
     return 1;
@@ -1407,8 +1446,7 @@ bool find_literal_pack(std::string const & fname, std::vector<region_view> const
             bool deps_match = e.chain < p.hdr.num_chains && chain_unchanged(p, e.chain);
             // The directory alias may have changed since its roots were resolved.
             if (deps_match && selected) {
-                file_identity current;
-                deps_match = stat_identity(selected->c_str(), current) && current == p.identity(static_cast<uint64_t>(idx));
+                deps_match = source_file_matches(*selected, p.identity(static_cast<uint64_t>(idx)));
             }
             // checking the chain checked its entries, among them `e` if it is part `e.part` of it
             if (deps_match && (e.part >= p.chains[e.chain].count ||
@@ -1532,7 +1570,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                                                      b_obj_arg oout, size_t base, uint8_t sync, uint8_t bound) {
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
     std::string out(lean_string_cstr(oout));
-    std::string tmp = out + ".tmp." + std::to_string(getpid());
+    side_file_output ofd(out);
     char * mem = nullptr;
     size_t total = 0;
     try {
@@ -1571,7 +1609,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                     }
                 }
                 if (!ok) break;
-                file_descriptor fd(open(pt.path.c_str(), O_RDONLY | O_CLOEXEC));
+                file_descriptor fd(open_regular_input(pt.path.c_str()));
                 std::vector<char> hdr(olean_header_size());
                 ok = fd && fstat(fd.get(), &pt.st) == 0 && static_cast<size_t>(pt.st.st_size) >= hdr.size() + sizeof(size_t) &&
                     pread(fd.get(), hdr.data(), hdr.size(), 0) == static_cast<ssize_t>(hdr.size()) &&
@@ -1581,15 +1619,17 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 pt.data_off = olean_header_size();
                 pt.data_size = size - olean_header_size();
                 if (pt.version == 3) {
-                    uint64_t data_size; uint32_t num_closures = 0;
-                    ok = pread(fd.get(), &data_size, sizeof(data_size), olean_header_size()) == sizeof(data_size) &&
-                        data_size + olean_header_size() + sizeof(size_t) + sizeof(num_closures) <= size &&
+                    uint64_t data_size = 0; uint32_t num_closures = 0;
+                    pt.data_off = olean_header_size() + sizeof(size_t);
+                    ok = pt.data_off <= size && sizeof(num_closures) <= size - pt.data_off &&
+                        pread(fd.get(), &data_size, sizeof(data_size), olean_header_size()) == sizeof(data_size) &&
+                        data_size >= sizeof(void *) && data_size <= size - pt.data_off - sizeof(num_closures) &&
                         pread(fd.get(), &num_closures, sizeof(num_closures),
                               olean_header_size() + sizeof(size_t) + data_size) == sizeof(num_closures) &&
                         num_closures == 0;
-                    pt.data_off = olean_header_size() + sizeof(size_t);
                     pt.data_size = data_size;
                 }
+                if (!ok || pt.data_off > size || pt.data_size < sizeof(void *) || pt.data_size > size - pt.data_off) { ok = false; break; }
                 pt.offset = offset;
                 offset = align_up(offset + size, 64);
                 chain.push_back(std::move(pt));
@@ -1615,12 +1655,13 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
             throw exception((sstream() << "address range at " << reinterpret_cast<void *>(base) << " is not available").str());
         }
         mem = static_cast<char *>(m);
-        file_descriptor ofd(open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
-        if (!ofd) throw exception((sstream() << "failed to create '" << tmp << "': " << strerror(errno)).str());
+        if (!ofd.open(0644))
+            throw exception((sstream() << "failed to create temporary pack for '" << out << "': " << strerror(errno)).str());
+        auto const & tmp = ofd.path();
         auto write_at = [&](void const * data, size_t len, size_t off) {
             char const * p = static_cast<char const *>(data);
             while (len > 0) {
-                ssize_t w = pwrite(ofd.get(), p, len, off);
+                ssize_t w = pwrite(ofd.fd(), p, len, off);
                 if (w < 0) {
                     if (errno == EINTR) continue;
                     throw exception((sstream() << "failed to write '" << tmp << "': " << strerror(errno)).str());
@@ -1643,7 +1684,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
         std::vector<pack_ext_entry> ext_entry_table;
         std::vector<pack_ext_name> ext_name_table;
         std::unordered_map<std::string, uint32_t> ext_name_index;
-        auto describe_part = [&](object * data) {
+        auto describe_part = [&](object * data, std::vector<parser_span> const & regions) {
             pack_part pp = {};
             object * arrays[4];
             for (unsigned i = 0; i < 4; i++) arrays[i] = module_data_field(data, 1 + i);
@@ -1667,7 +1708,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                     it = ext_name_index.emplace(key, static_cast<uint32_t>(ext_name_table.size())).first;
                     ext_name_table.push_back({ reinterpret_cast<uint64_t>(n) });
                 }
-                ext_entry_table.push_back({ reinterpret_cast<uint64_t>(lean_ctor_get(pair, 1)), it->second, 0 });
+                object * row = lean_ctor_get(pair, 1);
+                uint32_t hint = key == parser_extension_key() ? parser_density_hint(row, regions) : 0;
+                ext_entry_table.push_back({ reinterpret_cast<uint64_t>(row), it->second, hint });
             }
             return pp;
         };
@@ -1705,12 +1748,13 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
             std::vector<std::unique_ptr<file_descriptor>> fds;
             bool unchanged = true;
             for (part const & pt : chain) {
-                fds.emplace_back(new file_descriptor(open(pt.path.c_str(), O_RDONLY | O_CLOEXEC)));
+                fds.emplace_back(new file_descriptor(open_regular_input(pt.path.c_str())));
                 struct stat st;
                 unchanged = unchanged && *fds.back() && fstat(fds.back()->get(), &st) == 0 && same_stat(pt.st, st);
             }
             if (!unchanged) continue;
             std::vector<region_view> deps;
+            std::vector<parser_span> parser_regions;
             pack_chain c { static_cast<uint32_t>(entries.size()), static_cast<uint32_t>(chain.size()) };
             std::vector<object *> chain_roots;
             std::vector<bool> referenced;
@@ -1732,7 +1776,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 size_t new_base = reinterpret_cast<size_t>(slot);
                 memcpy(slot + olean_header_base_addr_offset(), &new_base, sizeof(new_base));
                 write_at(slot, size, pt.offset);
-                part_table.push_back(describe_part(root));
+                parser_regions.push_back({ reinterpret_cast<uintptr_t>(slot + pt.data_off + sizeof(void *)),
+                                           pt.data_size - sizeof(void *) });
+                part_table.push_back(describe_part(root, parser_regions));
                 std::vector<uint64_t> hashes;
                 for (unsigned a = 1; a <= 3; a += 2) {
                     object * names = module_data_field(root, a);
@@ -1975,39 +2021,41 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
         write_at(roots_area.data(), roots_area.size(), roots_area_off);
         write_at(names.data(), names.size(), names_off);
         write_at(index.data(), index.size(), hdr.entries_off);
-        if (ftruncate(ofd.get(), hdr.size) != 0)
+        if (ftruncate(ofd.fd(), hdr.size) != 0)
             throw exception((sstream() << "failed to write '" << tmp << "': " << strerror(errno)).str());
         munmap(mem, total);
         mem = nullptr;
         // the checksum of the regions as written
-        if (int e = pack_payload_checksum(ofd.get(), hdr.entries_off, hdr.payload_checksum))
+        if (int e = pack_payload_checksum(ofd.fd(), hdr.entries_off, hdr.payload_checksum))
             throw exception((sstream() << "failed to read '" << tmp << "': " << strerror(e)).str());
         hdr.header_checksum = pack_header_checksum(hdr);
         hdr.common.checksum = pack_checksum(hdr, index.data(), index.size());
         write_at(&hdr, sizeof(hdr), 0);
         // read-only: a tool writing to a mapped pack in place fails, instead of crashing processes
         // or changing their results
-        if (fchmod(ofd.get(), 0444) != 0)
+        if (fchmod(ofd.fd(), 0444) != 0)
             throw exception((sstream() << "failed to make '" << tmp << "' read-only").str());
         // the pack is on the disk before its name is, so that one found under its name is whole
-        if (sync && !side_file_sync(ofd.get()))
+        if (sync && !side_file_sync(ofd.fd()))
             throw exception((sstream() << "failed to write '" << tmp << "': " << strerror(errno)).str());
-        // Locked until its identity is recorded, which can only come after the rename, as that changes
-        // the file's status change time: a build that finds it under its name meanwhile waits at its
-        // shared lock (`toolchainPack` in `Lake/PaperLean/BuildData.lean`), and does not remove it.
-        flock(ofd.get(), LOCK_EX);
-        if (std::rename(tmp.c_str(), out.c_str()) != 0)
-            throw exception((sstream() << "failed to write '" << out << "': " << strerror(errno)).str());
-        if (sync) {
-            size_t slash = out.rfind('/');
-            file_descriptor dfd(open(slash == std::string::npos ? "." : out.substr(0, slash + 1).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-            if (dfd) side_file_sync(dfd.get());
-        }
-        write_pack_identity(out, hdr.common.checksum, sync);
+        // Readers acquiring the published pack wait on its inode until its identity is
+        // recorded. Writers additionally lock the parent directory during just the pair
+        // of renames: locks on distinct new inodes cannot serialize these publications.
+        size_t slash = out.rfind('/');
+        std::string parent = slash == std::string::npos ? "." : out.substr(0, slash + 1);
+        file_descriptor dfd(open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        auto lock = [&](int fd) {
+            int rc;
+            do { rc = flock(fd, LOCK_EX); } while (rc != 0 && errno == EINTR);
+            return rc == 0;
+        };
+        if (!dfd || !lock(dfd.get()) || !lock(ofd.fd()) || !ofd.publish(true))
+            throw exception((sstream() << "failed to publish pack '" << out << "': " << strerror(errno)).str());
+        if (sync) side_file_sync(dfd.get());
+        write_pack_identity(out, ofd.fd(), hdr.common.checksum, sync);
         return io_result_mk_ok(lean_usize_to_nat(entries.size()));
     } catch (std::exception & ex) {
         if (mem) munmap(mem, total);
-        std::remove(tmp.c_str());
         return io_result_mk_error((sstream() << "failed to create olean pack '" << out << "': " << ex.what()).str());
     }
 #else
@@ -2189,10 +2237,8 @@ struct pack_index_file {
     pack_module const * modules = nullptr;
     char const * strings = nullptr;
     std::vector<std::string> root_paths;  // resolved, or the binding's
-    std::vector<int> root_fds;
     std::vector<file_identity> bound;     // the binding's identities
 
-    ~pack_index_file() { for (int rfd : root_fds) if (rfd >= 0) close(rfd); }
     bool str_ok(pack_string x) const { return x.off <= hdr.strings_size && x.len <= hdr.strings_size - x.off; }
     std::string str(pack_string x) const { return std::string(strings + x.off, x.len); }
     file_identity identity(uint64_t i) const { return bound.empty() ? entry_identity(entries[i]) : bound[i]; }
@@ -2210,10 +2256,7 @@ struct pack_index_file {
             if (hdr.common.checksum != b.pack_checksum || hdr.num_entries != b.ids.size() || hdr.num_roots != b.roots.size()) {
                 err = "it binds another pack than '" + b.pack + "'"; return false;
             }
-            for (int rfd : root_fds) if (rfd >= 0) close(rfd);
-            root_fds.clear();
             root_paths = std::move(b.roots);
-            for (std::string const & r : root_paths) root_fds.push_back(open(r.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
             bound = std::move(b.ids);
             return true;
         }
@@ -2252,7 +2295,6 @@ struct pack_index_file {
         for (uint64_t i = 0; i < hdr.num_roots; i++) {
             if (!str_ok(roots[i])) { err = "corrupt"; return false; }
             root_paths.push_back(resolve_root(fname, str(roots[i])));
-            root_fds.push_back(open(root_paths.back().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         }
         return true;
     }
@@ -2264,19 +2306,39 @@ struct pack_index_file {
         if (static_cast<uint64_t>(c) >= hdr.num_chains) return true;
         for (uint32_t i = chains[c].first; i < chains[c].first + chains[c].count && i < hdr.num_entries; i++) {
             pack_entry const & e = entries[i];
-            char rel[PATH_MAX];
-            struct stat fst;
-            if (!str_ok(e.path) || e.path.len >= sizeof(rel) || e.root_idx >= root_fds.size() || root_fds[e.root_idx] < 0)
-                return true;
-            memcpy(rel, strings + e.path.off, e.path.len);
-            rel[e.path.len] = 0;
-            if (fstatat(root_fds[e.root_idx], rel, &fst, 0) != 0 || !(identity(i) == identity_of(fst))) return true;
+            if (!str_ok(e.path) || e.path.len >= PATH_MAX || e.root_idx >= root_paths.size() ||
+                !source_file_matches(root_paths[e.root_idx] + "/" + str(e.path), identity(i))) return true;
         }
         return false;
     }
 };
 }
 #endif
+
+/* Open a regular input for a lock, returning none for absent, replaced or special paths.
+   The handle wraps exactly the nonblocking descriptor that was checked above. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_open_regular_for_lock(b_obj_arg path) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    char const * name = lean_string_cstr(path);
+    if (strlen(name) + 1 != lean_string_size(path)) return mk_embedded_nul_error(path);
+    int fd = open_regular_input(name);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ENOTDIR || errno == EINVAL || errno == EAGAIN)
+            return io_result_mk_ok(lean_box(0));
+        return io_result_mk_error(decode_io_error(errno, path));
+    }
+    FILE * file = fdopen(fd, "rb");
+    if (!file) {
+        int error = errno;
+        close(fd);
+        return io_result_mk_error(decode_io_error(error, path));
+    }
+    return io_result_mk_ok(mk_option_some(io_wrap_handle(file)));
+#else
+    (void)path;
+    return io_result_mk_ok(lean_box(0));
+#endif
+}
 
 /* OLeanPack.useForProcess (packs image : @& String) : BaseIO Unit */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_use_process_packs(b_obj_arg packs, b_obj_arg image) {
@@ -2444,18 +2506,10 @@ extern "C" LEAN_EXPORT uint8_t lean_paperlean_packs_loaded() {
 
 /* packNextImport : BaseIO Unit
    Starts an import: a process that imports again reads again what changed since the last one, as
-   Lean does: the chains are checked again, and a root directory replaced meanwhile is opened again.
-   (Before the packs are loaded, nothing has been checked.) */
+   Lean does: revalidate the selected files once per chain and import. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_next_import() {
-    std::vector<loaded_pack> * packs = g_packs.load(std::memory_order_acquire);
-    if (!packs) return lean_box(0);
-    for (loaded_pack & p : *packs) {
-        for (size_t r = 0; r < p.roots.size(); r++) {
-            int error = 0;
-            p.root_fds[r].store(root_dir_fd(p.roots[r], error, true), std::memory_order_relaxed);
-        }
-    }
-    g_pack_generation.fetch_add(1, std::memory_order_acq_rel);
+    if (g_packs.load(std::memory_order_acquire))
+        g_pack_generation.fetch_add(1, std::memory_order_acq_rel);
     return lean_box(0);
 }
 
@@ -2618,8 +2672,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_module_parts(uint32_t id, uin
         pack_chain const & c = p->chains[chain];
         for (uint32_t i = c.first; i < c.first + count; i++) {
             std::string path = pack_part_path(*p, p->entries[i], read_root);
-            file_identity current;
-            if (!stat_identity(path.c_str(), current) || !(current == p->identity(i))) return lean_box(0);
+            if (!source_file_matches(path, p->identity(i))) return lean_box(0);
         }
     }
     return mk_option_some(pack_chain_parts(*p, chain, count, read_root));
@@ -2663,6 +2716,57 @@ bool packed_part_names(b_obj_arg d, part_names & out) {
         out.num_const_names = pp->num_const_names;
     }
     return true;
+}
+
+// Unlike the array, the interned extension name can be in another module's region.
+static size_t parser_packed_available(loaded_pack const & p, object * obj) {
+    uint64_t addr = reinterpret_cast<uintptr_t>(obj);
+    if (!p.in_regions(addr)) return 0;
+    uint64_t offset = addr - p.hdr.base_addr, lo = 0, hi = p.hdr.num_entries;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if (!p.used(p.entries[mid])) return 0;
+        if (p.entries[mid].offset <= offset) lo = mid + 1; else hi = mid;
+    }
+    if (!lo || !p.entry_ok(lo - 1)) return 0;
+    pack_entry const & e = p.entries[lo - 1];
+    uint64_t delta = offset - e.offset;
+    if (delta < olean_header_size() + sizeof(void *) || delta >= e.size) return 0;
+    return e.size - delta;
+}
+
+static bool is_packed_parser_extension(loaded_pack const & p, object * n) {
+    for (std::string_view label : { "parserExtension", "Parser", "Lean" }) {
+        if (parser_packed_available(p, n) < sizeof(lean_object) + 2 * sizeof(object *) ||
+            lean_ptr_tag(n) != 1 || lean_ctor_num_objs(n) != 2) return false;
+        object * str = lean_ctor_get(n, 1);
+        size_t size = parser_packed_available(p, str);
+        if (size < sizeof(lean_string_object) + label.size() + 1 || !lean_is_string(str) ||
+            lean_string_size(str) != label.size() + 1 || lean_string_capacity(str) < lean_string_size(str) ||
+            lean_string_capacity(str) > size - sizeof(lean_string_object) ||
+            memcmp(lean_string_cstr(str), label.data(), label.size() + 1) != 0) return false;
+        n = lean_ctor_get(n, 0);
+    }
+    return n == lean_box(0);
+}
+
+/* A hint is meaningful only for the very same parser row of an admitted ModuleData.
+   Absent packs, old words, wrong rows and invalid metadata keep the ordinary fallback. */
+extern "C" LEAN_EXPORT uint8_t lean_paperlean_parser_row_density(b_obj_arg data, b_obj_arg row) {
+    loaded_pack * p = nullptr;
+    pack_part const * pp = packed_part(data, &p);
+    if (!pp) return 0;
+    for (uint32_t i = pp->first_ext; i < pp->first_ext + pp->num_entries; ++i) {
+        pack_ext_entry const & ee = p->ext_entries[i];
+        if (ee.entries != reinterpret_cast<uint64_t>(row)) continue;
+        if (ee.parser_density != g_parser_dense && ee.parser_density != g_parser_sparse) continue;
+        if (!is_packed_parser_extension(*p, reinterpret_cast<object *>(p->ext_names[ee.name].name))) continue;
+        bool dense = ee.parser_density == g_parser_dense;
+        if (import_timing_enabled())
+            fprintf(stderr, "paperlean-counter parser.prepareHint=%s\n", dense ? "dense" : "sparse");
+        return dense ? 2 : 1;
+    }
+    return 0;
 }
 
 // The arrays `constNames`, `constants`, `extraConstNames` of `d`.
@@ -2816,22 +2920,21 @@ void write_record(std::string const & path, hash_record const & r) {
     std::string rest(reinterpret_cast<char const *>(files.data()), files.size() * sizeof(record_file));
     rest += strings;
     hdr.common.checksum = record_checksum(hdr, rest.data(), rest.size());
-    std::string tmp = path + ".tmp." + std::to_string(getpid());
-    FILE * f = fopen(tmp.c_str(), "wb");
-    bool ok = f && fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr) && fwrite(rest.data(), 1, rest.size(), f) == rest.size();
-    ok = f && fclose(f) == 0 && ok;
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        throw exception((sstream() << "failed to write '" << path << "'").str());
-    }
+    side_file_output tmp(path);
+    if (!tmp.open(0666) || !tmp.write_bytes(&hdr, sizeof(hdr)) ||
+        !tmp.write_bytes(rest.data(), rest.size()) || !tmp.publish())
+        throw exception((sstream() << "failed to write '" << path << "': " << strerror(errno)).str());
 }
 
 // The identity and the content hash of the regular file at `path`, read into `buf`; false if it
 // cannot be read or changed meanwhile.
-bool hash_file(std::string const & path, std::vector<char> & buf, file_identity & id, content_hash & h) {
-    file_descriptor fd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+bool hash_file(std::string const & path, std::vector<char> & buf, file_identity & id, content_hash & h,
+               file_identity const * expected = nullptr, bool owned = false) {
+    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK | (owned ? O_NOFOLLOW : 0);
+    file_descriptor fd(open(path.c_str(), flags));
     struct stat before, after, at_path;
     if (!fd || fstat(fd.get(), &before) != 0 || !S_ISREG(before.st_mode)) return false;
+    if (before.st_size < 0 || (expected && !(*expected == identity_of(before)))) return false;
     size_t size = before.st_size;
     if (buf.size() < size) buf.resize(size);
     for (size_t got = 0; got < size;) {
@@ -2840,8 +2943,8 @@ bool hash_file(std::string const & path, std::vector<char> & buf, file_identity 
         if (r <= 0) return false;
         got += r;
     }
-    if (fstat(fd.get(), &after) != 0 || stat(path.c_str(), &at_path) != 0 || !same_stat(before, after) ||
-        !same_stat(before, at_path))
+    if (fstat(fd.get(), &after) != 0 || (owned ? lstat : stat)(path.c_str(), &at_path) != 0 ||
+        !same_stat(before, after) || !same_stat(before, at_path))
         return false;
     id = identity_of(before);
     h = hash_content_core(buf.data(), size);
@@ -2852,6 +2955,22 @@ std::string hash_hex(content_hash h) {
     char buf[33];
     snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(h.lo), static_cast<unsigned long long>(h.hi));
     return buf;
+}
+
+// Read through one nonblocking descriptor, validating its expected identity before allocation,
+// and compare the digest of those same bytes when the caller supplied one.
+bool read_verified_bytes(b_obj_arg input, b_obj_arg identity, b_obj_arg hash, std::vector<char> & bytes,
+                         bool owned = false) {
+    uint64_t fields[7];
+    if (lean_sarray_size(identity) != sizeof(fields)) return false;
+    memcpy(fields, lean_sarray_cptr(identity), sizeof(fields));
+    file_identity expected{fields[0], fields[1], fields[2], static_cast<int64_t>(fields[3]),
+        static_cast<int64_t>(fields[4]), static_cast<int64_t>(fields[5]), static_cast<int64_t>(fields[6])};
+    file_identity actual;
+    content_hash content;
+    if (!hash_file(lean_string_cstr(input), bytes, actual, content, &expected, owned)) return false;
+    return lean_string_size(hash) == 1 || hash_hex(content) ==
+        std::string_view(lean_string_cstr(hash), lean_string_size(hash) - 1);
 }
 
 // Runs `f(i)` for each `i < n` on `jobs` threads (this one among them).
@@ -2867,6 +2986,91 @@ void parallel_for(size_t n, size_t jobs, std::function<void(size_t)> const & f) 
 }
 }
 #endif
+
+/* A pack content hash of the caller's bytes, with no path or retained record involved. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_hash_bytes(b_obj_arg bytes) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    return mk_string(hash_hex(hash_content_core(lean_sarray_cptr(bytes), lean_sarray_size(bytes))));
+#else
+    (void)bytes;
+    return mk_string("");
+#endif
+}
+
+/* Inspect the final owned cache entry itself, using one lstat for both its type and identity. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_owned_file_identity(b_obj_arg path) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    struct stat st;
+    if (lstat(lean_string_cstr(path), &st) != 0 || !S_ISREG(st.st_mode)) return lean_box(0);
+    file_identity id = identity_of(st);
+    uint64_t fields[7] = { id.dev, id.ino, id.size, static_cast<uint64_t>(id.mtime_sec),
+        static_cast<uint64_t>(id.mtime_nsec), static_cast<uint64_t>(id.ctime_sec), static_cast<uint64_t>(id.ctime_nsec) };
+    obj_res bytes = lean_alloc_sarray(1, sizeof(fields), sizeof(fields));
+    memcpy(lean_sarray_cptr(bytes), fields, sizeof(fields));
+    obj_res some = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(some, 0, bytes);
+    return some;
+#else
+    (void)path;
+    return lean_box(0);
+#endif
+}
+
+/* OLeanPack.readVerifiedBytes. A substituted FIFO, device or different regular file is rejected
+   before reading. The caller receives the exact bytes whose identity and digest we checked. */
+static obj_res read_verified_result(b_obj_arg input, b_obj_arg identity, b_obj_arg hash, bool owned) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    try {
+        std::vector<char> bytes;
+        if (!read_verified_bytes(input, identity, hash, bytes, owned))
+            return io_result_mk_error("file differs from its receipt");
+        object * result = lean_alloc_sarray(1, bytes.size(), bytes.size());
+        if (!bytes.empty()) memcpy(lean_sarray_cptr(result), bytes.data(), bytes.size());
+        return io_result_mk_ok(result);
+    } catch (std::exception const & ex) {
+        return io_result_mk_error(ex.what());
+    }
+#else
+    (void)input; (void)identity; (void)hash; (void)owned;
+    return io_result_mk_error("verified file reads are not supported on this platform");
+#endif
+}
+
+extern "C" LEAN_EXPORT obj_res lean_paperlean_read_verified_bytes(b_obj_arg input, b_obj_arg identity, b_obj_arg hash) {
+    return read_verified_result(input, identity, hash, false);
+}
+
+extern "C" LEAN_EXPORT obj_res lean_paperlean_read_verified_owned_bytes(b_obj_arg input, b_obj_arg identity, b_obj_arg hash) {
+    return read_verified_result(input, identity, hash, true);
+}
+
+/* Capture one ordinary purity input, ignoring packs. Only the private copy is parsed and
+   imported. An empty hash is used only by the standalone inspector, without a Prepare receipt. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_snapshot_eval_file(b_obj_arg input, b_obj_arg output,
+                                                                b_obj_arg identity, b_obj_arg hash) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    try {
+        std::vector<char> bytes;
+        if (!read_verified_bytes(input, identity, hash, bytes))
+            return io_result_mk_error("purity input differs from its receipt");
+
+        char const * path = lean_string_cstr(output);
+        FILE * f = fopen(path, "wbx");
+        if (!f) return io_result_mk_error("could not create private purity input");
+        bool ok = bytes.empty() || fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+        if (fclose(f) != 0 || !ok) {
+            std::remove(path);
+            return io_result_mk_error("could not finish writing private purity input");
+        }
+        return io_result_mk_ok(lean_box(0));
+    } catch (std::exception const & ex) {
+        return io_result_mk_error(ex.what());
+    }
+#else
+    (void)input; (void)output; (void)identity; (void)hash;
+    return io_result_mk_error("purity input capture is not supported on this platform");
+#endif
+}
 
 /* OLeanPack.hashFiles (files scope : @& Array String) (record : @& String) (jobs : USize) :
      IO (Array (ByteArray × String))

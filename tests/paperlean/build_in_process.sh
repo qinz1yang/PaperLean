@@ -38,7 +38,11 @@ PAPERLEAN_BUILD_PACKS=1 PAPERLEAN_BUILD_PACKS_KEEP=1 lake paperlean build > "$TM
 pid=$!
 wait $pid || { cat "$TMP_DIR/out"; fail "paperlean build failed"; }
 cat "$TMP_DIR/out"
-[ -d ".lake/paperlean/build/$pid" ] || fail "the build did not run in the paperlean process: $(ls .lake/paperlean/build)"
+has_pid_packdir() {
+  for d in ".lake/paperlean/build/$1"-*; do [ ! -d "$d" ] || return 0; done
+  return 1
+}
+has_pid_packdir "$pid" || fail "the build did not run in the paperlean process: $(ls .lake/paperlean/build)"
 [ "$(grep -c "Build completed successfully" "$TMP_DIR/out")" = 1 ] || fail "not one build"
 same_files
 
@@ -49,7 +53,7 @@ PAPERLEAN_BUILD_PACKS=1 PAPERLEAN_BUILD_PACKS_KEEP=1 lake paperlean build -R > "
 pid=$!
 wait $pid || { cat "$TMP_DIR/out"; fail "paperlean build -R failed"; }
 cat "$TMP_DIR/out"
-[ ! -d ".lake/paperlean/build/$pid" ] || fail "the build with -R ran in the paperlean process"
+! has_pid_packdir "$pid" || fail "the build with -R ran in the paperlean process"
 [ -n "$(ls .lake/paperlean/build 2>/dev/null)" ] || fail "the build with -R did not pack"
 same_files
 

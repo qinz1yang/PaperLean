@@ -82,7 +82,8 @@ globs = [
 
 [[lean_lib]]
 name = "LeanExport"
-globs = ["LeanExport.*"]
+# Include the strict JSON reader in the archive that owns the export parser.
+globs = ["LeanExport.*", "Lean.PaperLean.ExportJson"]
 # `Lake` links the parser into `libLake_shared`, so the export facet is required as well
 defaultFacets = ["static", "static.export"]
 

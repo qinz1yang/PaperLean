@@ -37,7 +37,7 @@ public def loadWorkspaceRoot (config : LoadConfig) : LogIO Workspace := do
   let fileCfg ← loadConfigFile config h
   let root := mkPackage config fileCfg 0
   have wsIdx_root : root.wsIdx = 0 := wsIdx_mkPackage
-  let facetConfigs := fileCfg.facetDecls.foldl (·.insert ·.config) initFacetConfigs
+  let facetConfigs := fileCfg.facetDecls.foldl (·.insert ·.config) PaperLean.workspaceInitFacets
   return {
     lakeEnv := config.lakeEnv
     lakeCache := computeLakeCache root config.lakeEnv

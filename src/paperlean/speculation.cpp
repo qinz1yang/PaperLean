@@ -2,10 +2,14 @@
 Copyright (c) 2026 PaperLean contributors.
 Released under Apache 2.0 license as described in the file LICENSE.
 */
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include "runtime/object.h"
+#include "runtime/interrupt.h"
+#include "kernel/kernel_exception.h"
+#include "paperlean/fast_import.h"
 
 // The mark of the threads that elaborate commands in order, the frontend of the process that reuses,
 // what reuse keeps, and the end of a run whose oracle found a difference, for
@@ -13,6 +17,47 @@ Released under Apache 2.0 license as described in the file LICENSE.
 // `IO.FS.withIsolatedStreams`, whose contents this process does not get to print.
 
 namespace lean {
+extern "C" size_t lean_paperlean_swap_kernel_heartbeats(size_t n);
+extern "C" obj_res lean_add_decl(obj_arg env, size_t max_hb, size_t max_depth, b_obj_arg decl, b_obj_arg cancel);
+
+namespace {
+class trial_kernel_counter {
+    size_t m_saved;
+public:
+    trial_kernel_counter(): m_saved(lean_paperlean_swap_kernel_heartbeats(0)) {}
+    ~trial_kernel_counter() { lean_paperlean_swap_kernel_heartbeats(m_saved); }
+    size_t remaining(size_t max) const { return m_saved < max ? max - m_saved : 0; }
+};
+}
+
+// All prerequisites and the proposed theorem use one private environment and one cumulative
+// heartbeat counter. Trial work leaves the caller's kernel checks and allocations untouched.
+extern "C" LEAN_EXPORT obj_res lean_paperlean_trial_proofs(obj_arg env, size_t normal_limit, size_t max_depth,
+                                                           b_obj_arg decls, b_obj_arg cancel) {
+    uncounted_heartbeats allocations;
+    trial_kernel_counter checks;
+    object_ref current(env);
+    size_t limit = 12000000;
+    if (normal_limit) limit = std::min(limit, checks.remaining(normal_limit));
+    if (size_t ambient = get_max_heartbeat()) limit = std::min(limit, checks.remaining(ambient));
+    size_t count = lean_array_size(decls);
+    if (!limit || !count) {
+        // The kernel interprets zero as unlimited. An empty batch cannot certify a theorem.
+        scope_cancel_tk token(is_scalar(cancel) ? nullptr : cnstr_get(cancel, 0));
+        return catch_kernel_exceptions<environment>([&]() -> environment {
+            check_interrupted();
+            if (!limit) throw heartbeat_exception();
+            throw exception("empty PaperLean proof trial");
+        });
+    }
+    for (size_t i = 0; ; ++i) {
+        object * decl = lean_array_get_core(decls, i);
+        object_ref result(lean_add_decl(current.steal(), limit, max_depth, decl, cancel));
+        if (lean_obj_tag(result.raw()) == 0 || i + 1 == count) return result.steal();
+        current = object_ref(cnstr_get(result.raw(), 0), true);
+    }
+}
+
 static thread_local bool t_elab_thread = false;
 
 // Which frontend of the process reuses: the first, if the command-line `lean` runs it, and no other,

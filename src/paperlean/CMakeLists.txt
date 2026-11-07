@@ -36,6 +36,7 @@ add_library(
   native_libs.cpp
   replace.cpp
   speculation.cpp
+  setup_index.cpp
   system.cpp
 )
 target_compile_definitions(paperlean PRIVATE PAPERLEAN_VERSION="${PAPERLEAN_VERSION}")

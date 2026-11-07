@@ -172,6 +172,24 @@ for round in 1 2; do
     capture env LEAN_PATH="$LIB1:$LIB2" LEAN_OLEAN_PACK="$TMP_DIR/p1.paperlean" lean --run "$TMP_DIR/image.lean" \
       "$TMP_DIR/p.image.paperlean"
     check_out_contains "image: true"
+    case "$(uname -s)" in
+      Darwin|Linux)
+        fixture="$TEST_DIR/paperlean/replay_ownership"
+        gmp_args=()
+        if grep -q '^USE_GMP:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+          gmp_include=$(sed -n 's/^GMP_INCLUDE_DIR:PATH=//p' "$BUILD_DIR/CMakeCache.txt")
+          gmp_args+=(-DLEAN_USE_GMP "-I$gmp_include")
+        fi
+        version=$(cat "$SRC_DIR/../paperlean/VERSION")
+        run ${CXX:-c++} -std=c++20 -DLEAN_MULTI_THREAD -DLEAN_MMAP "-DPAPERLEAN_VERSION=\"$version\"" \
+          -I"$SRC_DIR" -I"$BUILD_DIR/include" -I"$BUILD_DIR" -I"$BUILD_DIR/paperlean/include" \
+          "${gmp_args[@]}" -c "$fixture/counted.cpp" -o "$TMP_DIR/replay_counted.o"
+        run lean --root="$fixture" -c "$TMP_DIR/replay_counted.c" "$fixture/Replay.lean"
+        run leanc ${LEANC_OPTS-} -o "$TMP_DIR/replay_counted" "$TMP_DIR/replay_counted.c" "$TMP_DIR/replay_counted.o"
+        run env LEAN_PATH="$LIB1:$LIB2" LEAN_OLEAN_PACK="$PACKS" LEAN_IMPORT_IMAGE="$TMP_DIR/p.image.paperlean" \
+          PAPERLEAN_IMPORT_THREADS=4 "$TMP_DIR/replay_counted" "$(lean --print-prefix)" S6
+        ;;
+    esac
   fi
   # `UseD` succeeds in round 1, while `g_zero` is a simp lemma, and fails in round 2
   capture_only "" env LEAN_PATH="$LIB1:$LIB2" PAPERLEAN_IMPORT=legacy lean UseD.lean

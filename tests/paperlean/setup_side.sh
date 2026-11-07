@@ -91,9 +91,17 @@ for m in P Q; do compact "$IR/$m.setup.paperlean"; done
 # a file without permissions
 check_damage 7 'echo x > "$side"; chmod 000 "$side"'
 for m in P Q; do compact "$IR/$m.setup.paperlean"; done
+# Neither symbolic nor hard links allow a setup write to truncate a different file.
+printf 'unrelated contents\n' > "$TMP_DIR/original"
+cp "$TMP_DIR/original" "$TMP_DIR/linked-target"
+check_damage 7 'ln -s "$TMP_DIR/linked-target" "$side"'
+cmp "$TMP_DIR/original" "$TMP_DIR/linked-target" || fail "side writer changed a symbolic-link target"
+check_damage 7 'ln "$TMP_DIR/linked-target" "$side"'
+cmp "$TMP_DIR/original" "$TMP_DIR/linked-target" || fail "side writer truncated a hard link"
 # what cannot be replaced: the conventional setup file is written
-check_damage 8 'mkdir -p "$side/sub"; echo x > "$side/sub/f"; chmod a-w "$side/sub"'
+check_damage 8 'mkdir -p "$side/sub"; echo x > "$side/sub/f"; chmod a-w "$side/sub"; ln -s "$TMP_DIR/linked-target" "${side%.paperlean}.json"'
 for m in P Q; do
   [ -d "$IR/$m.setup.paperlean" ] || fail "the test does not test this: $m's side file was replaced"
   grep -q '"importArts"' "$IR/$m.setup.json" || fail "$m.setup.json was not written"
 done
+cmp "$TMP_DIR/original" "$TMP_DIR/linked-target" || fail "JSON fallback changed a symbolic-link target"

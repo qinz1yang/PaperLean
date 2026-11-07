@@ -457,7 +457,7 @@ $(diff $f.reuse.out $f.exact.out)"
       [ "$(grep -c "Type mismatch" $f.exact.out)" = 1 ];;
     NsDeclName) [ "$(grep -c "Type mismatch" $f.exact.out)" = 1 ] &&
       grep -q "NsDeclName.lean:9:" $f.exact.out;;
-    QuotCtx) [ "$(grep "^h : " $f.exact.out | sort -u | wc -l)" = 2 ];;
+    QuotCtx) [ "$(grep "^h : " $f.exact.out | sort -u | wc -l)" -eq 2 ];;
     NgenAfter) grep -q "294 = 290" $f.exact.out &&
       grep -q "NgenAfter.lean:7:28: error" $f.exact.out;;
     TcNgen) [ "$(grep -c "^ngen " $f.exact.out)" = 10 ] &&

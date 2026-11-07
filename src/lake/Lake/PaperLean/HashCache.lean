@@ -8,6 +8,7 @@ prelude
 public import Lake.Build.Trace
 import Init.While
 import Init.System.Promise
+public import Lake.PaperLean.BuildSessions
 import Lake.PaperLean.Env
 import Lean.PaperLean.System
 import Std.Data.HashMap.Basic
@@ -55,24 +56,18 @@ structure Loaded where
   wantKept : IO.Promise Unit
   kept : Task Record
 
-private builtin_initialize loadedRef : IO.Ref (Option Loaded) ← IO.mkRef none
+private structure Session where
+  loaded : Loaded
+  hits : IO.Ref (List String)
+  keptHits : IO.Ref (List String)
+  newEntries : IO.Ref (List (String × Entry))
+  gone : IO.Ref (List String)
 
--- (Lists: an array that threads share is copied on every change.)
-
-/-- The recorded files that this build took from the record. -/
-private builtin_initialize hitsRef : IO.Ref (List String) ← IO.mkRef []
-
-/-- The files that this build took from the kept record. -/
-private builtin_initialize keptHitsRef : IO.Ref (List String) ← IO.mkRef []
-
-/-- The files read during the build that are recorded. -/
-private builtin_initialize newRef : IO.Ref (List (String × Entry)) ← IO.mkRef []
-
-/-- The files whose entries no longer hold, as they changed. -/
-private builtin_initialize goneRef : IO.Ref (List String) ← IO.mkRef []
+private initialize runs : BuildSessions (Option Session) ← BuildSessions.new
+private initialize standalone : IO.Ref (Option Session) ← IO.mkRef none
 
 /-- The record of a workspace that `prefetch` reads ahead of its build. -/
-private builtin_initialize prefetchRef : IO.Ref (Option (FilePath × Task Record)) ← IO.mkRef none
+private initialize prefetchRef : IO.Ref (Option (FilePath × Task Record)) ← IO.mkRef none
 
 /-- How long before the start of the build a file must have been last changed to be recorded (s). -/
 private def margin : Int := 2
@@ -155,11 +150,8 @@ private def readRecord (kind : String) (gens : Bool) (file : FilePath) : BaseIO 
   | .error _ => return (0, {})
 
 /-- Makes `bytes` the contents of `file`: written to a temporary file and renamed into place. -/
-private def install (file : FilePath) (bytes : ByteArray) : BaseIO Unit := do
-  let tmp := file.addExtension s!"tmp.{← IO.Process.getPID}"
-  discard <| (do
-    IO.FS.writeBinFile tmp bytes
-    IO.FS.rename tmp file).toBaseIO
+private def install (file : FilePath) (bytes : ByteArray) : BaseIO Unit :=
+  discard <| (publishFile file (·.write bytes)).toBaseIO
 
 /-- The modification and status change times (s) of an identity. -/
 private def changeTimes (id : ByteArray) : Int × Int :=
@@ -183,16 +175,12 @@ public def prefetch (wsDir : FilePath) : BaseIO Unit := do
 
 /-- Starts using the records of the workspace in `wsDir`, at the start of a build under a `paperlean`
 command (`accelerated`). -/
-public def start (wsDir : FilePath) : BaseIO Unit := do
-  loadedRef.set none
-  hitsRef.set []
-  keptHitsRef.set []
-  newRef.set []
-  goneRef.set []
-  let prefetched? ← prefetchRef.swap none
-  unless ← accelerated do return
-  if (← IO.getEnv "PAPERLEAN_HASH_CACHE") == some "0" then return
+private def newSession (wsDir : FilePath) (enabled : Bool) : BaseIO (Option Session) := do
+  unless enabled && (← accelerated) do return none
+  if (← IO.getEnv "PAPERLEAN_HASH_CACHE") == some "0" then return none
   let file := recordFile wsDir
+  let prefetched? ← prefetchRef.modifyGet fun hint =>
+    if hint.any (·.1 == file) then (hint.map (·.2), none) else (none, hint)
   let keptFile := keptFile wsDir
   let r ← (do
     IO.FS.createDirAll (wsDir / ".lake")
@@ -203,52 +191,67 @@ public def start (wsDir : FilePath) : BaseIO Unit := do
     let some id ← Lean.PaperLean.fileIdentity clock.toString | return none
     let (mt, ct) := changeTimes id
     let (_, entries) ← match prefetched? with
-      | some (f, t) => if f == file then IO.wait t else readRecord recordKind false file
+      | some t => IO.wait t
       | none => readRecord recordKind false file
     let wantKept : IO.Promise Unit ← IO.Promise.new
     let kept ← BaseIO.mapTask (t := wantKept.result?) (prio := .dedicated) fun
       | some () => readRecord keptKind true keptFile
       | none => pure (0, {})
     return some { file, entries, before := min mt ct - margin, keptFile, wantKept, kept : Loaded }).toBaseIO
-  if let .ok (some l) := r then loadedRef.set (some l)
+  let .ok (some loaded) := r | return none
+  return some ⟨loaded, ← IO.mkRef [], ← IO.mkRef [], ← IO.mkRef [], ← IO.mkRef []⟩
+
+public def startFor (ctx : BuildContext) (wsDir : FilePath) (enabled : Bool) : BaseIO Unit := do
+  runs.insert ctx (← newSession wsDir enabled)
+
+public def start (wsDir : FilePath) : BaseIO Unit := do
+  standalone.set (← newSession wsDir true)
 
 /-- The hash in the `.hash` file `hashFile`, as `Hash.load?` reads it, without reading the file if
 it is recorded with its identity. -/
-public def load? (hashFile : FilePath) : BaseIO (Option Hash) := do
-  let some l ← loadedRef.get | Hash.load? hashFile
+private def loadIn (session? : Option Session) (hashFile : FilePath) : BaseIO (Option Hash) := do
+  let some s := session? | Hash.load? hashFile
+  let l := s.loaded
   let path := hashFile.toString
   -- (the file is read after this, so that a write after it changes the identity recorded)
   let some id ← Lean.PaperLean.fileIdentity path | Hash.load? hashFile
   match l.entries[path]? with
   | some e =>
     if e.identity == id then
-      hitsRef.modify (path :: ·)
+      s.hits.modify (path :: ·)
       return some ⟨e.hash⟩
-    goneRef.modify (path :: ·)
+    s.gone.modify (path :: ·)
   | none =>
     l.wantKept.resolve ()
     if let some e := (← IO.wait l.kept).2[path]? then
       if e.identity == id then
-        keptHitsRef.modify (path :: ·)
+        s.keptHits.modify (path :: ·)
         return some ⟨e.hash⟩
-      goneRef.modify (path :: ·)
+      s.gone.modify (path :: ·)
   let h? ← Hash.load? hashFile
   if let some h := h? then
     let (mt, ct) := changeTimes id
     if mt < l.before && ct < l.before then
-      newRef.modify ((path, { identity := id, hash := h.val }) :: ·)
+      s.newEntries.modify ((path, { identity := id, hash := h.val }) :: ·)
   return h?
+
+public def loadFor? (ctx : BuildContext) (hashFile : FilePath) : BaseIO (Option Hash) := do
+  loadIn (← runs.find? ctx).join hashFile
+
+public def load? (hashFile : FilePath) : BaseIO (Option Hash) := do
+  loadIn (← runs.singleOr? (some (← standalone.get))).join hashFile
 
 /-- Writes the records at the end of the build, if they changed: the record of the files that the
 build read, and the kept record of those that the record had and the build did not read, with what it
 kept before, less what the build read of it, what changed and what is too old. -/
-public def finish : BaseIO Unit := do
-  let some l ← loadedRef.swap none | return
-  let hits ← hitsRef.swap []
-  let keptHits ← keptHitsRef.swap []
-  let new ← newRef.swap []
-  let gone ← goneRef.swap []
+private def finishSession (s : Session) : BaseIO Unit := do
+  let l := s.loaded
+  let hits ← s.hits.swap []
+  let keptHits ← s.keptHits.swap []
+  let new ← s.newEntries.swap []
+  let gone ← s.gone.swap []
   removeStaleTemps l.file
+  if hits.isEmpty && keptHits.isEmpty && new.isEmpty && gone.isEmpty then return
   -- (a file that is read twice counts twice: then the record may keep an entry that was not read)
   if new.isEmpty && keptHits.isEmpty && gone.isEmpty && hits.length ≥ l.entries.size then return
   let goneSet : Std.HashSet String := gone.foldl (·.insert ·) {}
@@ -278,5 +281,11 @@ public def finish : BaseIO Unit := do
   let k := k.filter fun p e => !entries.contains p && !goneSet.contains p && gen - e.gen ≤ maxAge
   let k := unread.foldl (init := k) fun k (p, e) => k.insert p { e with gen }
   install l.keptFile (encode keptKind true gen k)
+
+public def finishFor (ctx : BuildContext) : BaseIO Unit := do
+  if let some s := (← runs.take? ctx).join then finishSession s
+
+public def finish : BaseIO Unit := do
+  if let some s ← standalone.swap none then finishSession s
 
 end Lake.PaperLean.HashCache

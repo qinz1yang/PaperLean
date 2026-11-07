@@ -19,6 +19,7 @@ Modified by PaperLean.
 #include <sys/stat.h>
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include "runtime/thread.h"
 #include "runtime/interrupt.h"
 #include "runtime/sstream.h"
@@ -36,6 +37,7 @@ Modified by PaperLean.
 #include "library/time_task.h"
 #include "library/util.h"
 #include "paperlean/olean_pack.h"
+#include "paperlean/side_file_output.h"
 #include "paperlean/fast_import.h"
 
 // PaperLean: `src/paperlean/lookup_cache.cpp`
@@ -109,6 +111,30 @@ public:
 
     int get() const { return m_fd; }
     operator bool() const { return m_fd != -1; }
+};
+
+// A file-backed region belongs to the loader until its CompactedRegion has been constructed.
+// Pack hits bypass this owner: their mappings are shared for the rest of the process.
+struct loaded_region_deleter {
+    size_t size;
+    bool is_mmap;
+
+    void operator()(char * buffer) const {
+        if (is_mmap) {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+            __lsan_unregister_root_region(buffer, size);
+#endif
+#endif
+#ifdef LEAN_WINDOWS
+            lean_always_assert(UnmapViewOfFile(buffer));
+#else
+            lean_always_assert(munmap(buffer, size) == 0);
+#endif
+        } else {
+            free_sized(buffer, size);
+        }
+    }
 };
 
 /** On-disk format of a .olean file. */
@@ -216,7 +242,17 @@ static std::vector<region_view> extract_dep_regions(b_obj_arg odep_regions) {
 
 // --- Lib table helpers for closure fn ptr relocation ---
 
-static void write_lib_table(std::ostream & out, std::vector<lib_info> const & libs) {
+#ifndef LEAN_WINDOWS
+struct compacted_region_writer {
+    side_file_output & file;
+    void write(char const * bytes, size_t size) {
+        if (!file.write_bytes(bytes, size)) throw exception("failed to create file");
+    }
+};
+#endif
+
+template <typename Writer>
+static void write_lib_table(Writer & out, std::vector<lib_info> const & libs) {
     uint32_t n = libs.size();
     out.write(reinterpret_cast<char const *>(&n), sizeof(n));
     for (lib_info const & lib : libs) {
@@ -282,6 +318,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
     bool allow_closures = allow_closures_u8 != 0;
 
     option_ref<object_ref> prev(oprev);
+    if (strlen(lean_string_cstr(ofname)) + 1 != lean_string_size(ofname)) return mk_embedded_nul_error(ofname);
     object_ref cs_obj;
     if (prev) {
         cs_obj = prev.get_val();
@@ -312,14 +349,17 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
     // older file) so that we neither expose partially-written files nor modify possibly
     // memory-mapped files.
 #ifdef LEAN_WINDOWS
-    uint32_t pid = GetCurrentProcessId();
+    std::string olean_tmp_fn = std::string(olean_fn) + ".tmp." + std::to_string(GetCurrentProcessId());
 #else
-    uint32_t pid = getpid();
+    side_file_output tmp(olean_fn);
 #endif
-    std::string olean_tmp_fn = std::string(olean_fn) + ".tmp." + std::to_string(pid);
-
     try {
+#ifdef LEAN_WINDOWS
         std::ofstream out(olean_tmp_fn, std::ios_base::binary);
+#else
+        if (!tmp.open(0666)) throw exception("failed to create file");
+        compacted_region_writer out{tmp};
+#endif
 
         if (!allow_closures) {
             // v2 path: just `[header][data]`, no extension, no trailer.
@@ -399,6 +439,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             compactor.alloc(lib_table_size(used_libs));
             write_lib_table(out, used_libs);
         }
+#ifdef LEAN_WINDOWS
         out.close();
         // Note that close itself can fail to flush, so this must be last.
         if (out.fail()) {
@@ -407,14 +448,18 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             // IO.Error type; `errno` is not reliable set by iostream.
             throw exception((sstream() << "failed to create file").str());
         }
+#else
+        if (!tmp.publish()) throw exception((sstream() << errno << " " << strerror(errno)).str());
+#endif
     } catch (exception & ex) {
+#ifdef LEAN_WINDOWS
         std::remove(olean_tmp_fn.c_str());
+#endif
         return io_result_mk_error((sstream() << "failed to write '" << olean_fn << "': " << ex.what()).str());
     }
 
-    // Atomic rename
-    while (std::rename(olean_tmp_fn.c_str(), olean_fn) != 0) {
 #ifdef LEAN_WINDOWS
+    while (std::rename(olean_tmp_fn.c_str(), olean_fn) != 0) {
         if (errno == EEXIST) {
             // Memory-mapped files can be deleted starting with Windows 10 using "POSIX semantics".
             HANDLE h_olean_fn = CreateFile(olean_fn, GENERIC_READ | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -429,9 +474,9 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
                 return io_result_mk_error((sstream() << "failed to delete '" << olean_fn << "': " << GetLastError()).str());
             }
         }
-#endif
         return io_result_mk_error((sstream() << "failed to write '" << olean_fn << "': " << errno << " " << strerror(errno)).str());
     }
+#endif
 
     return io_result_mk_ok(cs_obj.steal());
 }
@@ -604,12 +649,13 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 #endif
 #endif
 
+        std::unique_ptr<char, loaded_region_deleter> owned_buffer(buffer, loaded_region_deleter{size, is_mmap});
         if (!buffer) {
             buffer = static_cast<char *>(malloc(size));
+            owned_buffer.reset(buffer);
             lseek(fd.get(), 0, SEEK_SET);
             ssize_t r = readn(fd.get(), buffer, size);
             if (r < 0 || r != static_cast<ssize_t>(size)) {
-                free(buffer);
                 return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "'").str());
             }
             // The buffer outlives this call (its lifetime is the Lean `CompactedRegion`'s, freed by
@@ -671,6 +717,9 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
         // logical address, `size` = the file size), not the inner data section.
         cnstr_set(pair, 1, mk_compacted_region(ofname, mod,
             buffer, reinterpret_cast<size_t>(base_addr), size, is_mmap));
+        // From here only CompactedRegion.free releases the region. In particular, an exception in
+        // relocation above releases it, but a successfully constructed region keeps its live data.
+        owned_buffer.release();
         return io_result_mk_ok(pair);
     } catch (exception & ex) {
         return io_result_mk_error((sstream() << "failed to read '" << olean_fn << "': " << ex.what()).str());

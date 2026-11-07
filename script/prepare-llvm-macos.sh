@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-set -uxo pipefail
+set -euxo pipefail
 
 # run from root build directory as in
 # ```
-# eval cmake ../.. $(../../script/prepare-llvm-macos.sh)
+# llvm_options=$(../../script/prepare-llvm-macos.sh /path/to/llvm.tar.zst) || exit
+# eval "cmake ../.. $llvm_options"
+# Never use `eval cmake ... $(prepare-llvm-macos.sh ...)`: eval hides preparation failures.
 # ```
+
+if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
+  echo "usage: $0 LLVM_ARCHIVE [HOST_LLVM_ARCHIVE]" >&2
+  exit 1
+fi
 
 # use full LLVM release for compiling C++ code, but subset for compiling C code and distribution
 
@@ -12,9 +19,9 @@ GMP=${GMP:-$(brew --prefix)}
 LIBUV=${LIBUV:-$(brew --prefix)}
 OPENSSL=${OPENSSL:-$(brew --prefix openssl@3)}
 
-[[ -d llvm ]] || (mkdir llvm; gtar xf $1 --strip-components 1 --directory llvm)
+[[ -d llvm ]] || (mkdir llvm; gtar xf "$1" --strip-components 1 --directory llvm)
 [[ -d llvm-host ]] || if [[ "$#" -gt 1 ]]; then
-  (mkdir llvm-host; gtar xf $2 --strip-components 1 --directory llvm-host)
+  (mkdir llvm-host; gtar xf "$2" --strip-components 1 --directory llvm-host)
 else
   ln -s llvm llvm-host
 fi
@@ -36,7 +43,7 @@ $CP llvm/lib/clang/*/include/{std*,__std*,limits,float,__float*}.h stage1/includ
 # runtime
 (cd llvm; $CP --parents lib/clang/*/lib/*/libclang_rt.osx.a ../stage1)
 # libSystem stub, includes libc
-cp $SDK/usr/lib/libSystem.tbd stage1/lib/libc
+cp "$SDK/usr/lib/libSystem.tbd" stage1/lib/libc
 # use for linking, use system lib for running
 gcp llvm/lib/libc++.dylib stage1/lib/libc
 # make sure we search for the library in /usr/lib instead of the rpath, which should not contain `/usr/lib`
@@ -48,9 +55,9 @@ echo -n " -DLEAN_STANDALONE=ON"
 echo -n " -DLEAN_EXTRA_CXX_FLAGS='${EXTRA_FLAGS:-}'"
 if [[ -L llvm-host ]]; then
   echo -n " -DCMAKE_C_COMPILER=$PWD/stage1/bin/clang"
-  gcp $GMP/lib/libgmp.a stage1/lib/
-  gcp $LIBUV/lib/libuv.a stage1/lib/
-  gcp $OPENSSL/lib/libssl.a $OPENSSL/lib/libcrypto.a stage1/lib/
+  gcp "$GMP/lib/libgmp.a" stage1/lib/
+  gcp "$LIBUV/lib/libuv.a" stage1/lib/
+  gcp "$OPENSSL/lib/libssl.a" "$OPENSSL/lib/libcrypto.a" stage1/lib/
   echo -n " -DLEAN_EXTRA_LINKER_FLAGS='-lgmp -luv -lssl -lcrypto'"
 else
   echo -n " -DCMAKE_C_COMPILER=$PWD/llvm-host/bin/clang -DLEANC_OPTS='--sysroot $PWD/stage1 -resource-dir $PWD/stage1/lib/clang/15.0.1 ${EXTRA_FLAGS:-}'"

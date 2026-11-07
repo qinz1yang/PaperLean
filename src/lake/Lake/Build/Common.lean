@@ -405,7 +405,7 @@ If `text := true`, `file` is hashed as a text file rather than a binary file.
   if (← getTrustHash) then
     -- PaperLean: as `Hash.load?`, but under `paperlean build` without reading a file that is
     -- unchanged since an earlier build read it (`Lake.PaperLean.HashCache`)
-    if let some hash ← PaperLean.HashCache.load? hashFile then
+    if let some hash ← PaperLean.HashCache.loadFor? (← getBuildContext) hashFile then
       return hash
   let hash ← computeFileHash file text
   createParentDirs hashFile

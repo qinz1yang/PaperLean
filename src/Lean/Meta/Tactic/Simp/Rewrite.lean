@@ -217,7 +217,8 @@ where
       trace[Debug.Meta.Tactic.simp] "no theorems found for {tag}-rewriting {e}"
       return none
     else
-      let candidates := candidates.insertionSort fun e₁ e₂ => e₁.1.priority > e₂.1.priority
+      let candidates := if candidates.size == 1 then candidates else
+        candidates.insertionSort fun e₁ e₂ => e₁.1.priority > e₂.1.priority
       let useBackward := backward.defeqAttrib.useBackward.get (← getOptions)
       for (thm, numExtraArgs) in candidates do
         checkSystem "simp"

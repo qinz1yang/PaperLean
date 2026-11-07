@@ -286,11 +286,12 @@ abbrev withoutModifyingCache (k : SimpM α) : SimpM α := do
   let funext := (← get).funext
   try k finally modify fun s => { s with persistentCache, transientCache, funext }
 
-/-- Saves and restores the transient cache and funext, leaving
+/-- Runs with an empty transient cache, then restores it and funext, leaving
 the persistent cache untouched. Used when entering binders. -/
 abbrev withFreshTransientCache (k : SimpM α) : SimpM α := do
   let transientCache := (← get).transientCache
   let funext := (← get).funext
+  modify fun s => { s with transientCache := {} }
   try k finally modify fun s => { s with transientCache, funext }
 
 end Simp

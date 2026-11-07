@@ -13,6 +13,7 @@ import Lake.Build.Library
 import Lake.Build.Executable
 import Lake.Build.ExternLib
 import Lake.Build.InputFile
+import Lake.PaperLean.BuiltinFacets
 
 /-! # Initial Facets -/
 
@@ -31,3 +32,11 @@ public def initFacetConfigs : FacetConfigMap :=
 where
   insert {k} (group : DNameMap (KFacetConfig k)) map :=
     group.foldl (init := map) fun m _ v => m.insert v.toFacetConfig
+
+-- The interpreter may evaluate a closed definition in separate environments.
+-- Select the same immutable provider objects for stock workspace loading and
+-- for recognizing them when PaperLean writes a shared setup.
+public initialize PaperLean.workspaceInitFacets : FacetConfigMap ← do
+  let facets := initFacetConfigs
+  PaperLean.builtinFacetMap.set (some facets)
+  return facets

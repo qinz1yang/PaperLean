@@ -790,7 +790,8 @@ class task_manager {
     condition_variable                            m_queue_cv;
     condition_variable                            m_task_finished_cv;
     condition_variable                            m_dedicated_finished_cv;
-    bool                                          m_shutting_down{false};
+    unsigned                                      m_process_waiters{0};
+    std::atomic<bool>                             m_shutting_down{false};
 
     lean_task_object * dequeue() {
         lean_assert(m_queues_size != 0);
@@ -839,6 +840,7 @@ class task_manager {
         imp->m_head_dep    = nullptr;
         imp->m_deleted     = true;
         imp->m_canceled.store(true, std::memory_order_relaxed);
+        if (m_process_waiters) m_task_finished_cv.notify_all();
         lock.unlock();
         while (it) {
             lean_task_imp* imp = it->m_imp.load(std::memory_order_relaxed);
@@ -997,6 +999,7 @@ public:
         {
             unique_lock<mutex> lock(m_mutex);
             m_shutting_down = true;
+            if (m_process_waiters) m_task_finished_cv.notify_all();
             // we can assume that `m_std_workers` will not be changed after this line
         }
         m_queue_cv.notify_all();
@@ -1014,6 +1017,21 @@ public:
     void enqueue(lean_task_object * t) {
         unique_lock<mutex> lock(m_mutex);
         enqueue_core(lock, t);
+    }
+
+    // PaperLean's speculative import folds can take their ordinary synchronous path at
+    // consumption if a dedicated worker cannot be created. Nothing has enqueued t yet.
+    bool try_start_import_fold(lean_task_object * t) {
+        unique_lock<mutex> lock(m_mutex);
+        if (m_shutting_down) return false;
+        try {
+            spawn_dedicated_worker(t);
+            return true;
+        } catch (std::exception const &) {
+            // spawn_dedicated_worker counts the worker before constructing its lthread.
+            --m_num_dedicated_workers;
+            return false;
+        }
     }
 
     void resolve(lean_task_object * t, object * v) {
@@ -1046,39 +1064,62 @@ public:
         t1->m_imp.load(std::memory_order_relaxed)->m_head_dep = t2;
     }
 
-    void wait_for(lean_task_object * t) {
-        if (t->m_value)
-            return;
-        unique_lock<mutex> lock(m_mutex);
-        if (t->m_value)
-            return;
-        // see `Task.get`
-        bool in_pool = g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio <= LEAN_MAX_PRIO;
-        if (g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO) {
-            lean_panic("`Task.get` called from a `(sync := true)` task");
-        }
-        if (in_pool) {
-            m_max_std_workers++;
+    // A pool worker waiting for a queued task must yield its worker slot. Both single-task
+    // and any-task waits use the same policy; the mutex protects the counter across wakeups.
+    template<typename Pred>
+    void wait_for_completion(unique_lock<mutex> & lock, Pred ready, char const * sync_error) {
+        if (ready()) return;
+        auto * imp = g_current_task_object ? g_current_task_object->m_imp.load(std::memory_order_relaxed) : nullptr;
+        if (imp && imp->m_prio == LEAN_SYNC_PRIO) lean_panic(sync_error);
+        struct extra_slot {
+            unsigned * limit;
+            ~extra_slot() { if (limit) --*limit; }
+        } slot{imp && imp->m_prio <= LEAN_MAX_PRIO ? &m_max_std_workers : nullptr};
+        if (slot.limit) {
+            ++*slot.limit;
             if (m_idle_std_workers == 0)
                 spawn_worker();
             else
                 m_queue_cv.notify_one();
         }
-        m_task_finished_cv.wait(lock, [&]() { return t->m_value != nullptr; });
-        if (in_pool) {
-            m_max_std_workers--;
-        }
+        m_task_finished_cv.wait(lock, ready);
+    }
+
+    void wait_for(lean_task_object * t) {
+        if (t->m_value) return;
+        unique_lock<mutex> lock(m_mutex);
+        wait_for_completion(lock, [&]() { return t->m_value != nullptr; },
+                            "`Task.get` called from a `(sync := true)` task");
     }
 
     object * wait_any(object * task_list) {
-        if (object * t = wait_any_check(task_list))
-            return t;
+        if (object * t = wait_any_check(task_list)) return t;
         unique_lock<mutex> lock(m_mutex);
-        while (true) {
-            if (object * t = wait_any_check(task_list))
-                return t;
-            m_task_finished_cv.wait(lock);
-        }
+        object * result;
+        wait_for_completion(lock, [&]() { return (result = wait_any_check(task_list)) != nullptr; },
+                            "`IO.waitAny` called from a `(sync := true)` task");
+        return result;
+    }
+
+    // The ordinary wait_any contract is completion-only. Only the child-output owner
+    // may translate cancellation into an interrupted wait and terminate its child.
+    object * wait_any_for_process(object * task_list) {
+        if (!g_current_task_object) return wait_any(task_list);
+        unique_lock<mutex> lock(m_mutex);
+        auto * imp = g_current_task_object->m_imp.load(std::memory_order_relaxed);
+        object * result = nullptr;
+        auto ready = [&]() {
+            if (imp->m_canceled.load(std::memory_order_relaxed) || m_shutting_down) return true;
+            return (result = wait_any_check(task_list)) != nullptr;
+        };
+        if (ready()) return result;
+        struct registered_wait {
+            unsigned & count;
+            explicit registered_wait(unsigned & count): count(count) { ++count; }
+            ~registered_wait() { --count; }
+        } registration(m_process_waiters);
+        wait_for_completion(lock, ready, "`IO.Process.output` blocked inside a `(sync := true)` task");
+        return result;
     }
 
     void deactivate_task(lean_task_object * t) {
@@ -1098,12 +1139,14 @@ public:
     void cancel(lean_task_object * t) {
         unique_lock<mutex> lock(m_mutex);
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
-        if (imp)
+        if (imp) {
             imp->m_canceled.store(true, std::memory_order_relaxed);
+            if (m_process_waiters) m_task_finished_cv.notify_all();
+        }
     }
 
     bool shutting_down() const {
-        return m_shutting_down;
+        return m_shutting_down.load(std::memory_order_relaxed);
     }
 
     uint8_t get_task_state(lean_task_object * t) {
@@ -1230,6 +1273,22 @@ extern "C" LEAN_EXPORT obj_res lean_task_spawn_core(obj_arg c, unsigned prio, bo
     }
 }
 
+// A PaperLean-only keep-alive task for a pure import fold. The BaseIO action takes the
+// erased world (box(0)), which is precisely the argument supplied by run_task.
+extern "C" LEAN_EXPORT obj_res lean_paperlean_try_dedicated_fold(obj_arg act) {
+    if (g_task_manager) {
+        lean_paperlean_env_note_task();
+        lean_task_object * t = alloc_task(act, LEAN_MAX_PRIO + 1, /* keep_alive */ true);
+        if (g_task_manager->try_start_import_fold(t))
+            return mk_option_some(reinterpret_cast<object *>(t));
+        // Neither reference to this unqueued task has escaped. free_task releases the
+        // internal task records; the action they owned is decremented below, outside the lock.
+        free_task(t);
+    }
+    lean_dec(act);
+    return mk_option_none();
+}
+
 extern "C" LEAN_EXPORT obj_res lean_task_pure(obj_arg a) {
     return (lean_object*)alloc_task(a);
 }
@@ -1341,6 +1400,19 @@ extern "C" LEAN_EXPORT uint8_t lean_io_get_task_state_core(b_obj_arg t) {
 
 extern "C" LEAN_EXPORT b_obj_res lean_io_wait_any_core(b_obj_arg task_list) {
     return g_task_manager->wait_any(task_list);
+}
+
+extern "C" LEAN_EXPORT uint8_t lean_io_process_in_task() {
+    return g_current_task_object != nullptr;
+}
+
+extern "C" LEAN_EXPORT obj_res lean_io_process_wait_any_or_cancel(b_obj_arg task_list) {
+    // Without a task manager, spawned tasks have already evaluated synchronously.
+    object * t = g_task_manager ? g_task_manager->wait_any_for_process(task_list) : cnstr_get(task_list, 0);
+    if (!t) return mk_option_none();
+    object * v = lean_task_get(t);
+    lean_inc(v);
+    return mk_option_some(v);
 }
 
 obj_res lean_promise_new() {
@@ -2726,6 +2798,9 @@ extern "C" LEAN_EXPORT obj_res lean_byte_array_copy_slice(b_obj_arg src, obj_arg
     size_t dsz = lean_sarray_size(dest);
     size_t src_off = lean_nat_to_size_t(o_src_off);
     if (src_off > ssz) {
+        // These arguments are owned, but the no-op path need not convert them to size_t.
+        lean_dec(o_dest_off);
+        lean_dec(o_len);
         return dest;
     }
     size_t len = std::min(lean_nat_to_size_t(o_len), ssz - src_off);

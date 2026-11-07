@@ -145,7 +145,14 @@ where
             trace[Elab.definition.structural.eqns] "splitTarget? succeeded"
             mvarIds.forM go
           else
-            throwError "no progress at goal\n{MessageData.ofGoal mvarId}"
+            -- The unfold theorem's type is fixed. A stuck proof may need to unfold more
+            -- when checking types, without changing the policy used to split public equations.
+            let opts ← getOptions
+            let types := `backward.isDefEq.respectTransparency.types
+            if opts.get `backward.isDefEq.respectTransparency true && opts.get types true then
+              withOptions (fun os => os.setBool types false) (go mvarId)
+            else
+              throwError "no progress at goal\n{MessageData.ofGoal mvarId}"
 
 public builtin_initialize eqnInfoExt : MapDeclarationExtension EqnInfo ←
   mkMapDeclarationExtension (exportEntriesFn := fun env s =>

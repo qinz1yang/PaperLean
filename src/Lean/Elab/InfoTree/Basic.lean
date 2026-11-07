@@ -77,15 +77,18 @@ partial def InfoTree.findInfo? (p : Info → Bool) (t : InfoTree) : Option Info 
 /-- Instantiate the holes on the given `tree` with the assignment table.
 (analogous to instantiating the metavariables in an expression) -/
 partial def InfoTree.substitute (tree : InfoTree) (assignment : PersistentHashMap MVarId InfoTree) : InfoTree :=
-  match tree with
-  | node i c => node i <| c.map (substitute · assignment)
-  | context i t => context i (substitute t assignment)
-  | hole id  => match assignment.find? id with
-    | none      => hole id
-    | some tree => substitute tree assignment
+  if assignment.isEmpty then tree else go tree
+where
+  go : InfoTree → InfoTree
+    | node i c => node i <| c.map go
+    | context i t => context i (go t)
+    | hole id => match assignment.find? id with
+      | none => hole id
+      | some tree => go tree
 
 /-- Applies `s.lazyAssignment` to `s.trees`, asynchronously. -/
 def InfoState.substituteLazy (s : InfoState) : Task InfoState :=
+  if s.lazyAssignment.isEmpty then .pure s else
   Task.mapList (tasks := s.lazyAssignment.toList.map (·.2)) fun _ => { s with
     trees := s.trees.map (·.substitute <| s.lazyAssignment.map (·.get))
     lazyAssignment := {}

@@ -571,7 +571,7 @@ def runLintersAsync (stx : Syntax) (cmds : Array Syntax) : CommandElabM Unit := 
     if Parser.isTerminalCommand stx then
         -- TODO: support code actions in module linters
         -- Currently, code actions provided by terminal command are ignored
-        runModuleLinters cmds
+        runModuleLinters cmds moduleLintersCodeQualityEntriesPromise
 
   let task ← BaseIO.bindTask (sync := true) (t := (← getInfoState).substituteLazy) fun infoSt =>
     BaseIO.mapTask (t := treeTask) fun _ =>

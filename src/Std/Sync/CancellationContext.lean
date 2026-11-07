@@ -65,11 +65,18 @@ def fork (root : CancellationContext) : BaseIO CancellationContext := do
 
     let st ← get
     let newId := st.id
+    -- The live map bounds the number of live direct children. At this threshold at least
+    -- half of the stored IDs are stale, so scans are charged to the IDs they remove.
+    let tokens := st.tokens.modify root.id fun (token, children) =>
+      let children := if children.size ≥ 2 * st.tokens.size then
+          children.filter fun id => st.tokens.contains id
+        else
+          children
+      (token, children.push newId)
 
     set { st with
       id := newId + 1,
-      tokens := st.tokens.insert newId (token, #[])
-        |>.modify root.id (.map (·) (.push · newId))
+      tokens := tokens.insert newId (token, #[])
     }
 
     return { state := root.state, token, id := newId }
@@ -130,19 +137,33 @@ Creates a selector that waits for cancellation.
 def doneSelector (x : CancellationContext) : Selector Unit :=
   x.token.selector
 
-private partial def countAliveTokensRec (state : CancellationContext.State) (id : UInt64) : Nat :=
-  match state.tokens.get? id with
-  | none => 0
-  | some (_, children) => 1 + children.foldl (fun acc childId => acc + countAliveTokensRec state childId) 0
+private partial def countAliveTokensRec (state : CancellationContext.State) (id : UInt64) :
+    CancellationContext.State × Nat := Id.run do
+  let some (token, children) := state.tokens.get? id
+    | return (state, 0)
+  let mut state := state
+  let mut count := 1
+  let mut hasDeadChildren := false
+  for childId in children do
+    let (nextState, childCount) := countAliveTokensRec state childId
+    state := nextState
+    count := count + childCount
+    if childCount == 0 then hasDeadChildren := true
+  if hasDeadChildren then
+    let children := children.filter fun childId => state.tokens.contains childId
+    state := { state with tokens := state.tokens.insert id (token, children) }
+  return (state, count)
 
 /--
 Counts the number of alive (non-cancelled) tokens in the context tree, including
-this context and all its descendants.
+this context and all its descendants. Also removes stale child IDs in the visited subtree,
+so later counts do not repeatedly traverse already-cancelled children.
 -/
 def countAliveTokens (x : CancellationContext) : BaseIO Nat := do
   x.state.atomically do
-    let st ← get
-    return countAliveTokensRec st x.id
+    let (st, count) := countAliveTokensRec (← get) x.id
+    set st
+    return count
 
 end CancellationContext
 end Std

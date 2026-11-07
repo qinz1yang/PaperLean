@@ -558,7 +558,7 @@ LEAN_PATH=. PAPERLEAN_REUSE_STATS=fun_info.stats lean FunInfoKey.lean > fun_info
   fail "FunInfoKey.lean failed: $(cat fun_info.out)"
 LEAN_PATH=. PAPERLEAN_EXACT=1 lean FunInfoKey.lean > fun_info_exact.out 2>&1
 [ "$(grep -c "_hygCtx" fun_info_exact.out)" = 3 ] &&
-  [ "$(grep "_hygCtx" fun_info_exact.out | sort -u | wc -l)" = 3 ] ||
+  [ "$(grep "_hygCtx" fun_info_exact.out | sort -u | wc -l)" -eq 3 ] ||
   fail "FunInfoKey.lean does not test what it should: $(cat fun_info_exact.out)"
 awk -F '\t' '$1 == "FunInfoKey.lean" && $6 >= 2' fun_info.stats | grep -q . ||
   fail "FunInfoKey.lean reused too little: $(cat fun_info.stats)"

@@ -642,11 +642,26 @@ private partial def initIsPure (s : EvalState) (i : Name) : Bool := Id.run do
       todo := todo ++ e.calls
   return true
 
+/-- Valid only for one immutable declaration graph. An initializer's safety does not depend on
+the nullary declaration that reached it. -/
+private structure AnalysisCache where
+  effects : Std.HashMap Name DeclEffects := {}
+  initPure : Std.HashMap Name Bool := {}
+  initHits : Nat := 0
+
+private def cachedInitIsPure (s : EvalState) (i : Name) (trace : Bool) : StateM AnalysisCache Bool := do
+  if let some safe := (← get).initPure[i]? then
+    if trace then modify fun c => { c with initHits := c.initHits + 1 }
+    return safe
+  let safe := initIsPure s i
+  modify fun c => { c with initPure := c.initPure.insert i safe }
+  return safe
+
 open IR in
 /-- What the code of the nullary declaration `root` allows. The state holds the effects of the
 declarations seen so far. -/
-private def evalImpurity (s : EvalState) (root : Name) :
-    StateM (Std.HashMap Name DeclEffects) EvalVerdict := do
+private def evalImpurity (s : EvalState) (root : Name) (trace : Bool) :
+    StateM AnalysisCache EvalVerdict := do
   -- what it runs, and whether as part of evaluating another constant that it reads, which is decided
   -- on its own as to panics: what it gives is a value; and whether it is known only to be in a closure
   let mut seen : Std.HashSet (Name × Bool) := {}
@@ -698,11 +713,11 @@ private def evalImpurity (s : EvalState) (root : Name) :
         if let some t := s.forwards[n]? then
           todo := todo.push (t, nested, inClosure)
       | .fdecl _ _ _ body _ =>
-        let e ← match (← get)[n]? with
+        let e ← match (← get).effects[n]? with
           | some e => pure e
           | none =>
             let e := ((collectEffects body).run {}).2
-            modify (·.insert n e)
+            modify fun c => { c with effects := c.effects.insert n e }
             pure e
         if packaged && (e.calls.contains ``ptrAddrUnsafe || e.calls.contains ``isExclusiveUnsafe) then
           if inClosure then
@@ -727,7 +742,7 @@ private def evalImpurity (s : EvalState) (root : Name) :
     match flowImpurity s root suspects with
     | .error why => return .impure s!"evaluating `{root}`: {why}"
     | .ok running => inits := inits ++ initsInClosures.filter running.contains
-  if let some i := inits.find? (!initIsPure s ·) then
+  if let some i ← inits.findM? (fun i => return !(← cachedInitIsPure s i trace)) then
     if runsCode then
       return .impure s!"what `{root}` runs depends on the `[init]` declaration `{i}`"
     return .readsInit i
@@ -761,19 +776,51 @@ private structure EvalModule where
   inits : Array (Name × Name)
   exports : Array (Name × Name)
   identities : Array String
+  arts : ImportArtifacts
 
-/-- The `.olean` parts of `olean` that exist. -/
-private def oleanParts (olean : System.FilePath) : IO (Array System.FilePath) :=
-  return #[olean] ++ (← #[olean.addExtension "server", olean.addExtension "private"].filterM (·.pathExists))
+private abbrev EvalReceipts := Std.HashMap String (String × String)
+
+/-- Captures the bytes from one stable regular file descriptor with the specified identity and
+optional content hash. The destination must be a new path in the worker's private directory. -/
+@[extern "lean_paperlean_snapshot_eval_file"]
+private opaque snapshotEvalFile (input output : @& String) (identity : @& ByteArray) (hash : @& String) :
+    IO Unit
+
+/-- Resolve every part once. Package files use only private captures in both readers, including
+the fallback disk reader when an installed pack contains an older version. -/
+private def evalArtifacts (olean stage : System.FilePath) (packaged : Bool)
+    (receipts? : Option EvalReceipts) : IO (ImportArtifacts × Array String) := do
+  let files := moduleFiles olean
+  let copies := moduleFiles stage
+  let stamps ← files.mapM fun f => fileIdentity f.toString
+  let ids := if packaged then stamps.map fun stamp? => (stamp?.map identityText).getD noFile else #[]
+  let mut data := #[]
+  let mut ir := #[]
+  for h : i in [:files.size] do
+    let f := files[i]
+    let stamp? := stamps[i]!
+    let receipt? := if packaged then receipts?.bind (·[f.toString]?) else none
+    if packaged && receipts?.isSome then
+      unless (receipt?.map (·.1)).getD noFile == ids[i]! do
+        throw <| IO.userError s!"purity input has no matching prepare receipt: {f}"
+    let some stamp := stamp? | continue
+    let path ← if !packaged then pure f else do
+      let copy := copies[i]!
+      snapshotEvalFile f.toString copy.toString stamp ((receipt?.map (·.2)).getD "")
+      pure copy
+    if i < 3 then data := data.push path else ir := ir.push path
+  if stamps[0]!.isNone || (stamps[2]!.isSome && stamps[1]!.isNone) ||
+      stamps[3]!.isSome != stamps[4]!.isSome then
+    throw <| IO.userError s!"incomplete purity input: {olean}"
+  return (⟨#[data, ir]⟩, ids)
 
 open IR in
--- (the regions stay mapped: names and code of the modules are used until the end, and the process
--- that does this ends then)
-private unsafe def readEvalModule (olean : System.FilePath) (packaged : Bool) : IO EvalModule := do
-  let identities ← moduleIdentities olean
-  let data ← readModuleDataParts (← oleanParts olean)
-  let ir := olean.withExtension "ir"
-  let irData ← if ← ir.pathExists then readModuleDataParts #[olean.withExtension "ir.sig", ir] else pure #[]
+-- Keep the mapped regions until this process ends; the declarations reference their data.
+private unsafe def readEvalModule (olean stage : System.FilePath) (packaged : Bool)
+    (receipts? : Option EvalReceipts) : IO EvalModule := do
+  let (arts, identities) ← evalArtifacts olean stage packaged receipts?
+  let data ← readModuleDataParts (arts.oleanParts true)
+  let irData ← readModuleDataParts arts.irParts
   let mut decls : Array Decl := #[]
   let mut inits : Array (Name × Name) := #[]
   let mut exports : Array (Name × Name) := #[]
@@ -791,7 +838,17 @@ private unsafe def readEvalModule (olean : System.FilePath) (packaged : Bool) : 
       if n == declMapExt.name then
         decls := decls ++ (unsafeCast es : Array Decl)
   let some (main, _) := data[0]? | throw <| IO.userError s!"cannot read {olean}"
-  return { file := olean, packaged, imports := main.imports.map (·.module), decls, inits, exports, identities }
+  -- The private importer can recurse on a different part from the public module header.
+  if main.isModule && (arts.oleanPrivate?.isNone || arts.ir?.isNone) then
+    throw <| IO.userError s!"incomplete private or IR data for {olean}"
+  let mut imports := #[]
+  let mut seen : Std.HashSet Name := {}
+  for (d, _) in data ++ irData do
+    for imp in d.imports do
+      unless seen.contains imp.module do
+        seen := seen.insert imp.module
+        imports := imports.push imp.module
+  return { file := olean, packaged, imports, decls, inits, exports, identities, arts }
 
 /-- The number of panics so far, whatever was done about their messages. -/
 @[extern "lean_paperlean_panic_count"]
@@ -799,6 +856,13 @@ private opaque panicCount : BaseIO USize
 
 /-- What `evalImpuritiesCore` tells about its progress: a line per event, for the process that runs it. -/
 public abbrev EvalLog := String → IO Unit
+
+/-- Each import name must denote ordinary path components under its search root. -/
+private def evalNameComponents : Name → Bool
+  | .anonymous => true
+  | .str n s => evalNameComponents n && !s.isEmpty && s != "." && s != ".." &&
+    !s.any (fun c => c == '/' || c == '\u0000' || c == '\\')
+  | .num .. => false
 
 /-- What is known about modules, by the `.olean` files that they are found by. -/
 public structure EvalVerdicts where
@@ -834,10 +898,10 @@ together, in the order of their imports, as a module's constants evaluate those 
 that cannot be imported together are split in halves while `failures`, the number of imports that may
 still fail, lasts; then they are impure. -/
 private unsafe def evalConstants (modules : Array (Name × System.FilePath × Array Name × Array String))
-    (log : EvalLog) (failures : IO.Ref Nat) : IO Unit := do
+    (log : EvalLog) (failures : IO.Ref Nat) (arts : NameMap ImportArtifacts) : IO Unit := do
   enableInitializersExecution
   log s!"import\t{modules.size}"
-  match ← (importModules (modules.map fun (m, _) => { module := m }) {} (leakEnv := true) (loadExts := true)).toBaseIO with
+  match ← (importModules (modules.map fun (m, _) => { module := m }) {} (leakEnv := true) (loadExts := true) (arts := arts)).toBaseIO with
   | .error e =>
     log s!"import-failed\t{modules.size}"
     let left ← failures.modifyGet fun n => (n, n - 1)
@@ -851,8 +915,8 @@ private unsafe def evalConstants (modules : Array (Name × System.FilePath × Ar
       return
     -- (modules that are never imported together can define the same declarations)
     let half := modules.size / 2
-    evalConstants modules[:half] log failures
-    evalConstants modules[half:] log failures
+    evalConstants modules[:half] log failures arts
+    evalConstants modules[half:] log failures arts
   | .ok env =>
     let order : Std.HashMap Name Nat := env.header.moduleNames.foldl (init := {}) fun m n => m.insert n m.size
     let sorted := modules.qsort fun a b => (order[a.1]?.getD 0) < (order[b.1]?.getD 0)
@@ -879,47 +943,112 @@ are pure, except for those of `decided`, which are only read. What they import i
 path `sp`; below `toolchain` is Lean's own code. Constants of `modules` are evaluated, which needs them
 in `searchPathRef`.
 -/
-private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)) (sp : SearchPath)
-    (toolchain : System.FilePath) (decided : Std.HashSet System.FilePath) (log : EvalLog) : IO Unit := do
-  let isOwn (f : System.FilePath) := f.toString.startsWith (toolchain.toString ++ "/")
+private unsafe def evalImpuritiesAt (modules : Array (Name × System.FilePath)) (sp : SearchPath)
+    (toolchain : System.FilePath) (decided : Std.HashSet System.FilePath) (log : EvalLog)
+    (stage : System.FilePath) (receipts? : Option EvalReceipts) : IO Unit := do
+  -- A transient search-root rename must not select a second valid receipted artifact of the
+  -- same name. A path not in the inventory (or added afterwards) cannot supply a package.
+  let resolve (n : Name) : IO (Option System.FilePath) := do
+    unless !n.isAnonymous && evalNameComponents n do return none
+    let found ← sp.findWithExt "olean" n
+    let some receipts := receipts? | return found
+    let mut expected? := none
+    for root in sp do
+      let path := modToFilePath root n "olean"
+      if receipts.contains path.toString then
+        if expected?.any (· != path) then return none
+        expected? := some path
+    let own := modToFilePath toolchain n "olean"
+    match expected? with
+    | some path =>
+      if found != some path || path != own && (← own.pathExists) then return none
+      return some path
+    | none => return if found == some own then found else none
+  -- Root names must select unambiguous artifacts before any verdict can be published.
+  let mut roots : Std.HashMap Name System.FilePath := {}
+  let mut rootNames : Std.HashMap System.FilePath Name := {}
+  for (n, f) in modules do
+    unless !n.isAnonymous && evalNameComponents n do
+      throw <| IO.userError "invalid purity root name"
+    if let some other := rootNames[f]? then
+      unless n == other do
+        throw <| IO.userError s!"two names for the purity input {f}"
+    rootNames := rootNames.insert f n
+    if let some other := roots[n]? then
+      unless f == other do
+        throw <| IO.userError s!"two purity roots for {n}"
+    roots := roots.insert n f
+  let isOwn (f : System.FilePath) := f.toString.startsWith (toolchain.toString ++ "/") &&
+    !(f.toString.drop (toolchain.toString.length + 1) |>.toString.splitOn "/").any (· == "..")
+  let mut arts : NameMap ImportArtifacts := {}
+  let mut slot := 0
   let mut loaded : Array EvalModule := #[]
   let mut seen : Std.HashSet Name := modules.foldl (fun s m => s.insert m.1) {}
   let mut seenFiles : Std.HashSet System.FilePath := modules.foldl (fun s m => s.insert m.2) {}
-  let mut frontier := modules
+  let mut frontier := #[]
+  let mut broken : Std.HashMap Name String := {}
+  for (n, f) in modules do
+    if receipts?.isSome && (← resolve n) != some f then
+      broken := broken.insert n "has no unambiguous receipted artifact in the search path"
+    else
+      frontier := frontier.push (n, f)
   -- (the code of a primitive of Lean's can be in a module that the packages do not import)
   for m in [`Init, `Std, `Lean] do
     unless seen.contains m do
       seen := seen.insert m
-      if let some f ← sp.findWithExt "olean" m then
+      if let some f ← resolve m then
         unless seenFiles.contains f do
           seenFiles := seenFiles.insert f
           frontier := frontier.push (m, f)
   -- the modules that cannot be imported, as their `.olean` file is missing or cannot be read, with
   -- why, and the imports of those that were read
-  let mut broken : Std.HashMap Name String := {}
   let mut importsOf : Array (Name × Array Name) := #[]
+  -- Queue a bounded window in BFS order. Replace each task only after consuming its result;
+  -- file ownership, ambiguity checks and diagnostic ordering stay tied to the original indices.
+  let requested := (← IO.getEnv "PAPERLEAN_EVAL_READERS").bind String.toNat?
+  let readers := (requested.getD (min 32 (2 * (← numCPUs)))).max 1
+  let trace := (← IO.getEnv "PAPERLEAN_EVAL_PROFILE") == some "1"
+  let mut peakReaders := 0
+  let mut maxFrontier := 0
   while !frontier.isEmpty do
-    let tasks ← frontier.mapM fun (_, f) => IO.asTask (readEvalModule f (!isOwn f))
+    let width := min readers frontier.size
+    let startRead := fun (i : Nat) (f : System.FilePath) =>
+      IO.asTask (readEvalModule f (stage / s!"{slot + i}.olean") (!isOwn f) receipts?)
+    let mut tasks := #[]
+    for h : i in [:width] do
+      tasks := tasks.push (← startRead i frontier[i]!.2)
+    if trace then
+      peakReaders := max peakReaders width
+      maxFrontier := max maxFrontier frontier.size
     let mut next : Array (Name × System.FilePath) := #[]
-    for (n, f) in frontier, t in tasks do
-      match t.get with
+    for h : i in [:frontier.size] do
+      let (n, f) := frontier[i]
+      let idx := i % width
+      match tasks[idx]!.get with
       | .error _ =>
         -- (a file that cannot be read has no code, which the constants that run it are told by)
         broken := broken.insert n <| if ← f.pathExists then "has an .olean file that cannot be read"
           else "is not built (its .olean file does not exist)"
       | .ok m =>
+        arts := arts.insert n m.arts
         loaded := loaded.push m
         importsOf := importsOf.push (n, m.imports)
         for i in m.imports do
           unless seen.contains i do
             seen := seen.insert i
-            match ← sp.findWithExt "olean" i with
+            match ← resolve i with
             | some f =>
-              unless seenFiles.contains f do
+              if seenFiles.contains f then
+                broken := broken.insert i "has an ambiguous artifact path"
+              else
                 seenFiles := seenFiles.insert f
                 next := next.push (i, f)
             | none => broken := broken.insert i "is not built (its .olean file does not exist)"
+      if let some (_, later) := frontier[i + width]? then
+        tasks := tasks.set! idx (← startRead (i + width) later)
+    slot := slot + frontier.size
     frontier := next
+  if trace then log s!"readers\t{peakReaders}\t{maxFrontier}"
   -- Of each module that imports one of `broken` directly or not, one of them: it cannot be imported
   -- either, and evaluating its constants would try in vain.
   let mut cause : Std.HashMap Name Name := {}
@@ -977,7 +1106,7 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
   let s : EvalState := { decls, inits, initFns, forwards, clashes }
   decls := {}
   let names : Std.HashMap System.FilePath Name := modules.foldl (fun m (n, f) => m.insert f n) {}
-  let mut effects : Std.HashMap Name DeclEffects := {}
+  let mut cache : AnalysisCache := {}
   -- (one that was not read has not been decided)
   let loadedFiles : Std.HashSet System.FilePath := loaded.foldl (·.insert ·.file) {}
   for (_, f) in modules do
@@ -996,8 +1125,8 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
     let mut closed : Array Name := #[]
     for d in m.decls do
       if d.params.isEmpty && (s.clashes.contains d.name || !d.isExtern && !s.inits.contains d.name) then
-        let (verdict, effects') := (evalImpurity s d.name).run effects
-        effects := effects'
+        let (verdict, cache') := (evalImpurity s d.name trace).run cache
+        cache := cache'
         match verdict with
         | .impure why => why? := some why
         | .closed => closed := closed.push d.name
@@ -1010,12 +1139,29 @@ private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)
     else
       toEvaluate := toEvaluate.push (name, m.file, closed, m.identities)
       constants := constants + closed.size
+  if trace then log s!"initMemo\t{cache.initHits}\t{cache.initPure.size}"
   log s!"static\t{loaded.size}\t{constants}\t{s.clashes.size}"
   -- (a module that cannot be imported with the others takes some halvings to find;
   -- `PAPERLEAN_EVAL_FAILED_IMPORTS` replaces how many imports may fail, for tests)
   let failures ← IO.mkRef <| ((← IO.getEnv "PAPERLEAN_EVAL_FAILED_IMPORTS").bind String.toNat?).getD
     (2 * Nat.log2 (toEvaluate.size + 1) + 16)
-  evalConstants toEvaluate log failures
+  -- Every traversed module, including the toolchain, has explicit artifacts. An undeclared
+  -- import must never consult a workspace path during evaluation or a split retry.
+  let oldPath ← searchPathRef.get
+  try
+    searchPathRef.set []
+    evalConstants toEvaluate log failures arts
+  finally
+    searchPathRef.set oldPath
+
+private unsafe def evalImpuritiesCore (modules : Array (Name × System.FilePath)) (sp : SearchPath)
+    (toolchain : System.FilePath) (decided : Std.HashSet System.FilePath) (log : EvalLog) : IO Unit :=
+  IO.FS.withTempDir fun dir => evalImpuritiesAt modules sp toolchain decided log dir none
+
+@[implemented_by evalImpuritiesAt]
+private opaque evalPinned (modules : Array (Name × System.FilePath)) (sp : SearchPath)
+    (toolchain : System.FilePath) (decided : Std.HashSet System.FilePath) (log : EvalLog)
+    (stage : System.FilePath) (receipts? : Option EvalReceipts) : IO Unit
 
 /-- `evalImpuritiesCore`, which `log` is told the verdicts of. -/
 @[implemented_by evalImpuritiesCore]
@@ -1030,7 +1176,8 @@ module whose constants do not finish in `seconds`, or need more than `mebibytes`
 (`limitAddressSpace`), ends the process, which then has started but not finished it. The standard
 output names a module that it has been waiting for.
 -/
-public def evalImpuritiesMain (modulesFile eventsFile : System.FilePath) (seconds mebibytes : Nat) : IO Unit := do
+public def evalImpuritiesMain (modulesFile eventsFile : System.FilePath) (seconds mebibytes : Nat)
+    (inputDir? : Option System.FilePath := none) : IO Unit := do
   -- (of this `lean`: the one in the `PATH` is official Lean's under the front end)
   let toolchain ← getLibDir (← getBuildDir)
   let lines ← IO.FS.lines modulesFile
@@ -1068,7 +1215,17 @@ public def evalImpuritiesMain (modulesFile eventsFile : System.FilePath) (second
           let name := (modules.find? (·.2.toString == f)).elim f (toString ·.1)
           IO.println s!"  waiting for the constants of {name} (at most {seconds} s)"
           (← IO.getStdout).flush
-  discard <| evalImpuritiesSafe modules (← searchPathRef.get) toolchain decided log
+  match inputDir? with
+  | none => evalImpuritiesSafe modules (← searchPathRef.get) toolchain decided log
+  | some dir =>
+    let sp ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "search.json")) >>= fromJson? (α := SearchPath)
+    let mut receipts : EvalReceipts := {}
+    for line in ← IO.FS.lines (dir / "receipts.jsonl") do
+      let (f, id, hash) ← IO.ofExcept <| Json.parse line >>= fromJson? (α := String × String × String)
+      unless id.length == 112 && hash.length == 32 && !receipts.contains f do
+        throw <| IO.userError s!"invalid purity receipt for {f}"
+      receipts := receipts.insert f (id, hash)
+    evalPinned modules (sp ++ [toolchain]) toolchain decided log (dir / "parts") (some receipts)
   log "done"
   -- (not waiting for the task above)
   IO.Process.exit 0
@@ -1109,5 +1266,21 @@ manifest records. Returns, per module, why it found that its native code is not 
 @[extern "lean_paperlean_write_native_manifest"]
 public opaque writeNativeManifestFiles (out lib : @& String) (deps : @& Array String)
     (modules : @& Array NativeManifestModule) (extSymbols : @& Array String) : IO (Array String)
+
+/-- Recognize only portable C emitted by Lean. -/
+@[extern "lean_paperlean_portable_emitted_c"]
+public opaque portableEmittedC (bytes : @& ByteArray) : Bool
+
+/-- Extra verified extern/export names permitted by the generated-C check. -/
+@[extern "lean_paperlean_portable_c_symbol_guard"]
+public opaque portableCSymbolGuard (bytes : @& ByteArray) (symbols : @& Array String) : Option String
+
+/-- External, constant and exported C object names of one translation unit. -/
+@[extern "lean_paperlean_c_object_names"]
+public opaque cObjectNames (file : @& String) : IO (Array String × Array String × Array String)
+
+/-- Check that the private C snapshots can share a translation unit. -/
+@[extern "lean_paperlean_can_group_checked_c"]
+public opaque canGroupCheckedC (paths : @& Array String) : IO Bool
 
 end Lean.PaperLean

@@ -143,12 +143,8 @@ def Selectable.combine (selectables : Array (Selectable α)) : IO (Selector α) 
 
         let waiterPromise ← IO.Promise.new
 
-        try
-          selectable.selector.registerFn (waiter.withPromise waiterPromise)
-        catch e =>
-          waiter.race (lose := pure ()) (win := fun promise => promise.resolve (.error e))
-          return
-
+        -- Install delivery before registration: a selector may win and then throw.
+        -- If registration drops this promise without winning, result? resolves to none.
         discard <| IO.bindTask (t := waiterPromise.result?) fun res? => do
           match res? with
           | none =>
@@ -162,6 +158,12 @@ def Selectable.combine (selectables : Array (Selectable α)) : IO (Selector α) 
                 waiter.promise.resolve (.error e)
 
             deliver.toBaseIO
+
+        try
+          selectable.selector.registerFn (waiter.withPromise waiterPromise)
+        catch e =>
+          waiter.race (lose := pure ()) (win := fun promise => promise.resolve (.error e))
+          return
 
     unregisterFn := do
       for selectable in selectables do

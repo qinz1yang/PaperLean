@@ -18,6 +18,13 @@ public section
 
 namespace Lean.PaperLean
 
+-- Lake can be interpreted before its native plugin is loaded. Both views must
+-- allocate generation directories from the same process-wide counter.
+private initialize fileGeneration : IO.Ref Nat ← IO.mkRef 0
+
+@[noinline] def nextFileGeneration : BaseIO Nat :=
+  fileGeneration.modifyGet fun n => (n + 1, n + 1)
+
 @[extern "lean_paperlean_version"]
 private opaque versionCore : Unit → String
 
@@ -59,12 +66,23 @@ private opaque nativeLibsAvailableCore : Unit → Bool
 on Linux and macOS. -/
 def nativeLibsAvailable : Bool := nativeLibsAvailableCore ()
 
+/-- Create an owner-private default cache root, or tighten an existing owned root. An owned
+symlink may name an owned directory. Failure leaves optional caching unavailable; explicit shared
+cache directories do not use this operation. -/
+@[extern "lean_paperlean_private_cache_root"]
+opaque privateCacheRoot (path : @& String) : IO Unit
+
 /-- The identity of the file at `path`, as olean packs record it: its device, inode, size, and the
 seconds and nanoseconds of its modification and status change times, as 7 64-bit integers in the
 machine's byte order (one `stat`); `none` if it cannot be read. Unlike a modification time, the
 status change time cannot be set (`touch`, `cp -p`, `tar`). -/
 @[extern "lean_paperlean_file_identity"]
 opaque fileIdentity (path : @& String) : BaseIO (Option ByteArray)
+
+/-- Identity of a stable, open, readable regular input. Unsupported filesystems and
+final symlinks produce no identity. The descriptor uses the olean pack identity format. -/
+@[extern "lean_paperlean_readable_source_identity"]
+opaque readableSourceIdentity (path : @& String) : BaseIO (Option ByteArray)
 
 /-- Limits the address space of this process to what it holds now and `extra` bytes more, or lifts that
 limit if `extra` is `0`: allocations beyond it fail. It does nothing on other systems than Linux. -/

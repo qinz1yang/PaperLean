@@ -20,9 +20,19 @@ Roots must be spelled exactly as in the paths Lean reads (the entries of `LEAN_P
 
 open Lean
 
-def parseHex (s : String) : Nat :=
-  (s.toList.drop 2).foldl (init := 0) fun n c =>
-    n * 16 + if c.isDigit then c.toNat - '0'.toNat else c.toLower.toNat - 'a'.toNat + 10
+private def parseBase? (s : String) : Option USize := do
+  let digits := match s.toList with
+    | '0' :: 'x' :: ds | '0' :: 'X' :: ds => ds
+    | ds => ds
+  guard (!digits.isEmpty)
+  let n ← digits.foldlM (init := 0) fun n c => do
+    let x := c.toLower
+    let digit ← if c.isDigit then some (c.toNat - '0'.toNat)
+      else if 'a' ≤ x && x ≤ 'f' then some (x.toNat - 'a'.toNat + 10) else none
+    let n := n * 16 + digit
+    guard (n < USize.size)
+    return n
+  return n.toUSize
 
 def usage : IO UInt32 := do
   IO.eprintln "usage: lean --run paperlean/Pack.lean [--base <hex address>] <out.paperlean> <root>..."
@@ -39,10 +49,11 @@ def main (args : List String) : IO UInt32 := do
     IO.println s!"wrote an import image of {n} entries to {out}"
     return 0
   | _ =>
-    let (base, args) := match args with
-      | "--base" :: b :: rest => (parseHex b, rest)
-      | _ => (0x200000000000, args)
+    let some (base, args) := (match args with
+      | "--base" :: b :: rest => (parseBase? b).map (·, rest)
+      | ["--base"] => none
+      | _ => some (0x200000000000, args)) | usage
     let out :: roots := args | usage
-    let n ← PaperLean.OLeanPack.create (roots.map System.FilePath.mk).toArray out base.toUSize
+    let n ← PaperLean.OLeanPack.create (roots.map System.FilePath.mk).toArray out base
     IO.println s!"packed {n} files into {out}"
     return 0

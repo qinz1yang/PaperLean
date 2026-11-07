@@ -8,6 +8,22 @@
 # instance of a class in `Type (max u v)`, a level that is never zero, is decided so (without the entry
 # of the cache of `instantiateTypeLevelParams` for it that Lean's path adds).
 
+# Run the fixed rc3 oracle over exactly its constants. The candidate can add definitions to Init;
+# missing or changed rc3 answers must still fail the original count and digest.
+OFFICIAL=${OFFICIAL_LEAN_TOOLCHAIN:-$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc3}
+[ -x "$OFFICIAL/bin/lean" ] || fail "official Lean 4.35.0-rc3 not found: $OFFICIAL"
+cd "$TMP_DIR"
+cat > InitNames.lean <<'EOF2'
+import Lean
+open Lean
+run_meta do
+  let env ← getEnv
+  for (n, _) in env.constants.map₁.toList do
+    if let some idx := env.getModuleIdxFor? n then
+      if env.header.moduleNames[idx]!.getRoot == `Init then
+        IO.println (toJson n).compress
+EOF2
+"$OFFICIAL/bin/lean" InitNames.lean > init-rc3.names || fail "could not enumerate official Init"
 cat > "$TMP_DIR/ProofQuick.lean" <<'EOF2'
 import Lean
 open Lean Meta
@@ -18,10 +34,11 @@ digest of them, to compare with official Lean's. -/
 
 run_meta do
   let env ← getEnv
+  let official : Std.HashSet String := (← IO.FS.lines "init-rc3.names").foldl (·.insert ·) {}
   let mut names : Array Name := #[]
   for (n, _) in env.constants.map₁.toList do
     if let some idx := env.getModuleIdxFor? n then
-      if env.header.moduleNames[idx]!.getRoot == `Init then
+      if env.header.moduleNames[idx]!.getRoot == `Init && official.contains (toJson n).compress then
         names := names.push n
   names := names.qsort Name.quickLt
   let mut digest : UInt64 := 7

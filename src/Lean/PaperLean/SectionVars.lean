@@ -624,12 +624,36 @@ private unsafe def rmMCtx (m : MetavarContext) : RemapM MetavarContext := do
   modify fun s => { s with mctxs := s.mctxs.insert k r }
   return r
 
+/-- Update only remapped entries, retaining the original map when none change. Remove every old
+and destination key first, then replay affected entries in the original traversal order. This also
+preserves the old rebuild's last-insertion winner if a moved key collides with an unchanged key,
+or with another moved key; simply erasing/inserting during one fold would not. -/
+private def rmCacheMap {α β : Type} [BEq α] [Hashable α]
+    (cache : PersistentHashMap α β) (remap : α → β → RemapM (Option (α × β))) :
+    RemapM (PersistentHashMap α β) := do
+  let changes ← cache.foldlM (init := ({} : PersistentHashMap α (α × β))) fun changes k v => do
+    match ← remap k v with
+    | some kv => return changes.insert k kv
+    | none => return changes
+  if changes.isEmpty then return cache
+  let affected := changes.foldl (init := ({} : PersistentHashMap α Unit)) fun keys k (k', _) =>
+    (keys.insert k ()).insert k' ()
+  let out := affected.foldl (init := cache) fun out k _ => out.erase k
+  return cache.foldl (init := out) fun out k v =>
+    match changes.find? k with
+    | some (k', v') => out.insert k' v'
+    | none => if affected.contains k then out.insert k v else out
+
 private unsafe def rmCache (c : Meta.Cache) : RemapM Meta.Cache := do
-  let inferType ← c.inferType.foldlM (init := {}) fun acc k v =>
-    return acc.insert { k with expr := ← rmExpr k.expr } (← rmExpr v)
+  let hasId := fun (x : Expr) => x.hasFVar || x.hasMVar
+  let inferType ← rmCacheMap c.inferType fun k v => do
+    unless hasId k.expr || hasId v do return none
+    let expr ← rmExpr k.expr
+    let value ← rmExpr v
+    if expr.equal k.expr && value.equal v then return none
+    return some ({ k with expr }, value)
   -- (few keys of these have identifiers: `whnf` caches closed terms, `funInfo` mostly constants)
   let whnf ← c.whnf.foldlM (init := c.whnf) fun acc k v => do
-    let hasId := fun (x : Expr) => x.hasFVar || x.hasMVar
     if hasId k.expr then
       return (acc.erase k).insert { k with expr := ← rmExpr k.expr } (← rmExpr v)
     else if hasId v then
@@ -637,15 +661,29 @@ private unsafe def rmCache (c : Meta.Cache) : RemapM Meta.Cache := do
     else
       return acc
   let funInfo ← c.funInfo.foldlM (init := c.funInfo) fun acc k v => do
-    if k.expr.hasFVar || k.expr.hasMVar then
+    if hasId k.expr then
       return (acc.erase k).insert { k with expr := ← rmExpr k.expr } v
     else
       return acc
-  let synthInstance ← c.synthInstance.foldlM (init := {}) fun acc k v => do
-    let k' := { k with type := ← rmExpr k.type, localInsts := ← rmLocalInsts k.localInsts }
-    let v' ← v.mapM fun r => return { r with
-      expr := ← rmExpr r.expr, mvars := ← r.mvars.mapM rmExpr }
-    return acc.insert k' v'
+  let synthInstance ← rmCacheMap c.synthInstance fun k v => do
+    let keyHasId := hasId k.type || k.localInsts.any (hasId ·.fvar)
+    let valueHasId := v.any fun r => hasId r.expr || r.mvars.any hasId
+    unless keyHasId || valueHasId do return none
+    let k' ← if keyHasId then
+        pure { k with type := ← rmExpr k.type, localInsts := ← rmLocalInsts k.localInsts }
+      else pure k
+    let v' ← if valueHasId then
+        v.mapM fun r => return { r with expr := ← rmExpr r.expr, mvars := ← r.mvars.mapM rmExpr }
+      else pure v
+    let sameKey := k'.type.equal k.type && k'.localInsts.size == k.localInsts.size &&
+      (k'.localInsts.zip k.localInsts).all fun (a, b) => a.fvar.equal b.fvar
+    let sameValue := match v', v with
+      | some a, some b => a.expr.equal b.expr && a.mvars.size == b.mvars.size &&
+        (a.mvars.zip b.mvars).all fun (x, y) => x.equal y
+      | none, none => true
+      | _, _ => false
+    if sameKey && sameValue then return none
+    return some (k', v')
   return { c with inferType, whnf, funInfo, synthInstance }
 
 private unsafe def rmDefEqContext (c : DefEqContext) : RemapM DefEqContext :=

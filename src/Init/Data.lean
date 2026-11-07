@@ -52,3 +52,27 @@ public import Init.Data.Slice
 public import Init.Data.Order
 public import Init.Data.Rat
 public import Init.Data.Dyadic
+
+/-- Compiled implementation of the `Int` hash instance. Reducing the magnitude to
+64 bits before doubling preserves the original result modulo `2^64`. -/
+@[expose, macro_inline, instance_reducible] public def Hashable.intWordImpl : Hashable Int where
+  hash x :=
+    let v := 2 * UInt64.ofNat x.natAbs
+    if x < 0 then v - 1 else v
+
+@[csimp] public theorem instHashableInt_eq_intWordImpl : instHashableInt = Hashable.intWordImpl := by
+  apply congrArg (@Hashable.mk Int)
+  funext x
+  cases x with
+  | ofNat n =>
+    change UInt64.ofNat (2 * n) = if Int.ofNat n < 0 then _ else _
+    have hn : ¬ Int.ofNat n < 0 := Int.not_lt_of_ge (Int.natCast_nonneg n)
+    simp only [hn, ↓reduceIte]
+    exact UInt64.ofNat_mul 2 n
+  | negSucc n =>
+    change UInt64.ofNat (2 * n + 1) = if Int.negSucc n < 0 then _ else _
+    simp only [Int.negSucc_lt_zero, ↓reduceIte]
+    change UInt64.ofNat (2 * n + 1) = 2 * UInt64.ofNat (n + 1) - 1
+    rw [UInt64.ofNat_add, UInt64.ofNat_mul, UInt64.ofNat_add, UInt64.mul_add]
+    change 2 * UInt64.ofNat n + 1 = 2 * UInt64.ofNat n + (1 + 1) - 1
+    rw [← UInt64.add_assoc, UInt64.add_sub_cancel]

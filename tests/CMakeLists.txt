@@ -124,17 +124,34 @@ function(check_bench_argument DIR ARGS_BENCH RUN_BENCH_EXISTS)
   endif()
 endfunction()
 
+# Measurement targets deliberately run on every explicit benchmark invocation. Timestamp-only
+# output rules can reuse measurements made by another compiler, workload or benchmark run.
+function(measurement_target OUT OUTPUT)
+  string(SHA256 ID "${OUTPUT}")
+  set("${OUT}" "bench-measure-${ID}" PARENT_SCOPE)
+endfunction()
+
 function(add_combined_measurements OUTPUT)
+  measurement_target(TARGET "${OUTPUT}")
+  set(INPUT_TARGETS "")
+  foreach(INPUT IN LISTS ARGN)
+    measurement_target(INPUT_TARGET "${INPUT}")
+    list(APPEND INPUT_TARGETS "${INPUT_TARGET}")
+  endforeach()
   if(NOT ARGN)
     message(AUTHOR_WARNING "No input measurements provided for ${OUTPUT}")
-    add_custom_command(OUTPUT "${OUTPUT}" COMMAND "${CMAKE_COMMAND}" -E touch "${OUTPUT}")
+    add_custom_target("${TARGET}"
+      COMMAND "${CMAKE_COMMAND}" -E rm -f "${OUTPUT}"
+      COMMAND "${CMAKE_COMMAND}" -E touch "${OUTPUT}"
+      BYPRODUCTS "${OUTPUT}" VERBATIM)
     return()
   endif()
 
-  add_custom_command(
-    OUTPUT "${OUTPUT}"
-    DEPENDS "${ARGN}"
+  add_custom_target("${TARGET}"
+    DEPENDS ${INPUT_TARGETS}
     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/combine.py" -o "${OUTPUT}" -- ${ARGN}
+    BYPRODUCTS "${OUTPUT}"
+    VERBATIM
   )
 endfunction()
 
@@ -191,12 +208,15 @@ function(add_test_pile DIR GLOB)
     if(RUN_BENCH_EXISTS AND NOT EXISTS "${FILE}.no_bench")
       set(MEASUREMENTS_FILE "${FILE}.measurements.jsonl")
       list(APPEND MEASUREMENTS_FILES "${MEASUREMENTS_FILE}")
-      add_custom_command(
-        OUTPUT "${MEASUREMENTS_FILE}"
+      measurement_target(TARGET "${MEASUREMENTS_FILE}")
+      add_custom_target("${TARGET}"
+        DEPENDS lean
+        BYPRODUCTS "${MEASUREMENTS_FILE}"
         WORKING_DIRECTORY "${DIR}"
         COMMAND "${CMAKE_COMMAND}" -E remove -f "${MEASUREMENTS_FILE}"
         # On Windows, we can't call the file directly, hence we always use bash.
         COMMAND bash "${WITH_BENCH_ENV}" "${RUN_BENCH}" "${FILE_IN_DIR}"
+        VERBATIM
       )
     endif()
   endforeach()
@@ -236,12 +256,15 @@ function(add_test_dir DIR)
     set(MEASUREMENTS_FILE "${DIR}/measurements.jsonl")
     list(APPEND "${ARGS_BENCH}" "${MEASUREMENTS_FILE}")
     set("${ARGS_BENCH}" "${${ARGS_BENCH}}" PARENT_SCOPE)
-    add_custom_command(
-      OUTPUT "${MEASUREMENTS_FILE}"
+    measurement_target(TARGET "${MEASUREMENTS_FILE}")
+    add_custom_target("${TARGET}"
+      DEPENDS lean
+      BYPRODUCTS "${MEASUREMENTS_FILE}"
       WORKING_DIRECTORY "${DIR}"
       COMMAND "${CMAKE_COMMAND}" -E remove -f "${MEASUREMENTS_FILE}"
       # On Windows, we can't call the file directly, hence we always use bash.
       COMMAND bash "${WITH_BENCH_ENV}" "${RUN_BENCH}"
+      VERBATIM
     )
   endif()
 endfunction()
@@ -332,6 +355,15 @@ add_test_pile(elab_bench *.lean BENCH PART2 ${ELAB_FIXTURES})
 add_test_pile(elab_fail *.lean ${ELAB_FIXTURES})
 add_test_pile(misc *.sh)
 add_test_pile(paperlean *.sh)
+# These compare generated C, IR, and native symbols against rc3. They are
+# useful when investigating native interoperation, separately from the .olean contract.
+option(PAPERLEAN_COMPARE_UPSTREAM_NATIVE "Run strict rc3 native ABI and code comparisons" OFF)
+foreach(diag inline_abi official_code reverse_abi)
+  set_tests_properties("paperlean/${diag}.sh" PROPERTIES LABELS "upstream-native-comparison")
+  if(NOT PAPERLEAN_COMPARE_UPSTREAM_NATIVE)
+    set_tests_properties("paperlean/${diag}.sh" PROPERTIES DISABLED TRUE)
+  endif()
+endforeach()
 add_test_pile(misc_bench *.sh BENCH PART2)
 add_test_pile(server *.lean)
 add_test_pile(server_interactive *.lean)
@@ -363,6 +395,9 @@ add_combined_measurements("${BENCH_MEASUREMENTS_PART1}" "${PART1}")
 add_combined_measurements("${BENCH_MEASUREMENTS_PART2}" "${PART2}")
 add_combined_measurements("${BENCH_MEASUREMENTS}" "${BENCH_MEASUREMENTS_PART1}" "${BENCH_MEASUREMENTS_PART2}")
 
-add_custom_target(bench-part1 DEPENDS lean "${BENCH_MEASUREMENTS_PART1}" COMMENT "Run benchmarks (part 1)")
-add_custom_target(bench-part2 DEPENDS lean "${BENCH_MEASUREMENTS_PART2}" COMMENT "Run benchmarks (part 2)")
-add_custom_target(bench DEPENDS lean "${BENCH_MEASUREMENTS}" COMMENT "Run all benchmarks")
+measurement_target(BENCH_TARGET_PART1 "${BENCH_MEASUREMENTS_PART1}")
+measurement_target(BENCH_TARGET_PART2 "${BENCH_MEASUREMENTS_PART2}")
+measurement_target(BENCH_TARGET "${BENCH_MEASUREMENTS}")
+add_custom_target(bench-part1 DEPENDS "${BENCH_TARGET_PART1}" COMMENT "Run benchmarks (part 1)")
+add_custom_target(bench-part2 DEPENDS "${BENCH_TARGET_PART2}" COMMENT "Run benchmarks (part 2)")
+add_custom_target(bench DEPENDS "${BENCH_TARGET}" COMMENT "Run all benchmarks")

@@ -73,7 +73,7 @@ ln -s "$LINKED_DATA" .lake/paperlean
 capture lake paperlean prepare p --no-native
 capture lake paperlean prepare p --no-native
 capture lake paperlean prepare p --no-native
-[ "$(ls -d "$LINKED_DATA"/root-* | wc -l)" = 1 ] || fail "prepare kept the data of earlier runs: $(ls "$LINKED_DATA")"
+[ "$(ls -d "$LINKED_DATA"/root-* | wc -l)" -eq 1 ] || fail "prepare kept the data of earlier runs: $(ls "$LINKED_DATA")"
 capture lake paperlean build
 check_out_contains "PaperLean prepared data: used"
 capture lake paperlean clean p

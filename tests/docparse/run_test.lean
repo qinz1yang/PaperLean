@@ -93,6 +93,22 @@ def testConfigs : List (String × ParserFn):= [
   ("document", document),
 ]
 
+/-- Strip only the final numeric case suffix, preserving underscores in parser keys. -/
+def testKind (file : String) : Option String := do
+  let [stem, ""] := file.splitOn ".txt" | none
+  let index :: reversedKind := (stem.splitOn "_").reverse | none
+  if index.isEmpty || !index.toList.all Char.isDigit then none else do
+    let kind := String.intercalate "_" reversedKind.reverse
+    if kind.isEmpty then none else some kind
+
+#guard testKind "arg_val_0001.txt" == some "arg_val"
+#guard testKind "arg_0001.txt" == some "arg"
+#guard testKind "arg_val_x.txt" == none
+#guard testKind "arg_val_.txt" == none
+#guard testKind "_0001.txt" == none
+#guard testKind "arg_val_0001.txt.extra" == none
+#guard testConfigs.all (fun (kind, _) => testKind (kind ++ "_0001.txt") == some kind)
+
 def main : List String → IO UInt32
   | [inputFile] => do
     let inputFile : System.FilePath := inputFile
@@ -105,8 +121,10 @@ def main : List String → IO UInt32
     let [file] := inputFile.components
       | IO.eprintln "Expected file in current directory"
         return 4
-    let kind := file.takeWhile (· != '_')
-    let some p := testConfigs.lookup kind.copy
+    let some kind := testKind file
+      | IO.eprintln s!"Expected <parser>_<numeric case>.txt: {file}"
+        return 5
+    let some p := testConfigs.lookup kind
       | IO.eprintln s!"Not found in test configs: {kind}"
         return 5
     IO.print <| ← test p (← IO.FS.readFile inputFile)

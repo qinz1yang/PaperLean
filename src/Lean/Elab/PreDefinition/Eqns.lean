@@ -341,6 +341,35 @@ where
         return (lctx.mkForall xsNew type, lctx.mkLambda xsNew value)
 
 
+/-- Finish a constructor match in an equation published by its defining module. Imported
+definitions may also be realized independently by rc3, so use its exact type for those. -/
+private def reducePublishedEqnRhs (declName : Name) (type : Expr) : MetaM Expr := do
+  let env ← getEnv
+  if env.isImportedConst declName then return type
+  let some (_, _, rhs) := type.getForallBody.eq? | return type
+  let some info := isMatcherAppCore? env rhs | return type
+  let saved ← saveState
+  try
+    let args := rhs.getAppArgs
+    let discrs := args.extract info.getFirstDiscrPos (info.getFirstDiscrPos + info.numDiscrs)
+    unless ← discrs.anyM isConstructorApp do return type
+    -- Only reduce the outer matcher to its selected alternative. Keep all binders, and
+    -- keep the original RHS if the constructor pattern is still blocked on a variable.
+    forallTelescope type fun xs target => do
+      let rhs := target.appArg!
+      let .reduced rhs' ← withTransparency .default (reduceMatcher? rhs) | return type
+      -- Keep a branch that returns a captured value in its original form. This step only
+      -- exposes results determined by the discriminants of the constructor match.
+      let args := rhs.getAppArgs
+      let discrs := args.extract info.getFirstDiscrPos (info.getFirstDiscrPos + info.numDiscrs)
+      let discrVars := (discrs.foldl collectFVars {}).fvarSet
+      unless (collectFVars {} rhs').fvarIds.all discrVars.contains do return type
+      mkForallFVars xs (target.updateApp! target.appFn! rhs')
+  catch ex =>
+    restoreState saved
+    if ex.isInterrupt || ex.isRuntime then throw ex
+    return type
+
 /--
 Generate equations for `declName`.
 
@@ -373,6 +402,7 @@ where
   doRealize name info type := withOptions (tactic.hygienic.set · false) do
     let value ← mkEqnProof declName type
     let (type, value) ← removeUnusedEqnHypotheses type value
+    let type ← reducePublishedEqnRhs declName type
     addDecl <| (←mkThmOrUnsafeDef {
       name, type, value
       levelParams := info.levelParams

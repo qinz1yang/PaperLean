@@ -2262,7 +2262,12 @@ private def elabAtom : TermElab := fun stx expectedType? => do
   annotateIfRec stx (← elabAppAux stx #[] #[] (ellipsis := false) expectedType?)
 
 @[builtin_term_elab ident] def elabIdent : TermElab := elabAtom
+section
+-- rc3 registers the unqualified internal kind, distinct from Lean.Parser.Term.namedPattern.
+-- Name it locally so later bootstrap stages resolve the same elaborator key as stage 0.
+run_meta modifyEnv fun env => Parser.parserExtension.addLocalEntry env (.kind `namedPattern)
 @[builtin_term_elab namedPattern] def elabNamedPattern : TermElab := elabAtom
+end
 @[builtin_term_elab dotIdent] def elabDotIdent : TermElab := elabAtom
 @[builtin_term_elab explicitUniv] def elabExplicitUniv : TermElab := elabAtom
 @[builtin_term_elab pipeProj] def elabPipeProj : TermElab

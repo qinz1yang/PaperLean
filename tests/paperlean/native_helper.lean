@@ -11,6 +11,8 @@ modules are found in `LEAN_PATH`):
 - `manifest <out> <library> <directory of the .c files> <module>...` writes the manifest of a library
   compiled by the test: its modules are analysed and their files hashed in this process, and the `.c`
   files are the modules'.
+- `manifest-events <events> <out> <library> <directory> <module>...` reads the evaluation events
+  from a separate `evalImpuritiesMain` process.
 - `check <module>...` prints those of the modules that are not known to be pure, with the reason.
 - `unread` does that for a module that cannot be read.
 -/
@@ -33,7 +35,8 @@ def impurities (modules : Array (Name × System.FilePath)) : IO (Array (System.F
 /-- Writes to `out` the manifest of the native library `lib` of `modules`, each with its `.c` file. The
 files of the modules are found in the search path, as importing them finds them, and must be those the
 `.c` files were generated with. -/
-def writeManifest (out lib : String) (modules : Array (Name × String)) : IO Unit := do
+def writeManifest (out lib : String) (modules : Array (Name × String))
+    (events? : Option System.FilePath := none) : IO Unit := do
   let record : System.FilePath := s!"{out}.hashes"
   let mods ← modules.mapM fun (m, c) => do
     let olean ← findOLean m
@@ -46,7 +49,11 @@ def writeManifest (out lib : String) (modules : Array (Name × String)) : IO Uni
     return { name := m, cFile := c, hashes, data := ← moduleNativeData parts : NativeManifestModule }
   if ← record.pathExists then IO.FS.removeFile record
   let oleans ← modules.mapM (findOLean ·.1)
-  let verdicts ← evalVerdicts (modules.map (·.1) |>.zip oleans)
+  let verdicts ← match events? with
+    | none => evalVerdicts (modules.map (·.1) |>.zip oleans)
+    | some f => do
+      let lines ← IO.FS.lines f
+      pure <| lines.foldl EvalVerdicts.add ({} : EvalVerdicts)
   -- as they are now, which is what the manifest records
   let ids ← (oleans.mapM moduleIdentities : BaseIO _)
   let mods := (mods.zip oleans).zip ids |>.map fun ((m, f), i) =>
@@ -65,6 +72,8 @@ def main (args : List String) : IO Unit := do
   | "manifest" :: out :: lib :: dir :: mods =>
     writeManifest out lib (mods.map fun m => (m.toName, s!"{dir}/{m}.c")).toArray
     IO.println "manifest written"
+  | "manifest-events" :: events :: out :: lib :: dir :: mods =>
+    writeManifest out lib (mods.map fun m => (m.toName, s!"{dir}/{m}.c")).toArray (some ⟨events⟩)
   | "check" :: mods =>
     report (← impurities (← mods.toArray.mapM fun n => return (n.toName, ← findOLean n.toName)))
   | ["unread"] => report (← impurities #[(`Nope, "nope.olean")])

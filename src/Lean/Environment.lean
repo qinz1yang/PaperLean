@@ -847,6 +847,11 @@ lookups where it is available (`PaperLean.cachedLookup`). -/
   let m := kenv.constants.map₁
   if PaperLean.nativeAvailable n then PaperLean.cachedLookup 0 m () n fun _ => m[n]? else m[n]?
 
+/-- Look up an already imported constant at the current visibility, without consulting
+any asynchronous declarations or realizations. -/
+def findImportedConst? (env : Environment) (n : Name) : Option ConstantInfo :=
+  findImported? (env.base.get env) n
+
 /--
 Looks up the given declaration name in the environment, avoiding forcing any in-progress elaboration
 tasks unless necessary. This can usually be done efficiently because `addConstAsync` ensures that

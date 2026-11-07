@@ -17,7 +17,9 @@ import Lean.Compiler.LCNF.Util
 import Init.Data.Format.Macro
 import Init.Omega
 import Lean.OriginalConstKind
-
+import Lean.PaperLean.Compiler.Rewrite
+import Lean.Compiler.InlineAttrs
+import Lean.Meta.Match.MatcherInfo
 public section
 namespace Lean.Compiler.LCNF
 namespace ToLCNF
@@ -471,7 +473,7 @@ def countProofOverApp (motive : Expr) (maxArgs : Nat) : MetaM Nat := do
 Given `e : ∀ (h₁ : p₁) ... (hₙ : pₙ), b h₁ ... hₙ`,
 returns the beta reduced `e (lcProof p₁) ... (lcProof pₙ)`.
 -/
-def mkProofOverApp (e : Expr) (n : Nat) : MetaM Expr := do
+private def mkProofOverAppWithScope (key? : Option Name) (e : Expr) (n : Nat) : MetaM Expr := do
   let mut type ← Meta.inferType e
   if type.getNumHeadForalls < n then
     type ← Meta.forallBoundedTelescope type n Meta.mkForallFVars
@@ -479,14 +481,17 @@ def mkProofOverApp (e : Expr) (n : Nat) : MetaM Expr := do
 where
   go (type : Expr) (n : Nat) (vars : Array Expr) : MetaM Expr :=
     match n with
-    | 0 => return e.beta vars
+    | 0 => return PaperLean.applyBody e vars key?
     | k + 1 =>
       match type with
       | .forallE _ t b _ =>
         let t := t.instantiateRev vars
         go b k (vars.push (mkLcProof t))
       | .mdata _ type => go type n vars
-      | _ => Meta.throwFunctionExpected (e.beta vars)
+      | _ => Meta.throwFunctionExpected (PaperLean.applyBody e vars key?)
+
+def mkProofOverApp (e : Expr) (n : Nat) : MetaM Expr :=
+  mkProofOverAppWithScope none e n
 
 /--
 Eta reduce implicits. We use this function to eliminate introduced by the implicit lambda feature,
@@ -513,14 +518,22 @@ def litToValue (lit : Literal) : LitValue :=
   | .natVal val => .nat val
   | .strVal val => .str val
 
-/--
-Put the given expression in `LCNF`.
+open Lean.PaperLean (RewriteStage)
 
-- Nested proofs are replaced with `lcProof`-applications.
-- Eta-expand applications of declarations that satisfy `shouldEtaExpand`.
-- Put computationally relevant expressions in A-normal form.
--/
-partial def toLCNF (e : Expr) (eType : Expr) : CompilerM (Code .pure) := do
+/-- Mark newly exposed constants before beta substitution; applications supplied
+by the caller retain their own pass. The ordinary macro pass is the default. -/
+private def prepareBody (env : Environment) (key : Name) (scope : MData) (stage : RewriteStage)
+    (body : Expr) : Expr :=
+  if scope.isEmpty && (stage matches .macros) then
+    PaperLean.prepareHeads key (fun _ => none) body
+  else
+    let marker := stage.mark scope key
+    let rules := (CSimp.ext.getState env).map
+    PaperLean.prepareHeads key (body := body) fun n => do
+      guard <| rules.contains n || PaperLean.isMacroHead env n || PaperLean.isMatcherHead env n
+      return marker
+
+private partial def toLCNFAux (scopeKey : Name) (e eType : Expr) : CompilerM (Code .pure) := do
   run eType do toCode (← visit e)
 where
   visitCore (e : Expr) : M (Arg .pure) := withIncRecDepth do
@@ -533,7 +546,11 @@ where
       | .app ..      => visitApp e
       | .const ..    => visitApp e
       | .proj s i e  => visitProj s i e
-      | .mdata d e   => visitMData d e
+      | .mdata d v   =>
+        if v.isConst && (PaperLean.macroMarker? d scopeKey).isSome then
+          visitApp e
+        else
+          visitMData d v
       | .lam ..      => visitLambda e
       | .letE ..     => visitLet e #[]
       | .lit lit     => visitLit lit
@@ -579,9 +596,9 @@ where
       visitCore e
 
   /-- Giving `f` a constant `.const declName us`, convert `args` into `args'`, and return `.const declName us args'` -/
-  visitAppDefaultConst (f : Expr) (args : Array Expr) : M (Arg .pure) := do
+  visitResolvedConst (f : Expr) (args : Array Expr) : M (Arg .pure) := do
     let env ← getEnv
-    let .const declName us ← CSimp.replaceConstant env f | unreachable!
+    let .const declName us := f | unreachable!
     let args ← args.mapM (withoutExpectedType do visitAppArg ·)
     if hasNeverExtractAttribute env declName then
       modify fun s => {s with shouldCache := false }
@@ -591,7 +608,10 @@ where
   etaIfUnderApplied (e : Expr) (arity : Nat) (k : M (Arg .pure)) : M (Arg .pure) := do
     let numArgs := e.getAppNumArgs
     if numArgs < arity then
-      visit (← etaExpandN e (arity - numArgs))
+      -- This synthetic application already has its final head. Re-entering it with
+      -- enough arguments must not consume a third CSimp rule.
+      let settled := mkAppN (.mdata (RewriteStage.settled.mark {} scopeKey) e.getAppFn) e.getAppArgs
+      visit (← etaExpandN settled (arity - numArgs))
     else
       k
 
@@ -622,7 +642,7 @@ where
     withNewScope do
     match casesAltInfo with
     | .default numHyps =>
-      let c ← toCode (← visit (← liftMetaM <| mkProofOverApp e (numHyps + nproofs)))
+      let c ← toCode (← visit (← liftMetaM <| mkProofOverAppWithScope (some scopeKey) e (numHyps + nproofs)))
       let altType ← c.inferType
       return (altType, .default c)
     | .ctor ctorName numParams =>
@@ -651,7 +671,7 @@ where
         not occur in the type of `as : List α`.
         -/
         p.update (← applyToAny p.type)
-      let c ← toCode (← visit (← liftMetaM <| mkProofOverApp e nproofs))
+      let c ← toCode (← visit (← liftMetaM <| mkProofOverAppWithScope (some scopeKey) e nproofs))
       let altType ← c.inferType
       return (altType, .alt ctorName ps c)
 
@@ -694,7 +714,7 @@ where
           visit (mkAppN f fieldArgs)
         else
           withoutExpectedType do
-            let result ← visit (← liftMetaM <| mkProofOverApp (mkAppN f fieldArgs) nproofs)
+            let result ← visit (← liftMetaM <| mkProofOverAppWithScope (some scopeKey) (mkAppN f fieldArgs) nproofs)
             mkOverApplication result args arity
       else
         let mut alts := #[]
@@ -720,7 +740,7 @@ where
       let f := e.getAppFn
       let args := e.getAppArgs
       let env ← getEnv
-      let .const declName us ← CSimp.replaceConstant env f | unreachable!
+      let .const declName us := f | unreachable!
       let ctorInfo? ← isCtor? declName
       let args ← args.mapIdxM fun idx arg =>
         -- We can rely on `toMono` erasing ctor params eventually; we do not do so here so that type
@@ -788,7 +808,7 @@ where
       let ha := mkLcProof args[0]! -- We should not use `lcErased` here since we use it to create a pre-LCNF Expr.
       let hb := mkLcProof args[1]!
       let minor := args[minorPos]!
-      let minor := minor.beta #[ha, hb]
+      let minor := PaperLean.applyBody minor #[ha, hb] (some scopeKey)
       visit (mkAppN minor args[arity...*])
 
   visitNoConfusion (e : Expr) : M (Arg .pure) := do
@@ -837,23 +857,55 @@ where
       else
         expandNoConfusionMajor (← etaExpandN major (n+1)) (n+1)
 
-  visitProjFn (projInfo : ProjectionFunctionInfo) (e : Expr) : M (Arg .pure) := do
+  visitProjFn (projInfo : ProjectionFunctionInfo) (source : Expr) (e : Expr)
+      (scope : MData) (stage : RewriteStage) : M (Arg .pure) := do
     let typeName := projInfo.ctorName.getPrefix
     if isRuntimeBuiltinType typeName then
-      let numArgs := e.getAppNumArgs
-      let arity := projInfo.numParams + 1
-      if numArgs < arity then
-        visit (← etaExpandN e (arity - numArgs))
-      else
-        visitAppDefaultConst e.getAppFn e.getAppArgs
+      etaIfUnderApplied e (projInfo.numParams + 1) do
+        visitResolvedConst e.getAppFn e.getAppArgs
     else
-      let .const declName us := e.getAppFn | unreachable!
-      let info ← getConstInfo declName
+      -- For an ordinary structure, rc3 unfolds the incoming projection expression.
+      -- A late CSimp source may have a distinct executable body. If it has no body
+      -- to unfold, use the selected projection's field implementation.
+      let .const sourceName us := source | unreachable!
+      let sourceInfo ← getConstInfo sourceName
+      let info ← if sourceInfo.hasValue then pure sourceInfo else getConstInfo e.getAppFn.constName!
       let f ← Core.instantiateValueLevelParams info us
-      visit (f.beta e.getAppArgs)
-
+      let next := if (stage matches .raw) then .raw else .late
+      visit (PaperLean.applyBody (prepareBody (← getEnv) scopeKey scope next f) e.getAppArgs (some scopeKey))
   visitApp (e : Expr) : M (Arg .pure) := do
-    if let .const declName us ← CSimp.replaceConstant (← getEnv) e.getAppFn then
+    let args := e.getAppArgs
+    let head := e.getAppFn
+    let (scope, stage, original) := match head with
+      | .mdata d f => match RewriteStage.read? d scopeKey with
+        | some stage => if f.isConst then (d, stage, f) else ({}, .macros, head)
+        | none => ({}, .macros, head)
+      | f => ({}, .macros, f)
+    let env ← getEnv
+    let mut fn := original
+    let mut aliases := #[]
+    if (stage matches .original) then
+      if let some safe := isUnsafeRecName? fn.constName! then
+        aliases := aliases.push fn
+        fn := mkConst safe fn.constLevels!
+      if let some target ← liftMetaM (CSimp.replaceConstant? env fn) then
+        aliases := aliases.push fn
+        fn := target
+    if let some arg ← expandBody? original fn args scope aliases stage then return arg
+    let beforeLate := fn
+    unless stage matches .settled | .raw do
+      if let some target ← liftMetaM (CSimp.replaceConstant? env fn) then
+        aliases := aliases.push fn
+        fn := target
+      -- A macro/matcher first seen here may have no callable code. Open its body
+      -- only in that case (also preserving the explicit lazy Decidable fast path).
+      if let .const n _ := fn then
+        if PaperLean.isMacroHead env n || PaperLean.isMatcherHead env n then
+          if n == ``instDecidableAnd || n == ``instDecidableOr ||
+              (!(← getBaseDecl? n).isSome && !isExtern env n && (getImplementedBy? env n).isNone) then
+            if let some arg ← expandBody? original fn args scope aliases .macros then return arg
+    let e := mkAppN fn args
+    if let .const declName us := fn then
       checkComputable declName
       if declName == ``Quot.lift then
         visitQuotLift e
@@ -876,9 +928,9 @@ where
       else if isNoConfusion (← getEnv) declName then
         visitNoConfusion e
       else if let some projInfo ← getProjectionFnInfo? declName then
-        visitProjFn projInfo e
+        visitProjFn projInfo beforeLate e scope stage
       else
-        e.withApp visitAppDefaultConst
+        visitResolvedConst fn args
     else
       e.withApp fun f args => do
         match (← withoutExpectedType do visit f) with
@@ -886,6 +938,39 @@ where
         | .fvar fvarId =>
           let args ← args.mapM (withoutExpectedType do visitAppArg ·)
           letValueToArg <| .fvar fvarId args
+
+  expandBody? (original fn : Expr) (args : Array Expr) (scope : MData) (aliases : Array Expr)
+      (stage : RewriteStage) : M (Option (Arg .pure)) := do
+    let .const n _ := fn | return none
+    let env ← getEnv
+    let some (kind, next) := stage.body? env n | return none
+    let tracked := !scope.isEmpty || !aliases.isEmpty || (stage matches .raw)
+    if scope.contains n then
+      if (stage matches .raw) then throwError "recursive expansion of macro or matcher `{n}`"
+      return some (← visitAliasFallback original args aliases)
+    let child := if tracked then scope.setBool n true else scope
+    let needsMarker := tracked || !(next matches .macros)
+    let etaHead? := if needsMarker then some (.mdata (next.mark scope scopeKey) fn) else none
+    let some value ← liftMetaM (PaperLean.expandApplication? (mkAppN fn args) kind
+        (prepareBody env scopeKey child next) (some scopeKey) etaHead?)
+      | return none
+    return some (← visitCore value)
+
+  -- A recursive edge can come only from the macro's own definition. Caller operands retain
+  -- their own scopes even if beta reduction moves one into the head of a new application.
+  visitAliasFallback (original : Expr) (args : Array Expr) (aliases : Array Expr) : M (Arg .pure) := do
+    let env ← getEnv
+    for fn in aliases do
+      let n := fn.constName!
+      if (← getBaseDecl? n).isSome || isExtern env n || (getImplementedBy? env n).isSome then
+        checkComputable n
+        return ← visitResolvedConst fn args
+    -- With no standalone implementation, expand a source body once without its aliases.
+    -- Propagate that decision through its own code only. A raw-body cycle fails explicitly.
+    for fn in (#[original] ++ aliases) do
+      if let some arg ← expandBody? original fn args {} #[] .raw then return arg
+    checkComputable original.constName!
+    return ← visitResolvedConst original args
 
   visitLambda (e : Expr) : M (Arg .pure) := do
     let b := etaReduceImplicit e
@@ -907,7 +992,13 @@ where
     ```
     which will inline foo in the body of `f`, but will only inline `f` if it is small.
     -/
-    if !b.isLambda && !mustEtaExpand (← getEnv) b then
+    -- Eta reduction can expose the marker on an already settled head. Constructors,
+    -- projections and recursors still require the lambda just introduced for them.
+    let head := b.getAppFn
+    let etaHead := match head with
+      | .mdata d f => if f.isConst && (PaperLean.macroMarker? d scopeKey).isSome then f else head
+      | _ => head
+    if !b.isLambda && !mustEtaExpand (← getEnv) etaHead then
       /-
       We use eta-reduction to make sure we avoid the overhead introduced by
       the implicit lambda feature when declaring instances.
@@ -931,7 +1022,8 @@ where
     if isRuntimeBuiltinType s then
       let structInfo := getStructureInfo (← getEnv) s
       let projExpr ← liftMetaM <| Meta.mkProjection e structInfo.fieldNames[i]!
-      visitApp projExpr
+      let head := Expr.mdata (RewriteStage.late.mark {} scopeKey) projExpr.getAppFn
+      visitApp (mkAppN head projExpr.getAppArgs)
     else
       match (← withoutExpectedType do visit e) with
       | .erased | .type .. => return .erased
@@ -953,6 +1045,21 @@ where
     | _ =>
       let e := e.instantiateRev xs
       visit e
+
+/--
+Put the given expression in `LCNF`.
+
+- Nested proofs are replaced with `lcProof`-applications.
+- Eta-expand applications of declarations that satisfy `shouldEtaExpand`.
+- Put computationally relevant expressions in A-normal form.
+-/
+def toLCNF (e eType : Expr) : CompilerM (Code .pure) := do
+  -- Borrow the upcoming scope for this private key. Unlike mkFreshUserName, this does
+  -- not advance the counter that determines hygienic names of subsequent declarations.
+  let scopeKey := addMacroScope (← MonadQuotation.getContext) `_paperleanMacroBody
+    (← getThe Core.State).nextMacroScope
+  let e := PaperLean.markOriginalHeads (← getEnv) scopeKey e
+  toLCNFAux scopeKey e eType
 
 end ToLCNF
 

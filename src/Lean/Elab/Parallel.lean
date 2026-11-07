@@ -23,7 +23,7 @@ For each monad (`IO`, `CoreM`, `MetaM`, `TermElabM`, `TacticM`), the following f
   - Takes `List (MonadM α)`, returns `MonadM (List (Except Error (α × State)))` / `MonadM (List (Except Error α))`
   - All tasks run in parallel, results returned in input order
   - `par` returns state information, `par'` discards state
-  - Final state is restored to initial state (before tasks ran)
+  - The parent state is restored, retaining fresh-name branches and used macro scopes
   - Errors wrapped in `Except` so all results are collected
 
 - `parIter` / `parIterWithCancel`
@@ -54,7 +54,7 @@ the conclusion of the monadic action that produced each value. This means:
 - For `parIterGreedy`: State is threaded in task completion order
 
 This allows you to observe state changes (like logged messages, modified metavariable contexts, etc.)
-as tasks complete, unlike `par`/`par'` which restore the initial state after collecting all results.
+as tasks complete, unlike `par`/`par'` which restore the parent state captured after starting the tasks.
 
 Iterators do not have `Finite` instances, as we cannot prove termination from the available
 information.
@@ -123,6 +123,13 @@ end IO
 namespace Lean.Core.CoreM
 
 open Std.Iterators
+
+-- Joining a task installs its whole state, including environment-dependent caches.
+-- Restore the whole parent state captured after child name branches were allocated.
+-- Macro scopes are monotonic: joining an earlier successful child may have used more than
+-- the last child. Its returned names must stay fresh relative to the parent.
+private def restoreParent (parent : Core.SavedState) (nextMacroScope : MacroScope) : CoreM Unit :=
+  set { parent.toState with nextMacroScope }
 
 /--
 Runs a list of CoreM computations in parallel and returns:
@@ -201,19 +208,26 @@ in the same order as the input list, not in completion order.
 Results are wrapped in `Except Exception (α × Core.SavedState)` so that errors in individual
 tasks don't stop the collection - you can observe all results including which tasks failed.
 
-The final CoreM state is restored to the initial state (before tasks ran).
+Parent CoreM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par {α : Type} (jobs : List (CoreM α)) : CoreM (List (Except Exception (α × Core.SavedState))) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    let resultWithState ← observing do
-      let result ← task.get
-      pure (result, (← saveState))
-    results := resultWithState :: results
-  set initialState
-  return results.reverse
+  let parent ← Core.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      let resultWithState ← observing do
+        let result ← task.get
+        pure (result, (← saveState))
+      results := resultWithState :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of CoreM computations in parallel and collects results in the original order,
@@ -221,20 +235,27 @@ discarding state information.
 
 Unlike `par`, this doesn't return state information from tasks.
 
-The final CoreM state is restored to the initial state (before tasks ran).
+Parent CoreM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par' {α : Type} (jobs : List (CoreM α)) : CoreM (List (Except Exception α)) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    try
-      let result ← task.get
-      results := .ok result :: results
-    catch e =>
-      results := .error e :: results
-  set initialState
-  return results.reverse
+  let parent ← Core.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      try
+        let result ← task.get
+        results := .ok result :: results
+      catch e =>
+        results := .error e :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of CoreM computations in parallel and returns the first successful result
@@ -243,11 +264,15 @@ Runs a list of CoreM computations in parallel and returns the first successful r
 If `cancel := true` (the default), cancels all remaining tasks after the first success.
 -/
 def parFirst {α : Type} (jobs : List (CoreM α)) (cancel : Bool := true) : CoreM α := do
-  let (cancelHook, iter) ← parIterGreedyWithCancel jobs
+  let (cancels, tasks) := (← jobs.zipIdx.mapM fun (job, i) => asTask do return (i, ← job)).unzip
+  let iter := (IO.iterTasks tasks).mapM fun (task : CoreM (Nat × α)) => do
+    try pure (Except.ok (← task)) catch e => pure (Except.error e)
   for result in iter do
     match result with
-    | .ok value =>
-      if cancel then cancelHook
+    | .ok (winner, value) =>
+      if cancel then
+        for (cancelHook, i) in cancels.zipIdx do
+          if i != winner then cancelHook
       return value
     | .error _ => continue
   throwError "All parallel tasks failed"
@@ -257,6 +282,10 @@ end Lean.Core.CoreM
 namespace Lean.Meta.MetaM
 
 open Std.Iterators
+
+private def restoreParent (parent : Meta.SavedState) (nextMacroScope : MacroScope) : MetaM Unit := do
+  Core.CoreM.restoreParent parent.core nextMacroScope
+  set parent.meta
 
 /--
 Runs a list of MetaM computations in parallel and collects results in the original order,
@@ -268,19 +297,26 @@ in the same order as the input list, not in completion order.
 Results are wrapped in `Except Exception (α × Meta.SavedState)` so that errors in individual
 tasks don't stop the collection - you can observe all results including which tasks failed.
 
-The final MetaM state is restored to the initial state (before tasks ran).
+Parent MetaM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par {α : Type} (jobs : List (MetaM α)) : MetaM (List (Except Exception (α × Meta.SavedState))) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    let resultWithState ← observing do
-      let result ← task.get
-      pure (result, (← saveState))
-    results := resultWithState :: results
-  set initialState
-  return results.reverse
+  let parent ← Meta.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      let resultWithState ← observing do
+        let result ← task.get
+        pure (result, (← saveState))
+      results := resultWithState :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of MetaM computations in parallel and collects results in the original order,
@@ -288,20 +324,27 @@ discarding state information.
 
 Unlike `par`, this doesn't return state information from tasks.
 
-The final MetaM state is restored to the initial state (before tasks ran).
+Parent MetaM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par' {α : Type} (jobs : List (MetaM α)) : MetaM (List (Except Exception α)) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    try
-      let result ← task.get
-      results := .ok result :: results
-    catch e =>
-      results := .error e :: results
-  set initialState
-  return results.reverse
+  let parent ← Meta.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      try
+        let result ← task.get
+        results := .ok result :: results
+      catch e =>
+        results := .error e :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of MetaM computations in parallel and returns:
@@ -378,11 +421,15 @@ Runs a list of MetaM computations in parallel and returns the first successful r
 If `cancel := true` (the default), cancels all remaining tasks after the first success.
 -/
 def parFirst {α : Type} (jobs : List (MetaM α)) (cancel : Bool := true) : MetaM α := do
-  let (cancelHook, iter) ← parIterGreedyWithCancel jobs
+  let (cancels, tasks) := (← jobs.zipIdx.mapM fun (job, i) => asTask do return (i, ← job)).unzip
+  let iter := (IO.iterTasks tasks).mapM fun (task : MetaM (Nat × α)) => do
+    try pure (Except.ok (← task)) catch e => pure (Except.error e)
   for result in iter do
     match result with
-    | .ok value =>
-      if cancel then cancelHook
+    | .ok (winner, value) =>
+      if cancel then
+        for (cancelHook, i) in cancels.zipIdx do
+          if i != winner then cancelHook
       return value
     | .error _ => continue
   throwError "All parallel tasks failed"
@@ -392,6 +439,10 @@ end Lean.Meta.MetaM
 namespace Lean.Elab.Term.TermElabM
 
 open Std.Iterators
+
+private def restoreParent (parent : Term.SavedState) (nextMacroScope : MacroScope) : TermElabM Unit := do
+  Meta.MetaM.restoreParent parent.meta nextMacroScope
+  set parent.elab
 
 /--
 Runs a list of TermElabM computations in parallel and returns:
@@ -471,21 +522,28 @@ in the same order as the input list, not in completion order.
 Results are wrapped in `Except Exception (α × Term.SavedState)` so that errors in individual
 tasks don't stop the collection - you can observe all results including which tasks failed.
 
-The final TermElabM state is restored to the initial state (before tasks ran).
+Parent TermElabM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par {α : Type} (jobs : List (TermElabM α)) : TermElabM (List (Except Exception (α × Term.SavedState))) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    try
-      let result ← task.get
-      let taskState ← saveState
-      results := .ok (result, taskState) :: results
-    catch e =>
-      results := .error e :: results
-  set initialState
-  return results.reverse
+  let parent ← Term.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      try
+        let result ← task.get
+        let taskState ← saveState
+        results := .ok (result, taskState) :: results
+      catch e =>
+        results := .error e :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of TermElabM computations in parallel and collects results in the original order,
@@ -493,20 +551,27 @@ discarding state information.
 
 Unlike `par`, this doesn't return state information from tasks.
 
-The final TermElabM state is restored to the initial state (before tasks ran).
+Parent TermElabM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par' {α : Type} (jobs : List (TermElabM α)) : TermElabM (List (Except Exception α)) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    try
-      let result ← task.get
-      results := .ok result :: results
-    catch e =>
-      results := .error e :: results
-  set initialState
-  return results.reverse
+  let parent ← Term.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      try
+        let result ← task.get
+        results := .ok result :: results
+      catch e =>
+        results := .error e :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of TermElabM computations in parallel and returns the first successful result
@@ -515,11 +580,15 @@ Runs a list of TermElabM computations in parallel and returns the first successf
 If `cancel := true` (the default), cancels all remaining tasks after the first success.
 -/
 def parFirst {α : Type} (jobs : List (TermElabM α)) (cancel : Bool := true) : TermElabM α := do
-  let (cancelHook, iter) ← parIterGreedyWithCancel jobs
+  let (cancels, tasks) := (← jobs.zipIdx.mapM fun (job, i) => asTask do return (i, ← job)).unzip
+  let iter := (IO.iterTasks tasks).mapM fun (task : TermElabM (Nat × α)) => do
+    try pure (Except.ok (← task)) catch e => pure (Except.error e)
   for result in iter do
     match result with
-    | .ok value =>
-      if cancel then cancelHook
+    | .ok (winner, value) =>
+      if cancel then
+        for (cancelHook, i) in cancels.zipIdx do
+          if i != winner then cancelHook
       return value
     | .error _ => continue
   throwError "All parallel tasks failed"
@@ -529,6 +598,10 @@ end Lean.Elab.Term.TermElabM
 namespace Lean.Elab.Tactic.TacticM
 
 open Std.Iterators
+
+private def restoreParent (parent : Tactic.SavedState) (nextMacroScope : MacroScope) : TacticM Unit := do
+  Term.TermElabM.restoreParent parent.term nextMacroScope
+  set parent.tactic
 
 /--
 Runs a list of TacticM computations in parallel and returns:
@@ -608,21 +681,28 @@ in the same order as the input list, not in completion order.
 Results are wrapped in `Except Exception (α × Tactic.SavedState)` so that errors in individual
 tasks don't stop the collection - you can observe all results including which tasks failed.
 
-The final TacticM state is restored to the initial state (before tasks ran).
+Parent TacticM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par {α : Type} (jobs : List (TacticM α)) : TacticM (List (Except Exception (α × Tactic.SavedState))) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    try
-      let result ← task.get
-      let taskState ← Tactic.saveState
-      results := .ok (result, taskState) :: results
-    catch e =>
-      results := .error e :: results
-  set initialState
-  return results.reverse
+  let parent ← Tactic.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      try
+        let result ← task.get
+        let taskState ← Tactic.saveState
+        results := .ok (result, taskState) :: results
+      catch e =>
+        results := .error e :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of TacticM computations in parallel and collects results in the original order,
@@ -630,20 +710,27 @@ discarding state information.
 
 Unlike `par`, this doesn't return state information from tasks.
 
-The final TacticM state is restored to the initial state (before tasks ran).
+Parent TacticM state is restored after collection, including on exception.
+Fresh-name generators retain the parent branch allocated when the tasks were started.
+Macro scopes used by successful children remain reserved in the parent.
 -/
 def par' {α : Type} (jobs : List (TacticM α)) : TacticM (List (Except Exception α)) := do
-  let initialState ← get
   let tasks ← jobs.mapM asTask'
-  let mut results := []
-  for task in tasks do
-    try
-      let result ← task.get
-      results := .ok result :: results
-    catch e =>
-      results := .error e :: results
-  set initialState
-  return results.reverse
+  let parent ← Tactic.saveState
+  let nextMacroScope ← IO.mkRef (← getThe Core.State).nextMacroScope
+  try
+    let mut results := []
+    for task in tasks do
+      try
+        let result ← task.get
+        results := .ok result :: results
+      catch e =>
+        results := .error e :: results
+      let used := (← getThe Core.State).nextMacroScope
+      nextMacroScope.modify (max used)
+    return results.reverse
+  finally
+    restoreParent parent (← nextMacroScope.get)
 
 /--
 Runs a list of TacticM computations in parallel and returns the first successful result
@@ -652,11 +739,15 @@ Runs a list of TacticM computations in parallel and returns the first successful
 If `cancel := true` (the default), cancels all remaining tasks after the first success.
 -/
 def parFirst {α : Type} (jobs : List (TacticM α)) (cancel : Bool := true) : TacticM α := do
-  let (cancelHook, iter) ← parIterGreedyWithCancel jobs
+  let (cancels, tasks) := (← jobs.zipIdx.mapM fun (job, i) => asTask do return (i, ← job)).unzip
+  let iter := (IO.iterTasks tasks).mapM fun (task : TacticM (Nat × α)) => do
+    try pure (Except.ok (← task)) catch e => pure (Except.error e)
   for result in iter do
     match result with
-    | .ok value =>
-      if cancel then cancelHook
+    | .ok (winner, value) =>
+      if cancel then
+        for (cancelHook, i) in cancels.zipIdx do
+          if i != winner then cancelHook
       return value
     | .error _ => continue
   throwError "All parallel tasks failed"

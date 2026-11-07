@@ -13,6 +13,7 @@ import Init.Data.String.Search
 import Init.System.IO
 import Std.Internal.Parsec.String
 import Lean.Data.Json.Parser
+import Lean.PaperLean.ExportJson
 
 /-!
 # Reader for the Lean 4 NDJSON export format
@@ -57,8 +58,14 @@ def getName (nidx : Nat) : M Lean.Name := do
   let some n := (← get).nameMap[nidx]? | fail s!"Name not found {nidx}"
   return n
 
+/-- Keep the duplicate check separate from the callers' existing specializations. -/
+@[noinline] private def indexBound {α : Type} (m : Std.HashMap Nat α) (i : Nat) : Bool :=
+  m.contains i
+
 @[inline]
 def addName (nidx : Nat) (n : Lean.Name) : M Unit := do
+  if indexBound (← get).nameMap nidx then
+    fail s!"Name index {nidx} bound twice"
   modify fun s => { s with nameMap := s.nameMap.insert nidx n }
 
 @[inline]
@@ -68,6 +75,8 @@ def getLevel (uidx : Nat) : M Lean.Level := do
 
 @[inline]
 def addLevel (uidx : Nat) (l : Lean.Level) : M Unit := do
+  if indexBound (← get).levelMap uidx then
+    fail s!"Level index {uidx} bound twice"
   modify fun s => { s with levelMap := s.levelMap.insert uidx l }
 
 @[inline]
@@ -77,6 +86,8 @@ def getExpr (eidx : Nat) : M Lean.Expr := do
 
 @[inline]
 def addExpr (eidx : Nat) (e : Lean.Expr) : M Unit := do
+  if indexBound (← get).exprMap eidx then
+    fail s!"Expr index {eidx} bound twice"
   modify fun s => { s with exprMap := s.exprMap.insert eidx e }
 
 @[inline]
@@ -86,6 +97,8 @@ def getRecursorRule (ridx : Nat) : M Lean.RecursorRule := do
 
 @[inline]
 def addRecursorRule (ridx : Nat) (r : Lean.RecursorRule) : M Unit := do
+  if indexBound (← get).recursorRuleMap ridx then
+    fail s!"RecursorRule index {ridx} bound twice"
   modify fun s => { s with recursorRuleMap := s.recursorRuleMap.insert ridx r }
 
 @[inline]
@@ -98,10 +111,16 @@ def addConst (name : Lean.Name) (d : Lean.ConstantInfo) : M Unit := do
       constOrder := s.constOrder.push name
     }
 
+@[noinline] private def readObject (notObject : IO.Error) (parser : Parser Json) (line : String) :
+    M (Std.TreeMap.Raw String Json) := do
+  match Parser.run (ws *> parser <* eof) line with
+  | .ok (.obj obj) => return obj
+  | .ok _ => throw notObject
+  | .error e => fail s!"Invalid JSON: {e}"
+
 @[inline]
-def parseJsonObj (line : String) : M (Std.TreeMap.Raw String Json) := do
-  let .ok (.obj obj) := Json.Parser.anyCore.run line | fail "Expected JSON object"
-  return obj
+def parseJsonObj (line : String) : M (Std.TreeMap.Raw String Json) :=
+  readObject (.userError "Expected JSON object") Lean.PaperLean.ExportJson.anyCore line
 
 def parseNameStr (json : Json) : M Name := do
   let .obj data := json | fail s!"Name.str invalid"
@@ -498,8 +517,17 @@ where
       parseItem line
       go
 
+/-- The first line identifies the export format; it is never a declaration to be skipped.
+Only format 3.1.0 is supported. Producer/version provenance may be included in `meta` without
+requiring this reader's Lean or exporter version, and an otherwise empty export is valid. -/
 def parseMdata : M Unit := do
-  let _line ← (← get).stream.getLine
+  let line ← (← get).stream.getLine
+  let obj ← parseJsonObj line
+  let [("meta", .obj metadata)] := obj.toList | fail "Expected export metadata on first line"
+  let some (.obj format) := metadata["format"]? | fail "Export metadata missing format object"
+  let some (.str version) := format["version"]? | fail "Export metadata missing format version"
+  unless version == "3.1.0" do
+    fail s!"Unsupported export format version: {version}"
 
 def parseFile : M Unit := do
   parseMdata
@@ -507,7 +535,7 @@ def parseFile : M Unit := do
 
 end Parse
 
-public def parseStream (stream : IO.FS.Stream) : IO ExportedEnv := do
+@[noinline, nospecialize] public def parseStream (stream : IO.FS.Stream) : IO ExportedEnv := do
   let (_, state) ← Parse.M.run Parse.parseFile stream
   let { constMap, constOrder, .. } := state
   return {

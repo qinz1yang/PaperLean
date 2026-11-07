@@ -44,7 +44,7 @@ See also `ContextAsync.runIn` for running with an existing context.
 @[inline]
 protected def run (x : ContextAsync α) : Async α := do
   let ctx ← CancellationContext.new
-  x ctx <* ctx.cancel .cancel
+  try x ctx finally ctx.cancel .cancel
 
 /--
 Returns the current context for inspection or to pass to other functions.
@@ -129,19 +129,21 @@ def concurrentlyAll (xs : Array (ContextAsync α))
   let ctx ← getContext
   let concurrentCtx ← ctx.fork
 
-  let tasks : Array (AsyncTask α) ← xs.mapM fun ctxAsync => do
-    let childCtx ← concurrentCtx.fork
-    async (prio := prio)
-      (try
-        ctxAsync childCtx
-      catch err => do
-        concurrentCtx.cancel .cancel
-        throw err
-      finally
-        childCtx.cancel .cancel)
+  try
+    let tasks : Array (AsyncTask α) ← xs.mapM fun ctxAsync => do
+      let childCtx ← concurrentCtx.fork
+      async (prio := prio)
+        (try
+          ctxAsync childCtx
+        catch err => do
+          concurrentCtx.cancel .cancel
+          throw err
+        finally
+          childCtx.cancel .cancel)
 
-  let result ← tasks.mapM await
-  return result
+    tasks.mapM await
+  finally
+    concurrentCtx.cancel .cancel
 
 /--
 Launches a `ContextAsync` computation in the background, discarding its result.
@@ -155,7 +157,7 @@ even after parent cancellation.
 def background (action : ContextAsync α) (prio := Task.Priority.default) : ContextAsync Unit := do
   let ctx ← getContext
   let childCtx ← ctx.fork
-  Async.background (action childCtx *> childCtx.cancel .cancel) prio
+  Async.background (try action childCtx finally childCtx.cancel .cancel) prio
 
 /--
 Launches a `ContextAsync` computation in the background, discarding its result. It's similar to `background`,
@@ -170,28 +172,32 @@ def disown (action : ContextAsync α) (prio := Task.Priority.default) : ContextA
   Async.background (action childCtx) prio
 
 /--
-Runs all computations concurrently and returns the first result. Each computation runs in its own child context;
-when the first completes successfully, all others are cancelled immediately.
+Runs all computations concurrently and returns the first result or propagates the first error.
+Each computation runs in its own child context within a group; when the first completes, the group
+is cancelled without cancelling the caller's context or unrelated siblings. Cancellation is cooperative
+and this function does not wait for losing computations to finish. Throws an error if `xs` is empty.
 -/
 def raceAll [ForM ContextAsync c (ContextAsync α)] (xs : c)
     (prio := Task.Priority.default) : ContextAsync α := do
   let parent ← getContext
-  let promise ← IO.Promise.new
+  let group ← parent.fork
+  try
+    let promise ← IO.Promise.new
+    let started ← IO.mkRef false
 
-  ForM.forM xs fun x => do
-    let ctx ← CancellationContext.fork parent
-    let task ← async (x ctx) prio
+    ForM.forM xs fun x => do
+      started.set true
+      let ctx ← group.fork
+      let task : AsyncTask α ← liftM (m := Async) <|
+        EAsync.async (try x ctx finally ctx.cancel .cancel) prio
+      BaseIO.chainTask task fun result => promise.resolve result
 
-    background do
-      try
-        let result ← await task
-        promise.resolve (.ok result)
-      catch e =>
-        discard $ promise.resolve (.error e)
+    unless ← started.get do
+      throw <| .userError "ContextAsync.raceAll requires at least one computation"
 
-  let result ← await promise
-  parent.cancel .cancel
-  Async.ofExcept result
+    Async.ofExcept (← await promise)
+  finally
+    group.cancel .cancel
 
 /--
 Launches a `ContextAsync` computation as an asynchronous task with a forked child context.

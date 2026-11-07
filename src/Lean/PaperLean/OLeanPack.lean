@@ -143,6 +143,23 @@ checks the parts of the tables that it uses by their checksums. -/
 @[extern "lean_paperlean_import_image_verify"]
 public opaque verifyImportImage (image : @& String) : IO String
 
+/-- The pack content hash of these exact bytes, or the empty string on unsupported platforms. -/
+@[extern "lean_paperlean_hash_bytes"]
+public opaque hashBytes (bytes : @& ByteArray) : String
+
+/-- Read the exact bytes of a stable regular file with the given identity. A nonempty `hash` must
+also match its pack digest. Opening a special file substituted for `path` cannot block the reader. -/
+@[extern "lean_paperlean_read_verified_bytes"]
+public opaque readVerifiedBytes (path : @& String) (identity : @& ByteArray) (hash : @& String) : IO ByteArray
+
+/-- The identity of the final directory entry itself if it is a regular file. -/
+@[extern "lean_paperlean_owned_file_identity"]
+public opaque ownedFileIdentity (path : @& String) : BaseIO (Option ByteArray)
+
+/-- Read a verified owned cache file, rejecting a final symlink even if its target has the expected identity. -/
+@[extern "lean_paperlean_read_verified_owned_bytes"]
+public opaque readVerifiedOwnedBytes (path : @& String) (identity : @& ByteArray) (hash : @& String) : IO ByteArray
+
 @[extern "lean_paperlean_hash_files"]
 private opaque hashFilesCore (files scope : @& Array String) (record : @& String) (jobs : USize) :
     IO (Array (ByteArray × String))
@@ -169,5 +186,10 @@ number of the pack's files that are bound, and of all of them.
 @[extern "lean_paperlean_pack_bind"]
 public opaque bind (pack : @& String) (roots storedRoots : @& Array String) (record out : @& String) :
     IO (Nat × Nat)
+
+/-- Open a stable regular file for locking. Symlinks to regular files are accepted. Absent,
+replaced and special files return `none`; opening a raced special file cannot block. -/
+@[extern "lean_paperlean_open_regular_for_lock"]
+public opaque openRegularForLock (path : @& String) : IO (Option IO.FS.Handle)
 
 end Lean.PaperLean.OLeanPack

@@ -4,7 +4,7 @@
 #
 # Exports <commit> of this repository into the new directory <dir> as the source tree of a release
 # build (`CHECK_OLEAN_VERSION=ON`): its `.git` has only a `HEAD` naming the upstream release commit
-# (`LEAN_UPSTREAM_GITHASH` of src/CMakeLists.txt), from which stage0, which PaperLean does not change,
+# (`LEAN_UPSTREAM_GITHASH` of src/CMakeLists.txt), from which the bootstrap compiler
 # takes the githash that it writes into the headers of the library's `.olean` files, as when upstream
 # builds its release; `PAPERLEAN_COMMIT` names <commit>, PaperLean's build.
 #   script/paperlean-export-source.sh <commit> <dir>

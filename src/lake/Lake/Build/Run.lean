@@ -15,6 +15,7 @@ import Lake.PaperLean.BuildData
 import Lake.PaperLean.Schedule
 import Lake.PaperLean.HashCache
 import Lake.PaperLean.SetupIndex
+import Lake.PaperLean.SourceInputScope
 
 /-! # Build Runner
 
@@ -47,6 +48,9 @@ structure MonitorContext where
   failFast : Bool := false
   /-- The build's cancellation token, if any. -/
   cancelTk? : Option IO.CancelToken := none
+  /-- A returned target job can register more jobs after the outer fetch completes.
+  Its lifetime keeps the monitor open without adding another reported job. -/
+  until? : Option (Task Unit) := none
 
 @[inline, instance_reducible] def MonitorContext.logger (ctx : MonitorContext) : MonadLog BaseIO :=
   .stream ctx.out ctx.outLv ctx.useAnsi
@@ -196,11 +200,17 @@ partial def loop
     let new ← drainQueue
     loop new unfinished
   else
-    -- Must recheck queue for new tasks before terminating the loop.
-    -- Finished tasks may have registered new tasks.
+    -- Check the producer before the final drain. If it is done, every job it
+    -- registered is now visible. Keep polling while an unregistered target is live.
+    let pending ← match ctx.until? with
+      | none => pure false
+      | some t => Bool.not <$> IO.hasFinished t
     let new ← drainQueue
     if 0 < new.size then
       loop new unfinished
+    else if pending then
+      sleep
+      loop (← drainQueue) unfinished
 
 def main (init : Array OpaqueJob) : MonitorM PUnit := do
   let new ← drainQueue
@@ -394,12 +404,13 @@ def Workspace.startBuild
   (bctx : BuildContext) (build : FetchM α) (caption := "job computation")
 : BaseIO (Job α) := do
   let compute := Job.async build (caption := caption)
-  compute.run.run'.run bctx |>.run nilTrace
+  let track ← PaperLean.SetupIndex.observesProviders bctx
+  (PaperLean.runFetchFor track compute).run'.run bctx |>.run nilTrace
 
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
-  reportResult cfg mctx.out result
+  if result.isOk || !result.failures.isEmpty then reportResult cfg mctx.out result
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
@@ -410,6 +421,21 @@ def finalizeBuild
       IO.Process.exit noBuildCode.toUInt8
     else
       throw (IO.userError e)
+
+/-- All three public runners bracket the same resources. Passive queries register their
+own context without enabling build accelerators, even when invoked inside another run. -/
+private def withPaperLeanBuildState (ws : Workspace) (ctx : BuildContext) (enable : Bool)
+    (act : BaseIO α) : BaseIO α := do
+  let compile := enable && !ctx.noBuild
+  let scheduler ← PaperLean.Schedule.startFor ctx ws.dir compile
+  PaperLean.BuildData.startFor ctx ws.dir compile
+  PaperLean.HashCache.startFor ctx ws.dir enable
+  PaperLean.SetupIndex.beginRun ctx ws enable
+  try PaperLean.SourceInputScope.withRun ctx enable act finally
+    PaperLean.SetupIndex.endRun ctx
+    PaperLean.BuildData.finishFor ctx
+    PaperLean.HashCache.finishFor ctx
+    PaperLean.Schedule.finishFor ctx scheduler
 
 /--
 Run a build function in the Workspace's context using the provided configuration.
@@ -423,19 +449,34 @@ public def Workspace.runFetchM
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
-  let job ← startBuild bctx build caption
-  let result ← monitorJob mctx job
+  let result ← withPaperLeanBuildState ws bctx false do
+    let job ← startBuild bctx build caption
+    monitorJob mctx job
   finalizeBuild cfg bctx mctx result
 
 def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildResult α) := do
-  let result ← monitorJob mctx job
+  let loggedFailure := fun (state : JobState) => state.log.hasEntries && state.log.maxLv ≥ mctx.failLv
+  let cancel := fun (optional : Bool) => do
+    if mctx.failFast && !optional then mctx.cancelTk?.forM (·.set)
+  let lifetime ← BaseIO.bindTask job.task (sync := true) fun
+    | .ok target _ => BaseIO.mapTask (t := target.task) (sync := true) fun result => do
+      if (result matches .error ..) || loggedFailure result.state then cancel target.optional
+    | .error .. => do cancel job.optional; return .pure ()
+  let result ← monitorJob {mctx with until? := some lifetime} job
   match result.out with
-  | .ok job =>
-    if let some a ← job.wait? then
-      return {result with out := .ok a}
-    else
-      -- Job failed but was unreported in the monitor. It was likely not properly registered.
-      return {result with out := .error <|
+  | .ok target =>
+    let outcome ← target.wait
+    let state := outcome.state
+    let result := {result with wantsRebuild := result.wantsRebuild || state.wantsRebuild}
+    -- A registered required failure was already reported by the monitor. An unregistered
+    -- returned target still uses the same log threshold, even if it returned a value.
+    if !target.optional && loggedFailure state then
+      state.log.replay (logger := .stream mctx.out .trace mctx.useAnsi)
+      let caption := if target.caption.isEmpty then "top-level target" else target.caption
+      return {result with failures := #[caption], out := .error "build failed"}
+    match outcome with
+    | .ok a _ => return {result with out := .ok a}
+    | .error .. => return {result with out := .error <|
         "uncaught top-level build failure (this is likely a bug in the build script)"}
   | .error e =>
     return {result with out := .error e}
@@ -452,8 +493,9 @@ public def Workspace.checkNoBuild
   let cfg := {noBuild := true}
   let mctx ← mkMonitorContext cfg jobs
   let bctx ← mkBuildContext ws cfg jobs
-  let job ← startBuild bctx build
-  let result ← monitorBuild mctx job
+  let result ← withPaperLeanBuildState ws bctx false do
+    let job ← startBuild bctx build
+    monitorBuild mctx job
   return result.isOk -- `isOk` means no failures, and thus no `--no-build` failures
 
 /-- Run a build function in the Workspace's context and await the result. -/
@@ -465,20 +507,9 @@ public def Workspace.checkNoBuild
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
-  -- PaperLean: under `paperlean build`, the order of compiles, the record of `.hash` files read and
-  -- the setup index (`Lake.PaperLean.Schedule`, `Lake.PaperLean.HashCache`,
-  -- `Lake.PaperLean.SetupIndex`)
-  PaperLean.Schedule.start ws.dir
-  PaperLean.HashCache.start ws.dir
-  PaperLean.SetupIndex.start ws.dir
-  let job ← startBuild bctx build
-  let result ← monitorBuild mctx job
-  -- PaperLean: the packs and setup indexes written during the build are not needed after it
-  -- (`Lake.PaperLean.BuildData`, `Lake.PaperLean.SetupIndex`)
-  PaperLean.BuildData.finish
-  PaperLean.Schedule.finish
-  PaperLean.HashCache.finish
-  PaperLean.SetupIndex.finish ws.dir
+  let result ← withPaperLeanBuildState ws bctx true do
+    let job ← startBuild bctx build
+    monitorBuild mctx job
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/

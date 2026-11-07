@@ -524,6 +524,9 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
   if opts.onlySrcDeps then
     Elab.printImportSrcs contents fileName
     return 0
+  if !opts.run && opts.bcFileName?.isSome && !Internal.hasLLVMBackend () then
+    IO.eprintln "LLVM bitcode output requires a compiler built with LLVM support"
+    return 1
   -- Quick and dirty `#lang` support
   ---TODO: make it extensible, and add `lean4md`
   let contents ←

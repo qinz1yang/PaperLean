@@ -15,6 +15,7 @@ import Lake.Build.ModuleArtifacts
 import Lake.Build.Trace
 import Lake.Config.LeanLib
 import Lake.Config.Module
+import Lake.Util.Proc
 import Lake.Util.NativeLib
 import Lake.PaperLean.Cache
 import Init.System.Platform
@@ -96,27 +97,67 @@ def statFile (file : FilePath) : BaseIO (Option FileStamp) := do
       return none
   | .error _ => return none
 
+/-- A positive lexical profile of the output of EmitC. Unknown inputs use ordinary Lean. -/
+@[noinline] private def portableEmittedC (bytes : @& ByteArray) : Bool :=
+  Lean.PaperLean.portableEmittedC bytes
+
+@[noinline] private def portableCSymbolGuard (bytes : @& ByteArray) (symbols : @& Array String) : Option String :=
+  Lean.PaperLean.portableCSymbolGuard bytes symbols
+
+private def symbolGuardPath (snapshot : FilePath) := snapshot.addExtension "symbols.h"
+
+/-- The content hashes of files (`Lean.PaperLean.OLeanPack.hashFiles`), by path, with the identity
+that each was hashed with. -/
+public abbrev FileHashes := Std.HashMap String (ByteArray × String)
+
+/-- The content hash of `f` if it was hashed with the identity `stamp`. -/
+def FileHashes.of? (hashes : FileHashes) (f : FilePath) (stamp : FileStamp) : Option String :=
+  match hashes[f.toString]? with
+  | some (id, h) => if id.data == stamp.identity then some h else none
+  | none => none
+
+/-- The small result of inspecting verified `.olean` parts. The parts themselves are released
+before the next module is checked. Only this private staging directory is read when linking. -/
+private def moduleDataPath (snapshot : FilePath) := snapshot.addExtension "native-data.json"
+
+private def saveModuleData (snapshot : FilePath) (d : Lean.PaperLean.ModuleNativeData) : IO Unit :=
+  IO.FS.writeFile (moduleDataPath snapshot) <|
+    (toJson (d.differs, d.metaSymbols, d.exports, d.externs, d.why)).compress
+
+private def checkedModuleData (snapshot : FilePath) : IO Lean.PaperLean.ModuleNativeData := do
+  let path := (moduleDataPath snapshot).toString
+  let some id ← Lean.PaperLean.fileIdentity path | throw <| IO.userError "missing verified module metadata"
+  let bytes ← Lean.PaperLean.OLeanPack.readVerifiedBytes path id ""
+  let some text := String.fromUTF8? bytes | throw <| IO.userError "invalid verified module metadata"
+  let json ← IO.ofExcept <| Json.parse text
+  let (differs, metaSymbols, exports, externs, why) ← IO.ofExcept <| fromJson?
+    (α := Bool × Array String × Array String × Array String × String) json
+  return { differs, metaSymbols, exports, externs, why }
+
 /--
 Check a file against its trace description. The file is hashed once, and its identity is compared
 before and after hashing so that a file which changes during the check is rejected.
 -/
-def checkArtifact (kind : String) (file : FilePath) (descr? : Option ArtifactDescr) :
-    LoggerIO (Except String CheckedFile) := do
+def checkArtifact (hashes : FileHashes) (kind : String) (file : FilePath) (descr? : Option ArtifactDescr)
+    (snapshot? : Option FilePath := none) :
+    LoggerIO (Except String (CheckedFile × Bool)) := do
   let some descr := descr? | return .error s!"trace has no {kind} output"
   let before? ← statFile file
   let some before := before? | return .error s!"no {kind}"
-  -- The bytes' content hash, not the `.hash` file (`Lake/Build/Trace.lean`).
-  let hash ← computeFileHash file
-  let after? ← statFile file
-  let some after := after? | return .error s!"{kind} disappeared during verification"
-  if before != after then
-    return .error s!"{kind} changed during verification"
-  if hash != descr.hash then
-    return .error s!"{kind} does not match the trace"
-  return .ok { path := file, stamp := after }
+  let some expected := hashes.of? file before | return .error s!"{kind} has no prepared content hash"
+  if expected.isEmpty then return .error s!"{kind} has no prepared content hash"
+  let .ok bytes ← (Lean.PaperLean.OLeanPack.readVerifiedBytes file.toString ⟨before.identity⟩ expected).toBaseIO
+    | return .error s!"{kind} differs from its prepared identity or content hash"
+  if Hash.ofByteArray bytes != descr.hash then return .error s!"{kind} does not match the trace"
+  if let some snapshot := snapshot? then
+    createParentDirs snapshot
+    IO.FS.writeBinFile snapshot bytes
+  let needsSymbols := kind == ".c" && !portableEmittedC bytes
+  return .ok ({ path := file, stamp := before }, needsSymbols)
 
 /-- Verify a module's files against its Lake trace. -/
-def verifyModule (mod : Module) : LoggerIO (Except String VerifiedModule) := do
+def verifyModule (mod : Module) (snapshot : FilePath) (hashes : FileHashes) :
+    LoggerIO (Except String (VerifiedModule × Bool)) := IO.FS.withTempDir fun partDir => do
   let c? ← statFile mod.cFile
   if c?.isNone then return .error "no .c"
   let trace ← readTraceFile mod.traceFile
@@ -138,16 +179,34 @@ def verifyModule (mod : Module) : LoggerIO (Except String VerifiedModule) := do
     (".ir.sig", mod.irSigFile, descrs.irSig?), (".ir", mod.irFile, descrs.ir?)]
   let mut files : Array CheckedFile := #[]
   let mut present : Array Bool := #[]
+  let mut needsSymbols := false
+  let mut parts : Array FilePath := #[]
   for (kind, path, descr?) in kinds do
     if descr?.isNone then
+      if hashes.contains path.toString then return .error s!"{kind} is in the prepared pack but absent from the trace"
       if ← path.pathExists then return .error s!"{kind} exists but the trace does not list it"
       present := present.push false
       continue
-    match ← checkArtifact kind path descr? with
-    | .ok file => files := files.push file; present := present.push true
+    let copy? := if path == mod.cFile then some snapshot
+      else if kind.startsWith ".olean" then some (partDir / s!"module{kind}")
+      else none
+    match ← checkArtifact hashes kind path descr? copy? with
+    | .ok (file, custom) =>
+      files := files.push file
+      present := present.push true
+      if custom then needsSymbols := true
+      if kind.startsWith ".olean" then
+        if let some copy := copy? then parts := parts.push copy
     | .error e => return .error e
+  let data ← Lean.PaperLean.moduleNativeData parts
+  saveModuleData snapshot data
+  if needsSymbols then
+    let bytes ← IO.FS.readBinFile snapshot
+    let some guard := portableCSymbolGuard bytes (data.exports ++ data.externs)
+      | return .error "its C uses inputs outside the relocatable generated-C profile"
+    IO.FS.writeFile (symbolGuardPath snapshot) guard
   let opt (i : Nat) (p : FilePath) := if present[i]! then some p else none
-  return .ok {
+  return .ok ({
     mod := mod
     c := mod.cFile
     olean := mod.oleanFile
@@ -156,7 +215,7 @@ def verifyModule (mod : Module) : LoggerIO (Except String VerifiedModule) := do
     irSig? := opt 4 mod.irSigFile
     ir? := opt 5 mod.irFile
     files := files
-  }
+  }, needsSymbols)
 
 /-- The C compiler arguments Lake uses for an exporting object (`Lake/Build/Common.lean`,
 `Lake/Build/Module.lean`). -/
@@ -164,36 +223,69 @@ def objectArgs (lean : LeanInstall) (mod : Module) : Array String :=
   #["-I", lean.includeDir.toString] ++ lean.ccFlags ++
     mod.weakLeancArgs ++ mod.leancArgs ++ #["-DLEAN_EXPORTING"]
 
-/-- The content hashes of files (`Lean.PaperLean.OLeanPack.hashFiles`), by path, with the identity
-that each was hashed with. -/
-public abbrev FileHashes := Std.HashMap String (ByteArray × String)
+/-- A bounded set of location-independent compile and link flags for generated C. Additional file
+inputs, preprocessing definitions and debug/profile paths require their own dependency keys. -/
+private def moduleFlagsUsable (mod : Module) : Bool :=
+  (mod.leancArgs ++ mod.weakLeancArgs).all fun s =>
+    #["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-DNDEBUG", "-fPIC", "-fno-PIC"].contains s
 
-/-- The content hash of `f` if it was hashed with the identity `stamp`. -/
-def FileHashes.of? (hashes : FileHashes) (f : FilePath) (stamp : FileStamp) : Option String :=
-  match hashes[f.toString]? with
-  | some (id, h) => if id.data == stamp.identity then some h else none
-  | none => none
+private def linkFlagsUsable (pkg : Package) : Bool :=
+  pkg.leanLibs.all fun lib =>
+    (lib.weakLinkArgs ++ lib.linkArgs).all fun s => #["-lm", "-lLake", "-Wl,-z,text"].contains s
 
-/-- Compiles `c` with the arguments for `mod` into the object in `objects` that its key names, unless it
-is there (then the compiler's log is empty): the key of the compiler, the arguments, and the content
-hashes `cFiles` of the `.c` files that `c` is (`unit` false) or includes in this order, as
-`compileNativeUnit` writes it. Without the hash of a file (`""`: it changed since the files were
-hashed), into `tmp`. -/
-def compileCached (lean : LeanInstall) (objects tmp : FilePath) (mod : Module) (c : FilePath) (unit : Bool)
-    (cFiles : Array String) : BaseIO (Option FilePath × Log) := do
-  let args := objectArgs lean mod
-  let shape := #[lean.cc.toString, toString unit] ++ args
-  let obj := if cFiles.any (·.isEmpty) then tmp / s!"{Cache.key (shape.push c.toString)}.o"
-    else objects / s!"{Cache.key (shape ++ cFiles)}.o"
-  if ← obj.pathExists then return (some obj, {})
-  let tmp := obj.addExtension s!"tmp.{← IO.Process.getPID}"
-  let action : LoggerIO Unit := liftM <| compileO tmp c (moreArgs := args) (compiler := lean.cc)
-  let (ok?, log) ← Lake.LoggerIO.captureLog action
-  if ok?.isNone then return (none, log)
-  -- (another prepare may have compiled the same object meanwhile; either is as good)
-  match ← (IO.FS.rename tmp obj).toBaseIO with
-  | .ok _ => return (some obj, log)
-  | .error _ => discard <| (IO.FS.removeFile tmp).toBaseIO; return (none, log)
+/-- Installed toolchain flags for the ordinary supported compiler distribution. Mutable response
+files, forced includes, debug/profile options and unrecognized flags have no reusable input key. -/
+private def installedFlagsUsable (lean : LeanInstall) : Bool :=
+  go lean.ccFlags.toList
+where
+  go : List String → Bool
+    | [] => true
+    | "--sysroot" :: p :: rest => p == lean.sysroot.toString && go rest
+    | "-isystem" :: p :: rest => p == (lean.sysroot / "include" / "clang").toString && go rest
+    | flag :: rest =>
+      #["-pthread", "-fstack-clash-protection", "-ffp-contract=off", "-fdata-sections",
+        "-ffunction-sections", "-fPIC", "-fvisibility=hidden", "-Wno-unused-command-line-argument",
+        "-nostdinc", "-O2", "-O3", "-DNDEBUG"].contains flag && go rest
+
+/-- Resolve the normal driver. Explicit compiler/environment overrides or arbitrary commands on PATH
+are not certified. The resolved installed driver and its identity also namespace retained results. -/
+public def nativeCompiler? (lean : LeanInstall) : BaseIO (Option (FilePath × String)) := do
+  -- Lake exposes its default system driver as LEAN_CC=cc in a workspace. It is still
+  -- accepted only after resolving the first executable to the canonical system compiler below.
+  let systemChoice (v : String) := !Platform.isWindows && (v == "cc" || v == "/usr/bin/cc")
+  for key in #["LEAN_CC", "CC"] do
+    if let some value ← IO.getEnv key then
+      unless lean.customCc && systemChoice lean.cc.toString && systemChoice value do return none
+  let overrides := #["CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
+    "COMPILER_PATH", "GCC_EXEC_PREFIX", "GCC_COMPARE_DEBUG", "LIBRARY_PATH", "CCC_OVERRIDE_OPTIONS",
+    "DEPENDENCIES_OUTPUT", "SUNPRO_DEPENDENCIES", "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET",
+    "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"]
+  unless installedFlagsUsable lean do return none
+  if ← overrides.anyM fun v => return (← IO.getEnv v).isSome then return none
+  let resolve : IO (Option FilePath) := do
+    if !lean.customCc then
+      if lean.cc != leanCcExe lean.sysroot then return none
+      return some (← IO.FS.realPath lean.cc)
+    unless systemChoice lean.cc.toString do return none
+    let system ← IO.FS.realPath "/usr/bin/cc"
+    if lean.cc.isAbsolute then return some system
+    let some path ← IO.getEnv "PATH" | return none
+    for dir in System.SearchPath.parse path do
+      let f := dir / "cc"
+      if ← f.pathExists then
+        let first ← IO.FS.realPath f
+        return if first == system then some first else none
+    return none
+  let .ok (some driver) ← resolve.toBaseIO | return none
+  let some id ← Lean.PaperLean.fileIdentity driver.toString | return none
+  return some (driver, s!"{driver}:{Lean.PaperLean.identityText id}")
+
+/-- Run the admitted driver with the toolchain and system utilities only. In particular, an
+unrelated PATH entry cannot supply the assembler or linker chosen by the driver. -/
+private def nativeProc (lean : LeanInstall) (driver : FilePath) (args : Array String) : LogIO Unit := do
+  let systemDirs : System.SearchPath := if Platform.isWindows then [] else ["/usr/bin", "/bin"]
+  let path := if lean.customCc then systemDirs else lean.binDir :: systemDirs
+  proc { cmd := driver.toString, args, inheritEnv := false, env := #[("PATH", some path.toString)] }
 
 /-- The first checked file whose identity is no longer the recorded one. -/
 def changedFile? (files : Array CheckedFile) : BaseIO (Option FilePath) := do
@@ -202,6 +294,86 @@ def changedFile? (files : Array CheckedFile) : BaseIO (Option FilePath) := do
     if now? != some file.stamp then
       return some file.path
   return none
+
+/-- Source paths retain their compiler-visible spelling. The private file holds exactly the bytes
+that passed the module trace. The pack hash identifies that snapshot in a retained object key. -/
+private structure CInput where
+  original : FilePath
+  snapshot : FilePath
+  packHash : String
+  guard? : Option FilePath
+  deriving Inhabited
+
+private def checkedC (tmp : FilePath) (i : Nat) : FilePath :=
+  tmp / "obj" / "checked-c" / s!"{i}.c"
+
+/-- A deterministic test barrier around the real driver, without replacing that driver or changing
+its input. Both phases are bounded; a broken test cannot strand a prepare indefinitely. -/
+private def compilerGate (inputs : Array CInput) (c : FilePath) (after : Bool) : IO Unit := do
+  let some gate ← IO.getEnv "PAPERLEAN_NATIVE_COMPILER_GATE" | return
+  let some file ← IO.getEnv "PAPERLEAN_NATIVE_COMPILER_GATE_INPUT" | return
+  unless inputs.any (·.original.toString.endsWith file) do return
+  let dir : FilePath := gate
+  let signal := if after then "restored" else "release"
+  if after && !(← (dir / "restore-required").pathExists) then return
+  if after then
+    let tmp := dir / "compiled.tmp"
+    IO.FS.writeFile tmp "0"
+    IO.FS.rename tmp (dir / "compiled")
+  else
+    let log ← IO.FS.Handle.mk (dir / "calls") .append
+    log.putStrLn c.toString
+    log.flush
+    IO.FS.writeFile (dir / s!"blocked-{← IO.Process.getPID}") ""
+  for _ in [:2400] do
+    if ← (dir / signal).pathExists then return
+    IO.sleep 100
+  throw <| IO.userError s!"timed out waiting for {dir / signal}"
+
+/-- Build and publish only from the checked inputs. The unit includes original C paths through the
+private checked C files. The admitted C has only the toolchain header; stable logical module names
+and byte hashes allow the same unit to be reused in another checkout. -/
+private def compileCached (lean : LeanInstall) (objects tmp : FilePath) (mod : Module) (c : FilePath)
+    (unit : Bool) (inputs : Array CInput) (files : Array CheckedFile) : BaseIO (Option FilePath × Log) := do
+  let some (driver, compilerId) ← nativeCompiler? lean | return (none, {})
+  let args := objectArgs lean mod
+  let shape := #["portable-checked-c-v5", compilerId, toString unit] ++ args
+  let cFiles := inputs.map (·.packHash)
+  let shared := inputs.all (!·.packHash.isEmpty)
+  let obj := if shared then objects / s!"{Cache.key (shape ++ cFiles)}.o"
+    else tmp / s!"{Cache.key (shape.push c.toString)}.o"
+  if (← statFile obj).isSome then return (some obj, {})
+  -- `tmp` belongs to this package and process; distinct units have distinct `c` paths.
+  let candidate := tmp / s!"{Cache.key ((shape ++ cFiles).push c.toString)}.o.tmp"
+  let action : LoggerIO FilePath := do
+    let check : LoggerIO Unit := do
+      if let some path ← changedFile? files then
+        error s!"changed during compilation: {path}"
+    check
+    try
+      compilerGate inputs c false
+      let source := if unit then c else inputs[0]!.snapshot
+      let mut guards := #[]
+      for f in inputs do
+        if let some header := f.guard? then guards := guards ++ #["-include", header.toString]
+      let names := inputs.map fun f => s!"-ffile-prefix-map={f.snapshot}={f.original}"
+      liftM <| nativeProc lean driver (#["-c", "-o", candidate.toString, source.toString] ++ args ++ guards ++ names)
+      compilerGate inputs c true
+      check
+      if (← statFile candidate).isNone then error "no object produced"
+      if shared then
+        Cache.withKeyLock (objects.parent.getD objects) s!"objects/{obj.fileName.getD ""}" do
+          -- Check the entire unit before making any of its code visible to another prepare.
+          check
+          if (← statFile obj).isSome then return obj
+          IO.FS.rename candidate obj
+          return obj
+      else
+        IO.FS.rename candidate obj
+        return obj
+    finally
+      discard <| (IO.FS.removeFile candidate).toBaseIO
+  Lake.LoggerIO.captureLog action
 
 /--
 The built modules of the package's default libraries (of all its libraries if it has no default
@@ -254,8 +426,8 @@ def moduleData (olean : FilePath) (server? private? : Option FilePath) : IO Lean
 /-- The program that runs `Lean.PaperLean.evalImpuritiesMain`. -/
 def evalProgram : String := "import Lean.PaperLean.NativeLibs
 def main (args : List String) : IO UInt32 := do
-  let [modules, events, seconds, mebibytes] := args | return 2
-  Lean.PaperLean.evalImpuritiesMain modules events seconds.toNat! mebibytes.toNat!
+  let [modules, events, seconds, mebibytes, dir] := args | return 2
+  Lean.PaperLean.evalImpuritiesMain modules events seconds.toNat! mebibytes.toNat! (some ⟨dir⟩)
   return 0
 "
 
@@ -265,14 +437,21 @@ def evalSeconds : Nat := 10
 def evalMebibytes : Nat := 4096
 
 /-- The verdicts of `Lean.PaperLean.evalImpuritiesMain` on the library modules of `pkgs`, in processes
-of their own: with the olean packs `packs` (`LEAN_OLEAN_PACK`), as they map everything they read, and
-evaluate constants of packages. A module whose constants take too long or too much memory, or end the process, is impure
-too, and the others are done by another process. `dir` is a directory for their files;
+of their own, with only the installed toolchain pack in `packs`. Package artifacts are bound to
+the Prepare inventory `hashes`. A module whose constants take too long or too much memory, or end the process, is impure
+too, and the others are done by another process. Each run owns its temporary directory;
 `PAPERLEAN_EVAL_SECONDS` and `PAPERLEAN_EVAL_MEMORY` (in mebibytes) replace the limits, for tests, and
 the events of the processes are appended to the file `PAPERLEAN_EVAL_EVENTS` if it is set. -/
-public def evalImpurities (ws : Workspace) (pkgs : Array Package) (packs : String) (dir : FilePath) :
-    IO Lean.PaperLean.EvalVerdicts := do
-  IO.FS.createDirAll dir
+public def evalImpurities (ws : Workspace) (pkgs : Array Package) (packs : String) (hashes : FileHashes) :
+    IO Lean.PaperLean.EvalVerdicts := IO.FS.withTempDir fun dir => do
+  -- Compile the trusted evaluator with just the toolchain, then give the inspector the workspace
+  -- search roots as data. Its executing importer reads explicit private artifacts only.
+  IO.FS.writeFile (dir / "search.json") (toJson ws.augmentedLeanPath).compress
+  do
+    let out ← IO.FS.Handle.mk (dir / "receipts.jsonl") .write
+    for (path, (id, hash)) in hashes do
+      unless path.endsWith ".c" do
+        out.putStrLn (toJson (path, Lean.PaperLean.identityText id, hash)).compress
   let program := dir / "Eval.lean"
   IO.FS.writeFile program evalProgram
   let mods ← pkgs.flatMapM libraryModules
@@ -284,18 +463,21 @@ public def evalImpurities (ws : Workspace) (pkgs : Array Package) (packs : Strin
     IO.FS.writeFile (dir / "modules.txt") <| String.join <| mods.toList.map fun m =>
       s!"{m.name}\t{m.oleanFile}\t{if decided.contains m.oleanFile then 1 else 0}\n"
     if ← (dir / "events.txt").pathExists then IO.FS.removeFile (dir / "events.txt")
+    let parts := dir / "parts"
+    IO.FS.createDir parts
     let child ← IO.Process.spawn {
       cmd := ws.lakeEnv.lean.lean.toString
       args := #["--run", program.toString, (dir / "modules.txt").toString, (dir / "events.txt").toString,
-        toString seconds, toString mebibytes]
-      env := #[("LEAN_OLEAN_PACK", some packs), ("LEAN_IMPORT_IMAGE", none),
-        ("PAPERLEAN_NATIVE_LIBS", none), ("LEAN_PATH", some ws.augmentedLeanPath.toString),
+        toString seconds, toString mebibytes, dir.toString]
+      env := #[("LEAN_OLEAN_PACK", some packs), ("LEAN_IMPORT_IMAGE", some ""),
+        ("PAPERLEAN_NATIVE_LIBS", some ""), ("LEAN_PATH", none),
         ("LEAN_ABORT_ON_PANIC", none), ("LEAN_BACKTRACE", some "0")]
       stdin := .null
       stderr := .piped
     }
     let stderr ← child.stderr.readToEnd
     let exitCode ← child.wait
+    IO.FS.removeDirAll parts
     let events : Array String ← do
       if ← (dir / "events.txt").pathExists then IO.FS.lines (dir / "events.txt") else pure #[]
     if let some copy ← IO.getEnv "PAPERLEAN_EVAL_EVENTS" then
@@ -331,8 +513,8 @@ defines as `const lean_object*`, and of all variables that it defines with `LEAN
 declaration of the first kind and a definition of the second of the same name cannot be in one
 translation unit, and two definitions of the third kind would be one variable there, while they are
 two symbols, which cannot be linked together, otherwise. -/
-@[extern "lean_paperlean_c_object_names"]
-opaque cObjectNames (c : @& String) : IO (Array String × Array String × Array String)
+@[noinline] private def cObjectNames (c : @& String) : IO (Array String × Array String × Array String) :=
+  Lean.PaperLean.cObjectNames c
 
 /-- The modules of a package's native library, and the units in which `prepare` compiles them:
 ranges `[start, stop)` of `modules`, of consecutive modules with the same compiler arguments whose
@@ -408,6 +590,11 @@ def checkCompiled (vm : VerifiedModule) (obj? : Option FilePath) : BaseIO (Excep
   if (← statFile obj).isNone then return .error "no object produced"
   return .ok { vm with obj }
 
+/-- The plan is a scheduling hint. Check it against the actual private inputs before combining
+translation units: C can silently merge independent tentative definitions. -/
+@[noinline] private def canGroupCheckedC (paths : @& Array String) : IO Bool :=
+  Lean.PaperLean.canGroupCheckedC paths
+
 /--
 Verifies the modules of the unit `[start, stop)` of `plan` and compiles them into objects in `objects`
 (where they may be already: `compileCached`, with the content hashes `hashes` of the `.c` files),
@@ -419,30 +606,46 @@ public def compileNativeUnit (lean : LeanInstall) (objects tmp : FilePath) (hash
     (plan : NativePlan) (start stop : Nat) : BaseIO (Array ModuleResult) := do
   let mut results : Array ModuleResult := #[]
   let mut verified : Array (Nat × VerifiedModule × Log) := #[]
+  let mut guarded : Std.HashSet Nat := {}
+  -- Link flags apply to the whole library; finishNativeLib reports that failure once.
+  unless linkFlagsUsable plan.pkg do return #[]
+  let compiler ← nativeCompiler? lean
   for i in [start:stop] do
     let some mod := plan.modules[i]? | continue
-    let (result?, log) ← Lake.LoggerIO.captureLog (verifyModule mod)
+    if compiler.isNone then
+      results := results.push (i, mod, .error "its compiler or environment has unbound native inputs", {})
+      continue
+    unless moduleFlagsUsable mod do
+      results := results.push (i, mod, .error "compile failed: its compiler flags have unbound native inputs", {})
+      continue
+    let (result?, log) ← Lake.LoggerIO.captureLog (verifyModule mod (checkedC tmp i) hashes)
     match result?.getD (.error "cannot read the module's files") with
-    | .ok vm => verified := verified.push (i, vm, log)
+    | .ok (vm, needsGuard) =>
+      verified := verified.push (i, vm, log)
+      if needsGuard then guarded := guarded.insert i
     | .error e => results := results.push (i, mod, .error e, log)
-  -- the content hash of a verified `.c` file, which `verifyModule` read
-  let cHash (vm : VerifiedModule) : String :=
-    ((vm.files.find? (·.path == vm.c)).bind fun f => hashes.of? vm.c f.stamp).getD ""
+  if verified.isEmpty then return results
+  let inputs := verified.map fun (i, vm, _) =>
+    let snapshot := checkedC tmp i
+    let packHash := (vm.files.find? (·.path == vm.c)).bind fun f => hashes.of? vm.c f.stamp
+    { original := vm.c, snapshot, packHash := packHash.getD ""
+      guard? := if guarded.contains i then some (symbolGuardPath snapshot) else none : CInput }
   if h : verified.size > 1 then
     let first := verified[0].2.1
     let unitC := tmp / s!"{plan.pkg.prettyName}-unit-{start}.c"
     -- `EmitC.lean`'s initialization flags (`_G_*initialized`) are the only static variables whose
     -- names all files have
     let flags := #["_G_initialized", "_G_runtime_initialized", "_G_meta_initialized"]
-    let text := verified.foldl (init := ("", 0)) (fun (t, j) (_, vm, _) =>
+    let text := verified.foldl (init := ("", 0)) (fun (t, j) (i, _, _) =>
       (t ++ String.join (flags.toList.map fun f => s!"#define {f} {f}_{j}\n") ++
-        s!"#include \"{vm.c}\"\n" ++ String.join (flags.toList.map fun f => s!"#undef {f}\n"), j + 1)) |>.1
-    let written ← (do IO.FS.createDirAll tmp; IO.FS.writeFile unitC text; pure true).catchExceptions
-      fun _ => pure false
-    let cFiles := verified.map fun (_, vm, _) => cHash vm
+        s!"#include \"obj/checked-c/{i}.c\"\n" ++ String.join (flags.toList.map fun f => s!"#undef {f}\n"), j + 1)) |>.1
+    let compatible := verified.all fun (_, vm, _) => objectArgs lean vm.mod == objectArgs lean first.mod
+    let written ← if compatible && (← (canGroupCheckedC (inputs.map (·.snapshot.toString))).catchExceptions fun _ => pure false) then
+      (do IO.FS.createDirAll tmp; IO.FS.writeFile unitC text; pure true).catchExceptions fun _ => pure false
+    else pure false
     if written then
-      -- (the `.c` files' paths in the text do not change the object)
-      let (obj?, clog) ← compileCached lean objects tmp first.mod unitC true cFiles
+      let (obj?, clog) ← compileCached lean objects tmp first.mod unitC true inputs
+        (verified.flatMap fun (_, vm, _) => vm.files)
       discard <| (IO.FS.removeFile unitC).toBaseIO
       if obj?.isSome then
         -- (the compiler's log once)
@@ -451,10 +654,24 @@ public def compileNativeUnit (lean : LeanInstall) (objects tmp : FilePath) (hash
           results := results.push (i, vm.mod, ← checkCompiled vm obj?, log ++ unitLog)
           unitLog := {}
         return results.qsort (·.1 < ·.1)
-  for (i, vm, log) in verified do
-    let (obj?, clog) ← compileCached lean objects tmp vm.mod vm.c false #[cHash vm]
+  for (i, vm, log) in verified, input in inputs do
+    let (obj?, clog) ← compileCached lean objects tmp vm.mod vm.c false #[input] vm.files
     results := results.push (i, vm.mod, ← checkCompiled vm obj?, log ++ clog)
   return results.qsort (·.1 < ·.1)
+
+/-- Bounded synchronization for the metadata directory-ABA regression. Ordinary builds do no
+filesystem work here. The selected package pauses after the file-identity check and after its
+module metadata has been consumed, to let the test restore the original directory. -/
+private def metadataGate (pkg : Package) (after : Bool) : IO Unit := do
+  let some gate ← IO.getEnv "PAPERLEAN_NATIVE_METADATA_GATE" | return
+  unless (← IO.getEnv "PAPERLEAN_NATIVE_METADATA_PACKAGE") == some pkg.prettyName do return
+  let dir : FilePath := gate
+  IO.FS.writeFile (dir / (if after then "sampled" else "verified")) ""
+  let wait := dir / (if after then "restored" else "replaced")
+  for _ in [:1200] do
+    if ← wait.pathExists then return
+    IO.sleep 50
+  throw <| IO.userError s!"timed out waiting for {wait}"
 
 /--
 Links into `outDir`, a directory that no prepared data refers to yet, the native library of the
@@ -470,29 +687,25 @@ interpreter does (`evalImpurities`), for the files that it read: a module whose 
 or that it says nothing about, is taken not to. An `@[export]` of a symbol of Lean or of the libraries
 that it is linked against is not supported: the library's calls of that symbol would run the export.
 -/
-public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array ModuleResult)
+public def finishNativeLibWithSymbols (ws : Workspace) (plan : NativePlan) (results : Array ModuleResult)
     (deps : Array NativeLib) (outDir : FilePath) (jobs : Nat) (hashes : FileHashes)
-    (verdicts : Lean.PaperLean.EvalVerdicts) : LoggerIO NativeLib := do
+    (verdicts : Lean.PaperLean.EvalVerdicts) (depSymbols : Array String) : LoggerIO (NativeLib × String) := do
   let pkg := plan.pkg
   let lean := ws.lakeEnv.lean
   if plan.modules.isEmpty then
-    return { pkg := pkg.baseName, lib := "", manifest := "", modules := 0, excluded := #[] }
+    return ({ pkg := pkg.baseName, lib := "", manifest := "", modules := 0, excluded := #[] }, "")
+  unless linkFlagsUsable pkg do
+    error s!"cannot build the native library of {pkg.prettyName}: its linker flags have unbound native inputs"
+  let mut snapshots : Std.HashMap Name FilePath := {}
   let mut compiled : Array VerifiedModule := #[]
   let mut excluded : Array (Name × String) := #[]
-  for (_, mod, result, log) in results.qsort (·.1 < ·.1) do
+  for (i, mod, result, log) in results.qsort (·.1 < ·.1) do
     let _ ← (log.filter (fun e => e.level != .error)).replay
     match result with
-    | .ok vm => compiled := compiled.push vm
+    | .ok vm =>
+      compiled := compiled.push vm
+      snapshots := snapshots.insert vm.mod.name (checkedC outDir i)
     | .error e => excluded := excluded.push (mod.name, e)
-  -- The manifest knows the modules' files by the hashes of the files that were verified, which are
-  -- hashed now if they changed since `prepare` hashed them.
-  let unhashed := compiled.flatMap fun vm =>
-    (vm.files.filter fun f => (hashes.of? f.path f.stamp).isNone).map (·.path.toString)
-  let hashes ← if unhashed.isEmpty then pure hashes else do
-    let record := outDir / "hashes.paperlean"
-    let found ← Lean.PaperLean.OLeanPack.hashFiles unhashed #[] record jobs
-    removePath record
-    pure <| (unhashed.zip found).foldl (init := hashes) fun m (f, r) => if r.2.isEmpty then m else m.insert f r
   -- Later compilations must not invalidate an earlier module before it is linked.
   let mut stable : Array VerifiedModule := #[]
   for vm in compiled do
@@ -503,6 +716,9 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
       if vm.files.all fun f => (hashes.of? f.path f.stamp).isSome then stable := stable.push vm
       else excluded := excluded.push (vm.mod.name, "its files changed while it was prepared")
   compiled := stable
+  if compiled.isEmpty then
+    return ({ pkg := pkg.baseName, lib := "", manifest := "", modules := 0, excluded }, "")
+  let some (driver, _) ← nativeCompiler? lean | error "native compiler changed during preparation"
   -- Output names, with Lake's extension (`Lake/Util/NativeLib.lean`).
   let libName := s!"{pkg.prettyName}.{sharedLibExt}"
   let libFile := outDir / libName
@@ -510,9 +726,11 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
   -- (a unit's object once, at the place of its first module)
   let objects := compiled.foldl (init := #[]) fun os vm => if os.contains vm.obj then os else os.push vm.obj
   let depLibs := deps.map (·.lib)
-  -- What the `.olean` parts of the modules and of those of the libraries it is linked against tell.
-  let data ← try parallelMap jobs compiled fun vm => moduleData vm.olean vm.oleanServer? vm.oleanPrivate?
+  metadataGate pkg false
+  -- The same trace- and pack-checked metadata used to authorize the corresponding C input.
+  let data ← try parallelMap jobs compiled fun vm => checkedModuleData snapshots[vm.mod.name]!
     catch e => error s!"cannot read the modules of {pkg.prettyName}: {e}"
+  metadataGate pkg true
   let exports := (compiled.zip data).flatMap fun (vm, d) => d.exports.map (vm.mod.name, ·)
   let unclaimed ← Lean.PaperLean.undefinedSymbols (exports.map (·.2)) (depLibs.map (·.toString))
   if let some (m, e) := exports.find? (!unclaimed.contains ·.2) then
@@ -523,7 +741,7 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
   -- module left out are not used either, whose symbols are those of a package (of a module built by
   -- Lake, which the importer can only refer to through imports). A module that refers to any other is
   -- left out; it stays in the objects, which may hold other modules.
-  let symbols ← try parallelMap jobs compiled fun vm => Lean.PaperLean.cSymbols vm.c.toString
+  let symbols ← try parallelMap jobs compiled fun vm => Lean.PaperLean.cSymbols snapshots[vm.mod.name]!.toString
     catch e => error s!"cannot read the modules of {pkg.prettyName}: {e}"
   let defined : Std.HashSet String := symbols.foldl (fun s (ds, _) => s.insertMany ds) {}
   let wanted : Std.HashSet String := symbols.foldl (init := {}) fun s (_, us) =>
@@ -567,7 +785,7 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
     IO.FS.createDirAll (outDir / "obj")
     IO.FS.writeFile stubC <| String.join <| missing.toList.map fun s =>
       s!"__attribute__((weak, visibility(\"hidden\"))) char {s}[8];\n"
-    compileO stubO stubC (moreArgs := #["-fPIC"]) (compiler := lean.cc)
+    nativeProc lean driver #["-c", "-o", stubO.toString, stubC.toString, "-fPIC"]
   let linkArgs :=
     objects.map (·.toString)
     ++ (if missing.isEmpty then #[] else #[stubO.toString])
@@ -578,7 +796,7 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
     ++ runPathArgs
   -- `outDir` is a fresh directory that no prepared data refers to yet (`Lake/Build/Actions.lean`)
   try
-    let _ ← compileSharedLib libFile linkArgs lean.cc
+    nativeProc lean driver (#["-shared", "-o", libFile.toString] ++ (← mkArgs libFile linkArgs))
   catch _ =>
     error s!"cannot link the native library of {pkg.prettyName}"
   if (← (libFile.addExtension "rsp").pathExists) then IO.FS.removeFile (libFile.addExtension "rsp")
@@ -590,14 +808,6 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
   let why ← Lean.PaperLean.loadError libFile.toString
   unless why.isEmpty do
     error s!"cannot load the native library of {pkg.prettyName}: {why}"
-  let mut depModules : Array Module := #[]
-  for d in deps do
-    if let some p := ws.packages.find? (·.baseName == d.pkg) then
-      depModules := depModules ++ (← libraryModules p)
-  let depData ← try parallelMap jobs depModules fun mod => do
-      let opt (f : FilePath) : IO (Option FilePath) := return if ← f.pathExists then some f else none
-      moduleData mod.oleanFile (← opt mod.oleanServerFile) (← opt mod.oleanPrivateFile)
-    catch e => error s!"cannot read the modules that {pkg.prettyName} imports: {e}"
   -- The file paths are in `module_file_kind` order (`paperlean/olean_pack.h`).
   let notPure (vm : VerifiedModule) : Option String :=
     if let some (_, why) := verdicts.impure.find? (·.1 == vm.olean) then some why else
@@ -611,17 +821,21 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
   let hashOf (vm : VerifiedModule) (f? : Option FilePath) : String :=
     (f?.bind fun f => (vm.files.find? (·.path == f)).bind fun file => hashes.of? f file.stamp).getD ""
   let manifestModules : Array Lean.PaperLean.NativeManifestModule := compiled.mapIdx fun i vm => {
-    name := vm.mod.name, cFile := vm.c.toString
+    name := vm.mod.name, cFile := snapshots[vm.mod.name]!.toString
     data := { data[i]! with differs := data[i]!.differs || (notPure vm).isSome }
     hashes := #[some vm.olean, vm.oleanServer?, vm.oleanPrivate?, vm.irSig?, vm.ir?].map (hashOf vm) }
   let manifestWhy ← Lean.PaperLean.writeNativeManifestFiles manifestFile.toString libFile.toString
-    (deps.map (·.manifest.toString)) manifestModules (depData.flatMap (·.metaSymbols))
+    (deps.map (·.manifest.toString)) manifestModules depSymbols
+  -- Certify only symbols of the modules that actually made it into this generation.
+  let ownSymbols := data.flatMap (·.metaSymbols)
+  let bytes := (toJson ownSymbols).compress.toUTF8
+  IO.FS.writeBinFile (outDir / "meta-symbols.json") bytes
   -- The manifest records the files as they are now, the library holds them as they were verified.
   for vm in compiled do
     if let some path ← changedFile? vm.files then
       error s!"cannot use the native library of {pkg.prettyName}: {path} changed while it was \
         linked; run `paperlean prepare` again"
-  return {
+  return ({
     pkg := pkg.baseName
     lib := libFile
     manifest := manifestFile
@@ -630,6 +844,13 @@ public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array
     interpreted := (compiled.zip (data.zip manifestWhy)).filterMap fun (vm, d, why) =>
       ((if d.differs then some d.why else notPure vm) <|> if why.isEmpty then none else some why).map
         (vm.mod.name, ·)
-  }
+  }, Lean.PaperLean.OLeanPack.hashBytes bytes)
+
+/-- Finish a library without a prepared dependency-symbol receipt. External meta calls are
+classified conservatively. The prepare command supplies symbols from the linked entries. -/
+public def finishNativeLib (ws : Workspace) (plan : NativePlan) (results : Array ModuleResult)
+    (deps : Array NativeLib) (outDir : FilePath) (jobs : Nat) (hashes : FileHashes)
+    (verdicts : Lean.PaperLean.EvalVerdicts) : LoggerIO NativeLib :=
+  Prod.fst <$> finishNativeLibWithSymbols ws plan results deps outDir jobs hashes verdicts #[]
 
 end Lake.PaperLean

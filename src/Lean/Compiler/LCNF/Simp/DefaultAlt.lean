@@ -23,6 +23,10 @@ private def getMaxOccs (alts : Array (Alt .pure)) : Alt .pure × Nat := Id.run d
   let mut maxAlt := alts[0]!
   let mut max    := getNumOccsOf alts 0
   for h : i in 1...alts.size do
+    -- Only the suffix starting at i is counted. It cannot strictly beat max
+    -- once its size is at most max; ties must retain the earlier winner.
+    if alts.size - i <= max then
+      break
     let curr := getNumOccsOf alts i
     if curr > max then
        maxAlt := alts[i]

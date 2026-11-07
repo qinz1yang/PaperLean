@@ -205,6 +205,14 @@ private def constModuleIdx (env : Environment) (n : Name) : UInt32 :=
 @[extern "lean_paperlean_end_native_init"]
 private opaque endNativeInit (env : @& Environment) : BaseIO Unit
 
+-- Shared with the C++ image replay workers. A missed slot leaves the fold on the
+-- existing synchronous import path; acquisition never blocks the importing thread.
+@[extern "lean_paperlean_start_import_fold"]
+private opaque startImportFold (extName : @& Name) (act : BaseIO (Except IO.Error EnvExtensionState)) :
+    BaseIO (Option (Task (Except IO.Error EnvExtensionState)))
+@[extern "lean_paperlean_release_import_worker"]
+private opaque releaseImportWorker : BaseIO Unit
+
 @[export lean_paperlean_prefetch_imported_states]
 private def prefetchImportedStatesImpl (env : Environment) (opts : Options) (startingAt : Nat)
     (persistent : Bool) : BaseIO Unit := do
@@ -215,8 +223,11 @@ private def prefetchImportedStatesImpl (env : Environment) (opts : Options) (sta
     -- only in an environment marked persistent, which the task does not need to mark
     if persistent && pureImportedFolds.contains descr.name.toString then
       let as := (unsafe descr.toEnvExtension.getStateImpl states).importedEntries
-      let task ← IO.asTask (descr.addImportedFn as { env, opts }) .dedicated
-      importedFoldsRef.modify (·.push (descr.name, as, task))
+      let fold : IO EnvExtensionState := do
+        try descr.addImportedFn as { env, opts }
+        finally releaseImportWorker
+      if let some task ← startImportFold descr.name fold.toBaseIO then
+        importedFoldsRef.modify (·.push (descr.name, as, task))
   -- The core folds do not use native libraries; the interpreter first runs after they are loaded.
   if startingAt == 0 then
     loadNativeLibs env opts

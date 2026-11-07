@@ -12,6 +12,7 @@ public import Lean.Meta.Eqns
 public import Lean.Elab.RecAppSyntax
 public import Lean.Meta.WrapInstance
 public import Lean.Elab.DefView
+import Lean.PaperLean.ProofConversion
 public section
 
 namespace Lean.Elab
@@ -194,6 +195,7 @@ private def addNonRecAux (docCtx : LocalContext × LocalInstances) (preDef : Pre
         name := preDef.declName, levelParams := preDef.levelParams, type := preDef.type, value := preDef.value, all
       }
       reportTheoremDiag d
+      let d ← Lean.PaperLean.ProofConversion.optimize d
       return Declaration.thmDecl d
     let decl ←
       match preDef.kind with
@@ -222,7 +224,10 @@ private def addNonRecAux (docCtx : LocalContext × LocalInstances) (preDef : Pre
     if compile && shouldGenCodeFor preDef then
       compileDecl decl
     if applyAttrAfterCompilation then
-      saveEqnAffectingOptions preDef.declName
+      if isRecursive then
+        saveEqnAffectingOptions preDef.declName
+      else
+        saveNonRecEqnOptions preDef.declName decl
       enableRealizationsForConst preDef.declName
     addPreDefDocs docCtx preDef
     if applyAttrAfterCompilation then

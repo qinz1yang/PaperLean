@@ -14,6 +14,11 @@ Artifacts are cached in ~/.cache/lean_build_artifact/ for reuse.
 """
 
 import argparse
+from contextlib import contextmanager
+import hashlib
+import re
+import stat
+import tempfile
 import json
 import os
 import platform
@@ -80,12 +85,13 @@ def get_artifact_name() -> Optional[str]:
     if system == 'Darwin':
         if machine == 'arm64':
             return 'build-macOS aarch64'
-        return 'build-macOS'  # Intel
+        if machine == 'x86_64':
+            return 'build-macOS'
     elif system == 'Linux':
         if machine == 'aarch64':
             return 'build-Linux aarch64'
-        return 'build-Linux release'
-    # Windows not supported for CI artifact download
+        if machine == 'x86_64':
+            return 'build-Linux release'
     return None
 
 # -----------------------------------------------------------------------------
@@ -153,14 +159,117 @@ def github_api_request(url: str) -> dict:
 # CI artifact cache functions
 # -----------------------------------------------------------------------------
 
+CACHE_RECEIPT = '.complete.json'
+
+def cache_identity(sha: str) -> dict:
+    """Describe the complete source/platform identity, without abbreviated SHA keys."""
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
+        raise ValueError('artifact cache requires a full 40-character commit SHA')
+    return {
+        'repository': LEAN4_REPO,
+        'commit': sha.lower(),
+        'artifact': get_artifact_name(),
+        'system': platform.system(),
+        'machine': platform.machine(),
+    }
+
 def get_cache_path(sha: str) -> Path:
-    """Get cache directory for a commit's artifact."""
-    return ARTIFACT_CACHE / sha[:12]
+    """Get a cache directory specific to the full commit, repository and platform."""
+    identity = cache_identity(sha)
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return ARTIFACT_CACHE / f"{identity['commit']}-{key}"
+
+def tree_inventory(root: Path) -> list:
+    """Describe a relocatable payload. Record file identity as well as size and mode."""
+    entries = []
+    for path in sorted(root.rglob('*')):
+        if path == root / CACHE_RECEIPT:
+            continue
+        entry = {'path': path.relative_to(root).as_posix()}
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            target = os.readlink(path)
+            try:
+                path.resolve().relative_to(root.resolve())
+            except (ValueError, RuntimeError) as exc:
+                raise ValueError(f'artifact link escapes its payload: {path}') from exc
+            if os.path.isabs(target):
+                raise ValueError(f'non-relocatable artifact link: {path}')
+            entry.update(kind='symlink', target=target)
+        elif stat.S_ISDIR(metadata.st_mode):
+            entry.update(kind='directory')
+        elif stat.S_ISREG(metadata.st_mode):
+            entry.update(kind='file', size=metadata.st_size, mode=stat.S_IMODE(metadata.st_mode),
+                         dev=metadata.st_dev, ino=metadata.st_ino, ctime_ns=metadata.st_ctime_ns,
+                         mtime_ns=metadata.st_mtime_ns)
+        else:
+            raise ValueError(f'unsupported artifact entry: {path}')
+        entries.append(entry)
+    return entries
+
+def has_toolchain_layout(root: Path) -> bool:
+    """Require executables and the core import roots, not just an early-moved bin/lean."""
+    executables = ('lean', 'lake', 'leanc')
+    modules = ('Init.olean', 'Lean.olean', 'Lake.olean')
+    return (all((root / 'bin' / name).is_file() and os.access(root / 'bin' / name, os.X_OK)
+                for name in executables)
+            and all((root / 'lib' / 'lean' / name).is_file() for name in modules))
 
 def is_cached(sha: str) -> bool:
-    """Check if artifact for this commit is already cached and valid."""
-    cache_path = get_cache_path(sha)
-    return cache_path.exists() and (cache_path / 'bin' / 'lean').exists()
+    """Accept only an atomically published, complete entry for this exact identity."""
+    try:
+        identity = cache_identity(sha)
+        if identity['artifact'] is None:
+            return False
+        cache_path = get_cache_path(sha)
+        if cache_path.is_symlink():
+            return False
+        fd = os.open(cache_path / CACHE_RECEIPT, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            receipt = json.load(handle)
+        return (receipt.get('version') == 2 and receipt.get('identity') == identity
+                and has_toolchain_layout(cache_path)
+                and receipt.get('entries') == tree_inventory(cache_path))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+@contextmanager
+def cache_lock(path: Path, shared: bool = False):
+    """Use advisory locks on supported artifact platforms (macOS and Linux)."""
+    if os.name == 'nt':
+        # Artifact downloads are unsupported here; retain --clear-cache for legacy entries.
+        yield
+        return
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError(f'invalid cache lock: {path}')
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+def maintenance_lock_path() -> Path:
+    # Keep this inode outside the tree that --clear-cache removes.
+    return ARTIFACT_CACHE.parent / f'.{ARTIFACT_CACHE.name}.lock'
+
+def clear_cache() -> None:
+    """Wait for active downloads before deleting cache entries and their key locks."""
+    with cache_lock(maintenance_lock_path()):
+        if ARTIFACT_CACHE.is_symlink():
+            ARTIFACT_CACHE.unlink()
+            info(f"Removed cache link at {ARTIFACT_CACHE}")
+        elif ARTIFACT_CACHE.exists():
+            shutil.rmtree(ARTIFACT_CACHE)
+            info(f"Cleared cache at {ARTIFACT_CACHE}")
+        else:
+            info(f"Cache directory does not exist: {ARTIFACT_CACHE}")
+
 
 def check_zstd_support() -> bool:
     """Check if tar supports zstd compression."""
@@ -187,126 +296,107 @@ def check_gh_available() -> bool:
         return False
 
 def download_ci_artifact(sha: str, quiet: bool = False):
-    """
-    Try to download CI artifact for a commit.
-    Returns:
-      - Path to extracted toolchain directory if available
-      - CI_FAILED sentinel if CI run failed (don't bother building locally)
-      - None if no artifact available but local build might work
-    """
-    # Check cache first
-    if is_cached(sha):
-        return get_cache_path(sha)
-
-    artifact_name = get_artifact_name()
-    if artifact_name is None:
-        return None  # Unsupported platform
-
-    cache_path = get_cache_path(sha)
-
+    """Return a complete toolchain, CI_FAILED, or None for a local-build fallback."""
+    if get_artifact_name() is None:
+        return None
     try:
-        # Query for CI workflow run for this commit, including status
-        # Note: Query parameters must be in the URL for GET requests
-        result = subprocess.run(
-            ['gh', 'api', f'repos/{LEAN4_REPO}/actions/runs?head_sha={sha}&per_page=100',
-             '--jq', r'.workflow_runs[] | select(.name == "CI") | "\(.id) \(.conclusion // "null")"'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return None  # No CI run found (old commit?)
+        cache_path = get_cache_path(sha)
+        # A cache clear cannot remove the key-lock inode while a downloader owns it.
+        with cache_lock(maintenance_lock_path(), shared=True):
+            locks = ARTIFACT_CACHE / '.locks'
+            locks.mkdir(parents=True, exist_ok=True)
+            if not stat.S_ISDIR(locks.lstat().st_mode):
+                return None
+            with cache_lock(locks / (cache_path.name + '.lock')):
+                if is_cached(sha):
+                    return cache_path
+                return download_ci_artifact_locked(sha, cache_path, quiet)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
 
-        # Parse "run_id conclusion" format
-        line = result.stdout.strip().split('\n')[0]
-        parts = line.split(' ', 1)
-        run_id = parts[0]
-        conclusion = parts[1] if len(parts) > 1 else "null"
+def download_ci_artifact_locked(sha: str, cache_path: Path, quiet: bool):
+    """Build privately under the key lock; only rename a fully validated directory."""
+    identity = cache_identity(sha)
+    artifact_name = identity['artifact']
+    result = subprocess.run(
+        ['gh', 'api', f'repos/{LEAN4_REPO}/actions/runs?head_sha={sha}&per_page=100',
+         '--jq', r'.workflow_runs[] | select(.name == "CI") | "\(.id) \(.conclusion // "null")"'],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    parts = result.stdout.strip().splitlines()[0].split(' ', 1)
+    run_id = parts[0]
+    conclusion = parts[1] if len(parts) > 1 else 'null'
+    if not run_id.isdigit():
+        return None
 
-        # Check if the desired artifact exists for this run
-        result = subprocess.run(
-            ['gh', 'api', f'repos/{LEAN4_REPO}/actions/runs/{run_id}/artifacts',
-             '--jq', f'.artifacts[] | select(.name == "{artifact_name}") | .id'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            # No artifact available
-            # If CI failed and no artifact, the build itself likely failed - skip
-            if conclusion == "failure":
-                return CI_FAILED
-            # Otherwise (in progress, expired, etc.) - fall back to local build
-            return None
+    result = subprocess.run(
+        ['gh', 'api', f'repos/{LEAN4_REPO}/actions/runs/{run_id}/artifacts',
+         '--jq', f'.artifacts[] | select(.name == "{artifact_name}" and (.expired | not)) | .id'],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0 or not result.stdout.strip():
+        return CI_FAILED if conclusion == 'failure' else None
+    artifact_id = result.stdout.strip().splitlines()[0]
+    if not artifact_id.isdigit():
+        return None
 
-        # Download artifact
-        cache_path.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f'.{cache_path.name}.tmp-', dir=ARTIFACT_CACHE) as temp:
+        temporary = Path(temp)
+        download = temporary / 'download'
+        extracted = temporary / 'extracted'
+        download.mkdir()
+        extracted.mkdir()
         if not quiet:
-            print("downloading CI artifact... ", end='', flush=True)
-
+            print('downloading CI artifact... ', end='', flush=True)
         result = subprocess.run(
-            ['gh', 'run', 'download', run_id,
-             '-n', artifact_name,
-             '-R', LEAN4_REPO,
-             '-D', str(cache_path)],
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minutes for large downloads
-        )
-
+            ['gh', 'run', 'download', run_id, '-n', artifact_name, '-R', LEAN4_REPO, '-D', str(download)],
+            capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
-            shutil.rmtree(cache_path, ignore_errors=True)
             return None
-
-        # Extract tar.zst - find the file (name varies by platform/version)
-        tar_files = list(cache_path.glob('*.tar.zst'))
-        if not tar_files:
-            shutil.rmtree(cache_path, ignore_errors=True)
+        archives = list(download.glob('*.tar.zst'))
+        if len(archives) != 1:
             return None
-
-        tar_file = tar_files[0]
+        archive = archives[0]
+        digest = hashlib.sha256()
+        with archive.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
         if not quiet:
-            print("extracting... ", end='', flush=True)
-
+            print('extracting... ', end='', flush=True)
         result = subprocess.run(
-            ['tar', '--zstd', '-xf', tar_file.name],
-            cwd=cache_path,
-            capture_output=True,
-            timeout=300
-        )
-
+            ['tar', '--zstd', '-xf', str(archive)], cwd=extracted, capture_output=True, timeout=300)
         if result.returncode != 0:
-            shutil.rmtree(cache_path, ignore_errors=True)
             return None
 
-        # Move contents up from lean-VERSION-PLATFORM/ to cache_path/
-        # The extracted directory name varies (e.g., lean-4.15.0-linux, lean-4.15.0-darwin_aarch64)
-        extracted_dirs = [d for d in cache_path.iterdir() if d.is_dir() and d.name.startswith('lean-')]
-        if extracted_dirs:
-            extracted = extracted_dirs[0]
-            for item in extracted.iterdir():
-                dest = cache_path / item.name
-                if dest.exists():
-                    if dest.is_dir():
-                        shutil.rmtree(dest)
-                    else:
-                        dest.unlink()
-                shutil.move(str(item), str(cache_path / item.name))
-            extracted.rmdir()
-
-        # Clean up tar file
-        tar_file.unlink()
-
-        # Verify the extraction worked
-        if not (cache_path / 'bin' / 'lean').exists():
-            shutil.rmtree(cache_path, ignore_errors=True)
+        roots = list(extracted.iterdir())
+        if len(roots) == 1 and roots[0].is_dir() and roots[0].name.startswith('lean-'):
+            payload = roots[0]
+        else:
+            payload = extracted
+        if payload.is_symlink() or not has_toolchain_layout(payload):
             return None
-
+        receipt = {
+            'version': 2,
+            'identity': identity,
+            'run_id': run_id,
+            'artifact_id': artifact_id,
+            'archive_sha256': digest.hexdigest(),
+            'entries': tree_inventory(payload),
+        }
+        # The receipt belongs to the cache writer. An archive entry with this name is invalid,
+        # including symlinks, hard links and special files.
+        with (payload / CACHE_RECEIPT).open('x', encoding='utf-8') as handle:
+            json.dump(receipt, handle, sort_keys=True)
+            handle.write('\n')
+        # Legacy/incomplete entries are misses. Do not touch them until a replacement is ready,
+        # and never remove a published entry in an exception handler or another caller's temp.
+        if cache_path.is_dir() and not cache_path.is_symlink():
+            shutil.rmtree(cache_path)
+        else:
+            cache_path.unlink(missing_ok=True)
+        os.replace(payload, cache_path)
         return cache_path
 
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        shutil.rmtree(cache_path, ignore_errors=True)
-        return None
 
 # -----------------------------------------------------------------------------
 # Git helpers
@@ -382,12 +472,7 @@ Examples:
 
     # Handle cache clearing
     if args.clear_cache:
-        if ARTIFACT_CACHE.exists():
-            size = sum(f.stat().st_size for f in ARTIFACT_CACHE.rglob('*') if f.is_file())
-            shutil.rmtree(ARTIFACT_CACHE)
-            info(f"Cleared cache at {ARTIFACT_CACHE} ({size / 1024 / 1024:.1f} MB)")
-        else:
-            info(f"Cache directory does not exist: {ARTIFACT_CACHE}")
+        clear_cache()
         return
 
     # Get commit SHA
@@ -399,7 +484,13 @@ Examples:
     if not args.quiet:
         info(f"Commit: {sha[:12]}")
 
-    # Check prerequisites
+    if is_cached(sha):
+        if not args.quiet:
+            success("Using cached artifact")
+        print(get_cache_path(sha))
+        return
+
+    # Download prerequisites are unnecessary for a verified local toolchain.
     if not check_gh_available():
         error("gh CLI not available or not authenticated. Run 'gh auth login' first.")
 
@@ -412,14 +503,6 @@ Examples:
 
     if not args.quiet:
         info(f"Platform: {artifact_name}")
-
-    # Check cache
-    if is_cached(sha):
-        path = get_cache_path(sha)
-        if not args.quiet:
-            success("Using cached artifact")
-        print(path)
-        return
 
     # Download artifact
     result = download_ci_artifact(sha, quiet=args.quiet)

@@ -158,12 +158,6 @@ def toDecl (declName : Name) : CompilerM (Decl .pure) := do
     let (type, value) ← Meta.MetaM.run' do
       let type  ← toLCNFType info.type
       let value ← Meta.lambdaTelescope value fun xs body => do Meta.mkLambdaFVars xs (← Meta.etaExpand body)
-      let value ← replaceLogicConstants value
-      let value ← macroInline value
-      /- Recall that some declarations tagged with `macro_inline` contain matchers. -/
-      let value ← inlineMatchers value
-      /- Recall that `inlineMatchers` may have exposed `ite`s and `dite`s which are tagged as `[macro_inline]`. -/
-      let value ← macroInline value
       return (type, value)
     let code ← toLCNF value type
     let mut decl ← if let .fun decl (.return _) := code then

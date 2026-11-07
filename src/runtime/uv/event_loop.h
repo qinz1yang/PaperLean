@@ -44,7 +44,8 @@ void event_loop_run_loop(event_loop_t *event_loop);
 
 // =======================================
 // Global event loop manipulation functions
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(b_obj_arg options);
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(obj_arg options);
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure_checked(b_obj_arg options);
 extern "C" LEAN_EXPORT uint8_t lean_uv_event_loop_alive();
 
 // Helpers

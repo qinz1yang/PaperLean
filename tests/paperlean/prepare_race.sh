@@ -117,32 +117,19 @@ cat > root/UseUser.lean <<'END'
 import Dep.User
 #eval 1 + 1
 END
-# The compiler, which waits at the first module until it is told to go on, for the others to be compiled
-# after the analysis. With `LEAN_CC` set, leanc leaves out the flags of a release's bundled compiler, so
-# the gate runs leanc again without it (the flags it repeats do no harm).
-cat > "$ROOT/cc-gate" <<'END'
-#!/usr/bin/env bash
-if [[ " $* " == *"/Dep/A.c "* ]]; then
-  touch "$GATE/blocked"
-  for ((n = 0; n < 2400; n++)); do
-    [[ -e "$GATE/release" ]] && break
-    sleep 0.1
-  done
-fi
-exec env -u LEAN_CC leanc "$@"
-END
-chmod +x "$ROOT/cc-gate"
+# Pause the actual default C driver after verification, without replacing it or its flags.
 paused() { # paused <log> <command>...: `prepare` runs in the background until the analysis is done
-  rm -f "$ROOT/blocked" "$ROOT/release" "$1"
+  rm -f "$ROOT"/blocked-* "$ROOT/release" "$ROOT/eval.events" "$1"
   # (the compiler runs, as no compiled object is in the cache)
   rm -rf "$PAPERLEAN_CACHE_DIR"/prepared/*/objects
   local log="$1"
   shift
-  GATE="$ROOT" LEAN_CC="$ROOT/cc-gate" PAPERLEAN_UNIT_BYTES=0 stdbuf -oL lake paperlean prepare -j 1 "$@" > "$log" 2>&1 &
+  PAPERLEAN_NATIVE_COMPILER_GATE="$ROOT" PAPERLEAN_NATIVE_COMPILER_GATE_INPUT=/Dep/A.c \
+    PAPERLEAN_EVAL_EVENTS="$ROOT/eval.events" PAPERLEAN_UNIT_BYTES=0 lake paperlean prepare -j 1 "$@" > "$log" 2>&1 &
   PREPARE=$!
   local n
   for ((n = 0; n < 2400; n++)); do
-    [[ -e "$ROOT/blocked" ]] && grep -q "evaluated the packages" "$log" && return 0
+    compgen -G "$ROOT/blocked-*" > /dev/null && grep -q '^done$' "$ROOT/eval.events" 2>/dev/null && return 0
     sleep 0.1
   done
   fail "prepare did not get to the point of the test"
@@ -174,9 +161,9 @@ touch "$ROOT/release"
 wait "$PREPARE" || fail "prepare failed"
 cat "$ROOT/prepare1.log"
 grep -q "interpreted" "$ROOT/prepare1.log" || fail "the changed modules are not interpreted"
-grep -q "e.g. Dep.Z: its files changed after they were analysed" "$ROOT/prepare1.log" ||
+grep -Eq '^  e\.g\. Dep\.Z: (\.c has no prepared content hash|\.c bytes do not match the prepared content hash|its files changed after they were analysed)$' "$ROOT/prepare1.log" ||
   fail "Dep.Z is not reported as changed"
-grep -q "e.g. Dep.Priv: its files changed after they were analysed" "$ROOT/prepare1.log" ||
+grep -Eq '^  e\.g\. Dep\.Priv: (\.c has no prepared content hash|\.c bytes do not match the prepared content hash|its files changed after they were analysed)$' "$ROOT/prepare1.log" ||
   fail "Dep.Priv is not reported as changed"
 # (`Dep.User` is as it was, and stays out through its import)
 if grep -q "e.g. Dep.User: its files" "$ROOT/prepare1.log"; then
@@ -210,7 +197,7 @@ PREPARE_RACE_TOUCH="$VICTIM" paused "$ROOT/prepare2.log"
 touch "$ROOT/release"
 wait "$PREPARE" || fail "prepare failed"
 cat "$ROOT/prepare2.log"
-grep -q "e.g. Dep.Victim: its files changed while it was analysed" "$ROOT/prepare2.log" ||
+grep -Eq '^  e\.g\. Dep\.Victim: (\.olean has no prepared content hash|its files changed while it was analysed)$' "$ROOT/prepare2.log" ||
   fail "Dep.Victim is not reported as changed while it was analysed"
 same_as_plain UseA.lean "paperlean-timing native libs=1 modules=1 "
 

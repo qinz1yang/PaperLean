@@ -160,4 +160,19 @@ END
 (cd "$TMP_DIR/dep" && run lake build Dep.V1 Dep.V2)
 capture lake paperlean prepare -j 2
 check_out_contains "Compiling the native library of dep (2 jobs, 2 units)"
-check_out_contains "the native library of dep could not be built"
+# Some host linkers coalesce tentative variables; others reject the duplicate symbol.
+# If linking succeeds, both conflicting definitions must still be interpreted.
+if ! grep -q "the native library of dep could not be built" "$CAPTURED.out.produced"; then
+  check_out_contains 'e.g. Dep.V1: `Shared.cfg` runs `Shared.cfg`, which modules define differently'
+  check_out_contains 'e.g. Dep.V2: `Shared.cfg` runs `Shared.cfg`, which modules define differently'
+fi
+for version in 1 2; do
+  cat > "UseV$version.lean" <<END
+import Dep.V$version
+#eval v$version
+END
+  capture lake lean "UseV$version.lean"
+  printf '%s\n' "$version" | $DIFF -- - "$CAPTURED.out.produced" || fail "conflicting variable baseline differs"
+  capture env PAPERLEAN_ACCELERATE=1 lake lean "UseV$version.lean"
+  printf '%s\n' "$version" | $DIFF -- - "$CAPTURED.out.produced" || fail "conflicting variable ran natively"
+done

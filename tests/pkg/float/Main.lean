@@ -179,25 +179,31 @@ structure Sample where
 Parse the decompressed `lines` of a vector file into `Sample`s, doing the hex
 decoding once per file rather than once per backend. `arityCheck` is consulted
 only to decide whether each line carries one, two, or three operands — every
-backend that checks a given file agrees on its arity. Malformed lines are reported to stderr
-under `label` and skipped. Factoring this out keeps the per-backend timing in
+backend that checks a given file agrees on its arity. Malformed lines and files without
+any samples fail the run. Factoring this out keeps the per-backend timing in
 `main` measuring only the operations, not the parsing.
 -/
 def parseSamples (arityCheck : Check) (label : String) (lines : Array String) :
     IO (Array Sample) := do
   let mut samples := #[]
-  for line in lines do
+  for (line, row) in lines.zipIdx do
     let tokens := line.trimAscii.toString.split " " |>.filter (!·.isEmpty) |>.toStringList
     unless tokens.isEmpty do
+      -- UInt64 decoding otherwise wraps overlong inputs. Require the flags field,
+      -- validate its hexadecimal spelling, and reject missing or surplus columns.
+      let decoded := if tokens.all (fun token => token.length ≤ 16) then
+          tokens.mapM hexToUInt64? else none
       let parsed : Option Sample :=
-        match arityCheck.op, tokens.mapM hexToUInt64? with
-        | .ternary _ _, some (a :: b :: c :: expected :: _) => some { a, b, c, expected }
-        | .binary _ _, some (a :: b :: expected :: _) => some { a, b, c := 0, expected }
-        | .unary _ _, some (a :: expected :: _) => some { a, b := 0, c := 0, expected }
+        match arityCheck.op, decoded with
+        | .ternary _ _, some [a, b, c, expected, _flags] => some { a, b, c, expected }
+        | .binary _ _, some [a, b, expected, _flags] => some { a, b, c := 0, expected }
+        | .unary _ _, some [a, expected, _flags] => some { a, b := 0, c := 0, expected }
         | _, _ => none
       match parsed with
-      | none => IO.eprintln s!"malformed line in {label}: {line.trimAscii.toString}"
+      | none => throw <| IO.userError s!"malformed line {row + 1} in {label}: {line.trimAscii.toString}"
       | some s => samples := samples.push s
+  if samples.isEmpty then
+    throw <| IO.userError s!"no samples in {label}"
   return samples
 
 public def main (args : List String) : IO UInt32 := do
@@ -220,7 +226,7 @@ public def main (args : List String) : IO UInt32 := do
   let mut grandDurations : Array Duration := .replicate backends.length 0
   for path in files do
     let some key := vectorKey path
-      | IO.eprintln s!"skipping {path}: not a recognizable vector file"; continue
+      | IO.eprintln s!"error: {path} is not a recognizable vector file"; return 2
     let suite := (path.parent.bind (·.fileName)).getD "?"
     let label := s!"{suite}/{key}"
     if !filters.isEmpty && !filters.any (containsSubstr label ·) then
@@ -252,7 +258,12 @@ public def main (args : List String) : IO UInt32 := do
     -- `modelBackend` entry suffices to drive the parse.
     let some (_, arityCheck) := modelBackend.operations.find? (·.1 == key)
       | IO.eprintln s!"error: {path} names unknown operation '{key}'"; return 2
-    let samples ← parseSamples arityCheck label lines
+    let samples? ← try
+        pure (some (← parseSamples arityCheck label lines))
+      catch error =>
+        IO.eprintln s!"error: {error}"
+        pure none
+    let some samples := samples? | return 2
 
     for (backend, i) in backends.zipIdx do
       let some (_, check) := backend.operations.find? (·.1 == key)
@@ -289,6 +300,9 @@ public def main (args : List String) : IO UInt32 := do
       grandDurations := grandDurations.modify i (· + elapsed)
     ran := ran + 1
 
+  if ran == 0 then
+    IO.eprintln s!"error: no vector files matched filters {filters}"
+    return 2
   if grandFailures > shown then
     IO.eprintln s!"... ({grandFailures - shown} further failures suppressed; pass --all to show them)"
   IO.println s!"total: {grandTotal} tests, {grandFailures} failures across {ran} file(s)"

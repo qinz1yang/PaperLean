@@ -56,7 +56,7 @@ def compressRangeFast (acc : String) (range : Range) : String :=
 def compressEditFast (acc : String) (edit : InsertReplaceEdit) : String :=
   let acc := acc ++ "{\"insert\":"
   let acc := compressRangeFast acc edit.insert
-  let acc := acc ++ ",\"newText\":\"" ++ edit.newText ++ "\""
+  let acc := Json.renderString edit.newText (acc ++ ",\"newText\":")
   let acc := acc ++ ",\"replace\":"
   let acc := compressRangeFast acc edit.replace
   acc ++ "}"

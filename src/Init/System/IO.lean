@@ -1501,7 +1501,7 @@ if it has.
     IO (Option UInt32)
 
 /--
-Terminates the child process using the `SIGTERM` signal or a platform analogue.
+Terminates the child process using the `SIGKILL` signal or a platform analogue.
 
 If the process was started using `SpawnArgs.setsid`, terminates the entire process group instead.
 -/
@@ -1534,27 +1534,104 @@ structure Output where
   /-- Everything that was written to the process's standard error. -/
   stderr   : String
 
+@[extern "lean_io_process_wait_any_or_cancel"]
+private opaque waitAnyOrCancel (tasks : @& List (Task α)) (h : tasks.length > 0) :
+    BaseIO (Option α) := do
+  if ← IO.checkCanceled then return none
+  return some (← IO.waitAny tasks h)
+
+@[extern "lean_io_process_in_task"] private opaque inOutputTask : BaseIO Bool
+
+-- Observe exit without consuming the POSIX PID. Only the output owner may reap it.
+@[extern "lean_io_process_output_observe"]
+private opaque observeOutputExit {cfg : @& StdioConfig} : @& Child cfg → Bool → IO Bool
+
+@[extern "lean_io_process_output_reap"]
+private opaque reapOutput {cfg : @& StdioConfig} : @& Child cfg → IO UInt32
+
+@[extern "lean_io_process_output_kill"]
+private opaque killOutput {cfg : @& StdioConfig} : @& Child cfg → IO Unit
+
+private def outputCanceled (cmd : String) : IO.Error :=
+  .interrupted cmd 0 "process output task canceled"
+
+private def stopOutput {cfg : StdioConfig} (child : Child cfg)
+    (observer? : Option (Task (Except IO.Error Bool))) : BaseIO Unit := do
+  -- A failed identity check (e.g. an embedding host reaped the child) cannot authorize
+  -- signaling the numeric PID. No successful observer consumes the status.
+  let .ok exited ← (observeOutputExit child false).toBaseIO | return ()
+  let killed ← (killOutput child).toBaseIO
+  let reap : BaseIO Unit := do
+    if let some observer := observer? then discard <| IO.wait observer
+    discard <| (reapOutput child).toBaseIO
+  if exited || (killed matches .ok ()) then reap
+  else
+    -- If the OS denies termination, don't block the caller. Retain the child until
+    -- its natural exit so the eventual status still has exactly one consuming owner.
+    discard <| BaseIO.asTask reap Task.Priority.dedicated
+
+private def outputExitCode {cfg : StdioConfig} (cmd : String) (child : Child cfg) : IO UInt32 := do
+  -- A caller outside the task manager cannot be canceled. Usually the child is also
+  -- already exiting when both readers reach EOF. Neither case needs another thread.
+  if !(← inOutputTask) then return ← reapOutput child
+  if ← observeOutputExit child false then
+    return ← reapOutput child
+  let observer ← IO.asTask (observeOutputExit child true) Task.Priority.dedicated
+  match ← waitAnyOrCancel [observer] (Nat.zero_lt_succ _) with
+  | none =>
+    stopOutput child (some observer)
+    throw (outputCanceled cmd)
+  | some (.error e) => throw e
+  | some (.ok _) => reapOutput child
+
 /--
 Runs a process to completion and captures its output and exit code.
 The child process is run with a null standard input or the specified input if provided,
 and the current process blocks until it has run to completion.
 
 The specifications of standard input, output, and error handles in `args` are ignored.
+If the calling task is canceled while waiting for I/O or process exit, this operation
+requests termination of the child, reaps its exit status, and reports an interrupted I/O error.
 -/
 def output (args : SpawnArgs) (input? : Option String := none) : IO Output := do
-  let child ←
+  if ← IO.checkCanceled then throw (outputCanceled args.cmd)
+  let (input?, child) ←
     if let some input := input? then
       let (stdin, child) ← (← spawn { args with stdout := .piped, stderr := .piped, stdin := .piped }).takeStdin
-      stdin.putStr input
-      stdin.flush
-      pure child
+      pure (some (stdin, input), child)
     else
-      spawn { args with stdout := .piped, stderr := .piped, stdin := .null }
+      pure (none, ← spawn { args with stdout := .piped, stderr := .piped, stdin := .null })
+  -- Drain both output pipes before writing input: the child may write before it reads.
   let stdout ← IO.asTask child.stdout.readToEnd Task.Priority.dedicated
-  let stderr ← child.stderr.readToEnd
-  let exitCode ← child.wait
+  let stderr ← IO.asTask child.stderr.readToEnd Task.Priority.dedicated
+  let stdin ← if let some (stdin, input) := input? then
+      IO.asTask (do stdin.putStr input; stdin.flush) Task.Priority.dedicated
+    else
+      pure <| Task.pure (.ok ())
+  try
+    -- Observe failures in completion order, rather than blocking on a different pipe first.
+    let rec wait (remaining : Nat) (pending : List (Task (Except IO.Error Unit))) : IO Unit :=
+      match remaining, pending with
+      | 0, _ => pure ()
+      | _, [] => pure ()
+      | n + 1, task :: tasks => do
+        let pending := task :: tasks
+        let some (i, result) ← waitAnyOrCancel
+          (pending.mapIdx fun i t => t.map (sync := true) fun a => (i, a)) (by simp [pending])
+          | throw (outputCanceled args.cmd)
+        IO.ofExcept result
+        wait n (pending.eraseIdx i)
+    -- These notifications must run on the reader threads: callers may occupy every
+    -- ordinary worker while waiting for their child processes.
+    wait 3 [stdout.map (sync := true) (·.map fun _ => ()),
+      stderr.map (sync := true) (·.map fun _ => ()), stdin]
+  catch err =>
+    stopOutput child none
+    throw err
+  let exitCode ← outputExitCode args.cmd child
   let stdout ← IO.ofExcept stdout.get
-  pure { exitCode := exitCode, stdout := stdout, stderr := stderr }
+  let stderr ← IO.ofExcept stderr.get
+  pure { exitCode, stdout, stderr }
 
 /--
 Runs a process to completion, blocking until it terminates.

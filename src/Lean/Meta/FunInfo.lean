@@ -61,17 +61,12 @@ private def collectDeps (fvars : Array Expr) (e : Expr) : Array Nat :=
 
 /-- Update `hasFwdDeps` fields using new `backDeps` -/
 private def updateHasFwdDeps (pinfo : Array ParamInfo) (backDeps : Array Nat) : Array ParamInfo :=
-  if backDeps.size == 0 then
-    pinfo
-  else
-    -- update hasFwdDeps fields
-    pinfo.mapIdx fun i info =>
-      if info.hasFwdDeps then
-        info
-      else if backDeps.contains i then
-        { info with hasFwdDeps := true }
-      else
-        info
+  backDeps.foldl (init := pinfo) fun infos i =>
+    if h : i < infos.size then
+      let info := infos[i]
+      if info.hasFwdDeps then infos else infos.set i { info with hasFwdDeps := true } h
+    else
+      infos
 
 private def getFunInfoAux (fn : Expr) (maxArgs? : Option Nat) : MetaM FunInfo :=
   checkFunInfoCache fn maxArgs? do

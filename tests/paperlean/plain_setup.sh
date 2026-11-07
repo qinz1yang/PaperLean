@@ -41,8 +41,8 @@ done
 echo '-- changed' >> R.lean
 run env PAPERLEAN_ACCELERATE=1 lake build
 SIDE=.lake/build/ir/R.setup.paperlean
-[ "$(wc -l < $SIDE)" = 0 ] || fail "the Lake of paperlean commands did not write R.setup.paperlean compact"
-INDEX="$WS/\\.lake/paperlean-setup/[0-9]+/setup-[0-9a-f]+\\.paperlean"
+[ "$(wc -l < $SIDE)" -eq 0 ] || fail "the Lake of paperlean commands did not write R.setup.paperlean compact"
+INDEX="$WS/\\.lake/paperlean-setup/[0-9]+-[0-9]+/setup-[0-9a-f]+\\.paperlean"
 show_json arts < $SIDE | grep -Eq "^\\{\"\\[anonymous\\]\":\\[\\[\"$INDEX\"\\],\\[\"[0-9]+\"\\]\\]\\}$" ||
   fail "the Lake of paperlean commands wrote importArts as: $(show_json arts < $SIDE)"
 [ "$(show_json arts < $SETUP)" = "$FULL" ] || fail "the Lake of paperlean commands changed R.setup.json: $(show_json arts < $SETUP)"

@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <new>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -41,6 +43,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include "paperlean/fast_import.h"
 #include "paperlean/olean_pack.h"
 #include "paperlean/side_file.h"
+#include "paperlean/side_file_output.h"
 #include "paperlean/native_libs.h"
 
 /*
@@ -95,6 +98,30 @@ header.
 */
 
 namespace lean {
+// These are the spellings and ABIs of Init.Data.Float.{Float,Float32}. EmitC writes their
+// declarations into importing C files, even though the extern attribute belongs to Init.
+// A retained object binds these calls directly to this toolchain, never to a package export.
+struct native_math_op {
+    std::string_view name, prototype;
+    unsigned arity;
+};
+constexpr native_math_op g_math_ops[] = {
+    {"ceil",   "double ceil(double);",        1},
+    {"floor",  "double floor(double);",       1},
+    {"floorf", "float floorf(float);",        1},
+    {"pow",    "double pow(double, double);", 2},
+    {"sqrt",   "double sqrt(double);",        1}
+};
+static native_math_op const * native_math(std::string_view name) {
+    for (auto const & op : g_math_ops) if (op.name == name) return &op;
+    return nullptr;
+}
+constexpr std::string_view g_math_prefix = "lean_paperlean_stdmath_";
+extern "C" LEAN_EXPORT double lean_paperlean_stdmath_ceil(double x) { return std::ceil(x); }
+extern "C" LEAN_EXPORT double lean_paperlean_stdmath_floor(double x) { return std::floor(x); }
+extern "C" LEAN_EXPORT float lean_paperlean_stdmath_floorf(float x) { return std::floor(x); }
+extern "C" LEAN_EXPORT double lean_paperlean_stdmath_pow(double x, double y) { return std::pow(x, y); }
+extern "C" LEAN_EXPORT double lean_paperlean_stdmath_sqrt(double x) { return std::sqrt(x); }
 // `Lean.PaperLean.Import`; the arguments are owned
 extern "C" obj_res lean_paperlean_env_imports_id(obj_arg env);
 extern "C" uint32 lean_paperlean_const_module_idx(obj_arg env, obj_arg n);
@@ -761,7 +788,6 @@ bool verify(b_obj_arg env, b_obj_arg opts, char const * list, native_modules & m
     //   the module's importers, which would use the library's copy.
     // By depth-first search; core modules import only core modules.
     std::vector<int32_t> owner(n, g_not_found - 1);
-    generation = g_libs_generation.load();
     auto owner_of_module = [&](size_t x) {
         if (owner[x] < g_not_found) {
             std::string sym = std::string(init_prefix) + init_name(x);
@@ -774,8 +800,14 @@ bool verify(b_obj_arg env, b_obj_arg opts, char const * list, native_modules & m
     std::vector<bool> toolchain;
     {
         std::shared_lock<std::shared_mutex> lock(g_libs_mutex);
+        generation = g_libs_generation.load();
         for (loaded_lib const & l : *g_libs) toolchain.push_back(l.toolchain);
     }
+    // Symbol lookup can see a library loaded after this snapshot. Such owners are not verified by
+    // this import, and must not index its per-library data or be recorded as its native initializers.
+    auto owner_in_snapshot = [&](int32_t own) {
+        return own >= 0 && static_cast<size_t>(own) < toolchain.size();
+    };
     lib_of.assign(n, -1);
     meta_only.assign(n, false);
     mods.init_lib.assign(n, -1);
@@ -824,7 +856,7 @@ bool verify(b_obj_arg env, b_obj_arg opts, char const * list, native_modules & m
             }
             int64_t self = static_cast<int64_t>(x);
             // (`own` can be a library that another thread loaded after `toolchain` was taken)
-            bool verified = own >= 0 && static_cast<size_t>(own) < toolchain.size() &&
+            bool verified = owner_in_snapshot(own) &&
                 (toolchain[own] || (verified_by[x] >= 0 && ms[verified_by[x]].lib == own));
             // the module's flags, as the manifest records them, or what they can be
             uint32_t flags = verified_by[x] >= 0 ? init_flags[x] : 0;
@@ -908,8 +940,8 @@ bool verify(b_obj_arg env, b_obj_arg opts, char const * list, native_modules & m
                     note_by_import(by_import, names, x, why);
                 }
             }
-            if (own >= 0 && !toolchain[own] && has_package(x)) mods.init_lib[x] = own;
-            if (own < 0 || !meta_ok[x]) continue;
+            if (owner_in_snapshot(own) && !toolchain[own] && has_package(x)) mods.init_lib[x] = own;
+            if (!owner_in_snapshot(own) || !meta_ok[x]) continue;
             lib_of[x] = own;
             meta_only[x] = !full_ok[x];
             auto init = std::make_shared<native_init const>(native_init{ own, name(lean_array_get_core(names, x), true).to_string(),
@@ -1310,7 +1342,10 @@ bool lean_own_symbol(std::string const & sym) {
 // Whether something in this process defines `sym`, as Lean's `lean.h` and libraries do when they are
 // what it is linked against.
 bool defined_here(std::string const & sym) {
-    return lean_header_names().count(sym) || dlsym(RTLD_DEFAULT, sym.c_str());
+    // The guarded standard spellings are bound to toolchain entry points even when a system
+    // libc does not expose the unprefixed spelling in RTLD_DEFAULT. Never create a stub for
+    // them or allow a package to claim their names.
+    return native_math(sym) || lean_header_names().count(sym) || dlsym(RTLD_DEFAULT, sym.c_str());
 }
 
 // The body of the initializer `<prefix>initialize_...` that `u` defines, if it defines one.
@@ -1461,6 +1496,322 @@ bool c_init_flags(c_unit const & u, uint32_t & flags) {
 }
 #endif
 
+// EmitC assigns a foreign scalar call to an SSA variable and only passes SSA variables.
+// Restrict the five reserved names to such calls and the exact prototype above; a definition,
+// incompatible redeclaration, function pointer, or address-taking does not satisfy this test.
+static bool native_math_call(std::string_view line, native_math_op const & op) {
+    auto take = [&](std::string_view prefix) {
+        if (line.substr(0, prefix.size()) != prefix) return false;
+        line.remove_prefix(prefix.size()); return true;
+    };
+    auto var = [&]() {
+        if (!take("v_")) return false;
+        size_t i = 0;
+        for (; i < line.size(); ++i) {
+            char c = line[i];
+            if (!(c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9'))) break;
+        }
+        line.remove_prefix(i); return i != 0;
+    };
+    return var() && take(" = ") && take(op.name) && take("(") && var() &&
+        (op.arity == 1 || (take(", ") && var())) && line == ");";
+}
+
+// Only this positive subset of EmitC's output is eligible for location-independent native code.
+// The body has no preprocessing directives. The admitted headers/macros and identifier families
+// are from lean.h and EmitC; an arbitrary extern expression or C extension is not assumed safe.
+static bool portable_emitted_c(std::string_view text,
+        std::unordered_set<std::string_view> const * declared = nullptr,
+        std::unordered_set<std::string_view> * used = nullptr) {
+    auto take = [&](std::string_view s) {
+        if (text.substr(0, s.size()) != s) return false;
+        text.remove_prefix(s.size());
+        return true;
+    };
+    // Splicing and trigraph substitution happen before the C lexer sees comments and literals.
+    if (text.find("??") != text.npos || text.find('\r') != text.npos || text.find('\0') != text.npos) return false;
+    for (size_t p = text.find('\\'); p != text.npos; p = text.find('\\', p + 1)) {
+        size_t q = text.find_first_not_of(" \t\v\f", p + 1);
+        if (q == text.npos || text[q] == '\n') return false;
+    }
+    if (!take("// Lean compiler output\n")) return false;
+    for (auto prefix : {"// Module: ", "// Imports:"}) {
+        if (!take(prefix)) return false;
+        size_t line = text.find('\n');
+        if (line == text.npos) return false;
+        text.remove_prefix(line + 1);
+    }
+    if (!take("#include <lean/lean.h>\n"
+              "#if defined(__clang__)\n"
+              "#pragma clang diagnostic ignored \"-Wunused-parameter\"\n"
+              "#pragma clang diagnostic ignored \"-Wunused-label\"\n"
+              "#elif defined(__GNUC__) && !defined(__CLANG__)\n"
+              "#pragma GCC diagnostic ignored \"-Wunused-parameter\"\n"
+              "#pragma GCC diagnostic ignored \"-Wunused-label\"\n"
+              "#pragma GCC diagnostic ignored \"-Wunused-but-set-variable\"\n"
+              "#endif\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n")) return false;
+    constexpr std::string_view footer = "#ifdef __cplusplus\n}\n#endif\n";
+    if (text.size() < footer.size() || text.substr(text.size() - footer.size()) != footer) return false;
+    text.remove_suffix(footer.size());
+    static std::unordered_set<std::string_view> const fixed {
+        "LEAN_EXPORT", "LEAN_ONCE_CELL_INITIALIZER", "LEAN_SCALAR_PTR_LITERAL", "LEAN_ALWAYS_INLINE",
+        "LEAN_UNLIKELY", "LEAN_LIKELY", "LEAN_BYTE", "LeanClosure", "LeanString", "LeanArray", "LeanScalarArray",
+        "bool", "char", "const", "double", "extern", "float", "int", "int8_t", "int16_t", "int32_t",
+        "int64_t", "intptr_t", "long", "short", "signed", "size_t", "static", "struct", "uint8_t",
+        "uint16_t", "uint32_t", "uint64_t", "uintptr_t", "unsigned", "void", "break", "case",
+        "default", "do", "else", "false", "for", "goto", "if", "return", "sizeof", "switch", "true",
+        "while", "NULL", "builtin", "res", "_start", "_args", "_aargs", "_result",
+        // Ground constants use designated initializers of the fixed runtime structs.
+        "m_header", "m_rc", "m_tag", "m_other", "m_cs_sz", "m_size", "m_capacity", "m_length",
+        "m_data", "m_objs", "m_value", "m_fun", "m_arity", "m_num_fixed", "m_y"
+    };
+    unsigned math_decls = 0;
+    auto known = [&](std::string_view id, size_t begin) {
+        // New definitions of the tools' binding targets are not package symbols.
+        if (id.substr(0, g_math_prefix.size()) == g_math_prefix) return false;
+        for (std::string_view p : {"lean_", "l_", "lp_", "v_", "_G_", "_init_", "_tmp_",
+                "initialize_", "runtime_initialize_", "meta_initialize_"})
+            if (id.substr(0, p.size()) == p) return true;
+        if (fixed.count(id)) return true;
+        if (!declared) return false;
+        if (auto * op = native_math(id)) {
+            auto start = text.rfind('\n', begin), end = text.find('\n', begin);
+            start = start == text.npos ? 0 : start + 1;
+            std::string_view line = text.substr(start, end - start);
+            unsigned bit = 1u << static_cast<unsigned>(op - g_math_ops);
+            if (line == op->prototype) math_decls |= bit;
+            else if (!(math_decls & bit) || !native_math_call(line, *op)) return false;
+        } else if (!declared->count(id)) return false;
+        if (used) used->insert(id);
+        return true;
+    };
+    auto letter = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
+    auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    for (size_t i = 0; i < text.size();) {
+        char c = text[i++];
+        if (letter(c)) {
+            size_t b = i - 1;
+            while (i < text.size() && (letter(text[i]) || digit(text[i]))) ++i;
+            if (!known(text.substr(b, i - b), b)) return false;
+        } else if (digit(c)) {
+            while (i < text.size() && (letter(text[i]) || digit(text[i]) || text[i] == '.')) ++i;
+        } else if (c == '"') {
+            bool closed = false;
+            while (i < text.size() && text[i] != '\n') {
+                char ch = text[i++];
+                if (ch == c) { closed = true; break; }
+                if (ch == '\\' && i < text.size()) ++i;
+            }
+            if (!closed) return false;
+        } else if (c == '/' && text.substr(i, 1) == "/") {
+            i = text.find('\n', i);
+            if (i == text.npos) return false;
+        } else if (c == '/' && text.substr(i, 1) == "*") {
+            i = text.find("*/", i + 1);
+            if (i == text.npos) return false;
+            i += 2;
+        } else if (std::string_view(" \t\v\f\n+-(){}[];,:.*&=!<>/|^~%?").find(c) == text.npos ||
+                   (c == '%' && (text.substr(i, 1) == ":" || text.substr(i, 1) == ">")) ||
+                   (c == '<' && (text.substr(i, 1) == "%" || text.substr(i, 1) == ":")) ||
+                   (c == ':' && text.substr(i, 1) == ">")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* portableEmittedC: the original bytes, after verification against the module trace. */
+extern "C" LEAN_EXPORT uint8_t lean_paperlean_portable_emitted_c(b_obj_arg bytes) {
+    auto * data = reinterpret_cast<char const *>(lean_sarray_cptr(bytes));
+    return portable_emitted_c(std::string_view(data, lean_sarray_size(bytes)));
+}
+
+// Additional names come only from the verified module's standard extern/export attributes.
+// Keep reserved extensions and C keywords out even when a declaration claims such a name.
+static bool custom_c_symbol(std::string_view name) {
+    auto alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    if (name.empty() || !alpha(name.front()) || name.find("__") != name.npos) return false;
+    for (char c : name) if (!alpha(c) && !(c >= '0' && c <= '9') && c != '_') return false;
+    static std::unordered_set<std::string_view> const reserved {
+        "alignas", "alignof", "asm", "auto", "bool", "break", "case", "char", "const", "constexpr",
+        "continue", "default", "do", "double", "else", "enum", "extern", "false", "float", "for",
+        "goto", "if", "inline", "int", "long", "nullptr", "register", "restrict", "return", "short",
+        "signed", "sizeof", "static", "static_assert", "struct", "switch", "thread_local", "true",
+        "typedef", "typeof", "typeof_unqual", "union", "unsigned", "void", "volatile", "while"
+    };
+    return !reserved.count(name);
+}
+
+/* Return a forced header for verified C with extra identifiers. Module-owned externs must
+remain ordinary external spellings. The fixed Init math operations instead bind to the toolchain.
+An included header or preprocessing line still fails the same grammar; no C bytes are rewritten. */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_portable_c_symbol_guard(b_obj_arg bytes, b_obj_arg syms) {
+    std::unordered_set<std::string_view> declared;
+    for (size_t i = 0; i < lean_array_size(syms); ++i) {
+        b_obj_arg sym = lean_array_get_core(syms, i);
+        std::string_view name(lean_string_cstr(sym), lean_string_size(sym) - 1);
+        if (custom_c_symbol(name)) declared.insert(name);
+    }
+    auto * data = reinterpret_cast<char const *>(lean_sarray_cptr(bytes));
+    std::unordered_set<std::string_view> used;
+    if (!portable_emitted_c(std::string_view(data, lean_sarray_size(bytes)), &declared, &used))
+        return mk_option_none();
+    // Cache admission depends on the identifiers in these C bytes. An unused attribute must
+    // not change whether identical C compiles on a cold miss or reuses a retained object.
+    std::string guard = "#include <lean/lean.h>\n";
+    std::vector<std::string_view> ordered(used.begin(), used.end());
+    std::sort(ordered.begin(), ordered.end());
+    if (std::any_of(ordered.begin(), ordered.end(), [](auto n) { return !native_math(n); }))
+        guard += "#ifndef __has_builtin\n#error PaperLean requires a compiler builtin probe\n#endif\n";
+    for (std::string_view name : ordered) {
+        guard += "#ifdef "; guard += name; guard += "\n#error PaperLean external name is a macro\n#endif\n";
+        if (auto * op = native_math(name)) {
+            // An asm label gives the original, trace-bound EmitC prototype a fixed linker
+            // symbol without redefining a token for the rest of a grouped translation unit.
+            guard += "extern "; guard += op->prototype.substr(0, op->prototype.size() - 1);
+            guard += " __asm__(\"";
+#ifdef __APPLE__
+            guard += "_";
+#endif
+            guard += g_math_prefix; guard += name; guard += "\");\n";
+            continue;
+        }
+        guard += "#ifdef __has_builtin\n#if __has_builtin("; guard += name;
+        guard += ")\n#error PaperLean external name is a compiler builtin\n#endif\n#endif\n";
+    }
+    return mk_option_some(lean_mk_string_from_bytes(guard.data(), guard.size()));
+}
+
+#ifdef PAPERLEAN_NATIVE_LIBS
+namespace {
+using c_names = std::unordered_set<std::string>;
+
+bool init_flag(std::string_view n) {
+    return n == "_G_initialized" || n == "_G_runtime_initialized" || n == "_G_meta_initialized";
+}
+
+struct grouped_names {
+    c_names references, local, definitions, init_flags;
+};
+
+// EmitC writes one simple named variable or function per top-level declaration. Reject an unfamiliar
+// declarator for grouping: standalone compilation still uses the checked C. Private names must not
+// appear even as references in another member, where a merged C translation unit could bind them.
+bool group_declarator(std::vector<std::string_view> const & h, char end, grouped_names & names) {
+    size_t i = 0;
+    bool local = i < h.size() && h[i] == "static";
+    bool external = i < h.size() && h[i] == "extern";
+    if (local || external || (i < h.size() && h[i] == "LEAN_EXPORT")) ++i;
+    if (i < h.size() && h[i] == "const") ++i;
+    if (i >= h.size() || !is_ident_start(h[i][0])) return false;
+    auto type = h[i++];
+    while (i < h.size() && h[i] == "*") ++i;
+    if (i >= h.size() || !is_ident_start(h[i][0])) return false;
+    std::string name(h[i++]);
+    bool function = i < h.size();
+    if (function) {
+        if (h[i] != "(" || h.back() != ")" || end == '=') return false;
+        for (++i; i + 1 < h.size(); ++i)
+            if (!is_ident_start(h[i][0]) && h[i] != "*" && h[i] != ",") return false;
+    } else if (end == '{') {
+        return false;
+    }
+    if (init_flag(name)) {
+        if (!local || function || type != "bool" || end != '=') return false;
+        names.init_flags.insert(name);
+    } else {
+        if (local) names.local.insert(name);
+        if (end == '{' || end == '=' || (!external && !function)) names.definitions.insert(name);
+    }
+    return true;
+}
+
+bool group_names(char const * path, grouped_names & names) {
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    std::string text;
+    char buf[1 << 16];
+    for (size_t n; (n = fread(buf, 1, sizeof(buf), f));) text.append(buf, n);
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) return false;
+    constexpr std::string_view opening = "extern \"C\" {\n#endif\n";
+    constexpr std::string_view closing = "#ifdef __cplusplus\n}\n#endif\n";
+    size_t begin = text.find(opening, text.find("\n#include <lean/lean.h>\n"));
+    if (begin == text.npos || text.size() < closing.size()) return false;
+    begin += opening.size();
+    size_t end = text.size() - closing.size();
+    if (begin > end || text.compare(end, closing.size(), closing) != 0) return false;
+    enum {header, function_body, initializer} mode = header;
+    int braces = 0, parens = 0, brackets = 0;
+    std::vector<std::string_view> tokens;
+    for_each_token(text, begin, end, [&](size_t b, size_t e) {
+        if (!ok) return;
+        bool ident = e != b;
+        std::string_view tok(text.data() + b, ident ? e - b : 1);
+        if (ident) {
+            if (tok.substr(0, 3) == "_G_" && !init_flag(tok)) { ok = false; return; }
+            names.references.emplace(tok);
+        }
+        char c = ident ? 0 : text[b];
+        if (mode == header) {
+            if (c != '{' && c != '=' && c != ';') { tokens.push_back(tok); return; }
+            if (!group_declarator(tokens, c, names)) { ok = false; return; }
+            tokens.clear();
+            if (c == '{') { mode = function_body; braces = 1; }
+            if (c == '=') mode = initializer;
+            return;
+        }
+        if (c == '{') ++braces;
+        if (c == '}') --braces;
+        if (mode == function_body) {
+            if (braces == 0) mode = header;
+            return;
+        }
+        if (c == '(') ++parens;
+        if (c == ')') --parens;
+        if (c == '[') ++brackets;
+        if (c == ']') --brackets;
+        if (braces < 0 || parens < 0 || brackets < 0) ok = false;
+        if (braces == 0 && parens == 0 && brackets == 0) {
+            if (c == ',') ok = false; // Another declarator following an initializer.
+            if (c == ';') mode = header;
+        }
+    });
+    if (!ok || mode != header || !tokens.empty()) return false;
+    for (auto const & s : names.references)
+        if (init_flag(s) && !names.init_flags.count(s)) return false;
+    return true;
+}
+
+bool intersect(c_names const & a, c_names const & b) {
+    for (auto const & n : a) if (b.count(n)) return true;
+    return false;
+}
+}
+#endif
+
+extern "C" LEAN_EXPORT obj_res lean_paperlean_can_group_checked_c(b_obj_arg paths) {
+#ifdef PAPERLEAN_NATIVE_LIBS
+    grouped_names all;
+    for (size_t i = 0; i < lean_array_size(paths); ++i) {
+        grouped_names next;
+        if (!group_names(lean_string_cstr(lean_array_get_core(paths, i)), next) ||
+            intersect(next.local, all.references) || intersect(all.local, next.references) ||
+            intersect(next.definitions, all.definitions))
+            return io_result_mk_ok(lean_box(0));
+        all.references.insert(next.references.begin(), next.references.end());
+        all.local.insert(next.local.begin(), next.local.end());
+        all.definitions.insert(next.definitions.begin(), next.definitions.end());
+    }
+    return io_result_mk_ok(lean_box(1));
+#else
+    (void)paths;
+    return io_result_mk_ok(lean_box(0));
+#endif
+}
+
 /* cObjectNames (c : @& String) : IO (Array String × Array String × Array String)
    The names of the variables that the `.c` file `c` (`EmitC.lean`) declares as `extern lean_object*`,
    of those that it defines as `const lean_object*`, and of all variables that it defines with
@@ -1597,6 +1948,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_load_error(b_obj_arg olib) {
 extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oout, b_obj_arg olib, b_obj_arg odeps,
                                                                     b_obj_arg omodules, b_obj_arg oext) {
 #ifdef PAPERLEAN_NATIVE_LIBS
+    if (strlen(lean_string_cstr(oout)) + 1 != lean_string_size(oout)) return mk_embedded_nul_error(oout);
     std::string strings;
     auto add = [&](std::string const & x) {
         native_string r { strings.size(), x.size() };
@@ -1631,13 +1983,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oo
     };
     add_symbols(oext);
     for (size_t i = 0; i < lean_array_size(omodules); i++) add_symbols(symbols_of(lean_array_get_core(omodules, i)));
-    std::vector<std::unique_ptr<c_unit>> units;
-    for (size_t i = 0; i < lean_array_size(omodules); i++) {
-        char const * cfile = lean_string_cstr(lean_ctor_get(lean_array_get_core(omodules, i), 1));
-        units.emplace_back(new c_unit());
-        if (!read_c_unit(cfile, *units.back()))
-            return fail(std::string("cannot read the initializers of ") + cfile);
-    }
+    // Only the symbol set is shared between modules. Keep each unit's text alive through its
+    // analysis (the tables contain string_views into it), then release it before reading the next.
     for (size_t i = 0; i < lean_array_size(omodules); i++) {
         object * p = lean_array_get_core(omodules, i);
         object * n = lean_ctor_get(p, 0);
@@ -1646,8 +1993,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oo
         bool differs = lean_ctor_get_uint8(lean_ctor_get(p, 3), 4 * sizeof(void *));
         native_module m;
         memset(&m, 0, sizeof(m));
-        c_unit const & u = *units[i];
-        if (!c_init_flags(u, m.flags))
+        c_unit u;
+        if (!read_c_unit(cfile, u) || !c_init_flags(u, m.flags))
             return fail(std::string("cannot read the initializers of ") + cfile);
         if (meta_init_local(u)) m.flags |= native_meta_init_local;
         m.flags |= meta_code_flags(u, symbols_of(p), all);
@@ -1697,13 +2044,10 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_write_native_manifest(b_obj_arg oo
     body.append(reinterpret_cast<char const *>(deps.data()), deps.size() * sizeof(native_string));
     body += strings;
     hdr.common.checksum = native_checksum(hdr, body.data(), body.size());
-    std::string out = lean_string_cstr(oout);
-    std::string tmp = out + ".tmp";
-    FILE * f = fopen(tmp.c_str(), "wb");
-    if (!f) return fail("cannot write " + tmp);
-    bool ok = fwrite(&hdr, 1, sizeof(hdr), f) == sizeof(hdr) && fwrite(body.data(), 1, body.size(), f) == body.size();
-    ok = fclose(f) == 0 && ok;
-    if (!ok || rename(tmp.c_str(), out.c_str()) != 0) return fail("cannot write " + out);
+    side_file_output output(out_path);
+    if (!output.open(0666) || !output.write_bytes(&hdr, sizeof(hdr)) ||
+        !output.write_bytes(body.data(), body.size()) || !output.publish())
+        return fail("cannot write " + out_path);
     object * r = lean_mk_empty_array();
     for (std::string const & why : whys) r = lean_array_push(r, lean_mk_string(why.c_str()));
     return io_result_mk_ok(r);

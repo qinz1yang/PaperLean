@@ -58,20 +58,29 @@ def ScopedEntries.insert (scopedEntries : ScopedEntries β) (ns : Name) (b : β)
   | none    => { map := scopedEntries.map.insert ns <| ({} : PArray β).push b }
   | some bs => { map := scopedEntries.map.insert ns <| bs.push b }
 
-def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) := do
+/-- Fold imports in declaration order. Only global insertion varies for the builtin parser;
+the initial state, scoped entry conversion and finalization always use the descriptor. -/
+@[inline] def foldImported (descr : Descr α β σ) (as : Array (Array (Entry α))) (initial : δ)
+    (addGlobal : σ → δ → α → ImportM (σ × δ)) : ImportM (StateStack α β σ) := do
   let mut s ← descr.mkInitial
+  let mut extra := initial
   let mut scopedEntries : ScopedEntries β := {}
   for a in as do
     for e in a do
       match e with
       | Entry.global a =>
-        let b ← descr.ofOLeanEntry s a
-        s := descr.addEntry s b
+        let (next, extra') ← addGlobal s extra a
+        s := next
+        extra := extra'
       | Entry.scoped ns a =>
         let b ← descr.ofOLeanEntry s a
         scopedEntries := scopedEntries.insert ns b
   s := descr.finalizeImport s
   return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
+
+def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : ImportM (StateStack α β σ) :=
+  foldImported descr as () fun s _ a => do
+    return (descr.addEntry s (← descr.ofOLeanEntry s a), ())
 
 /-- PaperLean: `addImportedFn`, with the state of the global entries built faster, which is the
 function that extensions run on import. -/
@@ -139,12 +148,15 @@ structure ScopedEnvExtension (α : Type) (β : Type) (σ : Type) where
 
 builtin_initialize scopedEnvExtensionsRef : IO.Ref (Array (ScopedEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState)) ← IO.mkRef #[]
 
--- PaperLean: (not inlined: its body calls PaperLean's code)
-@[noinline] unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ) := do
+/-- Register a scoped extension with its import fold. The remaining registration fields are
+shared by the standard scoped extension and the builtin parser. -/
+@[macro_inline, expose] unsafe def _root_.Lean.PaperLean.registerScopedEnvExtensionWithImport
+    (descr : Descr α β σ) (addImported : Array (Array (Entry α)) → ImportM (StateStack α β σ)) :
+    IO (ScopedEnvExtension α β σ) := do
   let ext ← registerPersistentEnvExtension {
     name            := descr.name
     mkInitial       := mkInitial descr
-    addImportedFn   := PaperLean.addImportedFnFast descr
+    addImportedFn   := addImported
     addEntryFn      := addEntryFn descr
     exportEntriesFnEx := exportEntriesFn descr
     statsFn         := fun s => format "number of local entries: " ++ format s.newEntries.length
@@ -157,6 +169,10 @@ builtin_initialize scopedEnvExtensionsRef : IO.Ref (Array (ScopedEnvExtension En
   let ext := { descr := descr, ext := ext : ScopedEnvExtension α β σ }
   scopedEnvExtensionsRef.modify fun exts => exts.push (unsafeCast ext)
   return ext
+
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ) :=
+  PaperLean.registerScopedEnvExtensionWithImport descr (PaperLean.addImportedFnFast descr)
 
 @[implemented_by registerScopedEnvExtensionUnsafe]
 opaque registerScopedEnvExtension (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ)

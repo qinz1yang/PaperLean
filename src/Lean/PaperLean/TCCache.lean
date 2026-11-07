@@ -9,6 +9,7 @@ public import Lean.Meta.Basic
 public import Lean.Meta.AbstractMVars
 public import Lean.Meta.Instances
 public import Lean.PaperLean.EnvDeps
+import all Lean.PaperLean.EnvDeps
 public import Lean.PaperLean.Speculation
 import Init.While
 import all Init.System.CancelToken
@@ -460,22 +461,141 @@ inductive Stored where
   recorded. -/
   | cheap
 
-/-- What is kept of the searches, by problem. -/
-private abbrev Entries := PersistentHashMap Key (Array Stored)
+/-- Counts of retained records and a weighted reference-slot charge, not transitive heap bytes:
+expressions and check closures can share or retain larger graphs. The limits bound this charge; the byte
+benefit and the cost of counting permanent-cache entries require workload measurements. -/
+private structure RetentionCount where
+  keys : Nat := 0
+  pending : Nat := 0
+  entries : Nat := 0
+  cheap : Nat := 0
+  slots : Nat := 0
+  operations : Nat := 0
 
-/-- The entries (`empty` if none were put yet), out of the native store where they are kept
-(`speculation.cpp`), which leaves it taken; none if it is taken, which turns reuse off. Unlike the
-value of a global reference, which is marked multi-threaded, the entries and the objects that they
-share with Lean's caches and terms are not, nor is the map, which an insertion then changes in place:
-one thread at a time uses them (`getEntries?`). -/
+private def RetentionCount.add (a b : RetentionCount) : RetentionCount :=
+  ⟨a.keys + b.keys, a.pending + b.pending, a.entries + b.entries, a.cheap + b.cheap,
+   a.slots + b.slots, a.operations + b.operations⟩
+
+private def RetentionCount.sub (a b : RetentionCount) : RetentionCount :=
+  ⟨a.keys - b.keys, a.pending - b.pending, a.entries - b.entries, a.cheap - b.cheap,
+   a.slots - b.slots, a.operations - b.operations⟩
+
+/-- Per-generation bounds. Two generations retain at most twice either limit. The overrides and
+unbounded switch are for comparing the same executable; they do not change recording admission
+or the 1024-heartbeat default. -/
+private builtin_initialize retentionKeys : Nat ←
+  return ((← IO.getEnv "PAPERLEAN_TC_CACHE_KEYS").bind String.toNat?).getD 4096
+private builtin_initialize retentionSlots : Nat ←
+  return ((← IO.getEnv "PAPERLEAN_TC_CACHE_SLOTS").bind String.toNat?).getD 524288
+private builtin_initialize retentionUnbounded : Bool ←
+  return (← IO.getEnv "PAPERLEAN_TC_CACHE_UNBOUNDED").isSome
+private builtin_initialize retentionDiagnostics : Bool ←
+  return (← IO.getEnv "PAPERLEAN_REUSE_STATS").isSome
+
+private def retainedCount (key : Key) (stored : Array Stored) : RetentionCount := Id.run do
+  let keySlots (k : Key) := 1 + 2 * k.decls.size + 2 * k.mvars.size + k.lmvars.size + k.localInsts.size
+  let mut n : RetentionCount := { keys := 1, slots := keySlots key }
+  let resultSlots (r : Option AbstractMVarsResult) :=
+    r.map (fun r => 1 + r.mvars.size + r.paramNames.size) |>.getD 0
+  for s in stored do
+    match s with
+    | .cheap => n := { n with cheap := n.cheap + 1, slots := n.slots + 1 }
+    | .pending p =>
+      -- Only a failed search that emptied the permanent cache retained a map.
+      let perm := if p.result.isSome || !p.emptiedPerm then 0 else
+        p.perm.foldl (fun n _ _ => n + 1) 0
+      let ops := if retentionDiagnostics then
+          p.raw.accesses.foldl (fun n a => if a matches .cache .. then n + 1 else n) 0
+        else 0
+      n := { n with
+        pending := n.pending + 1
+        slots := n.slots + 1 + keySlots p.key + p.fvars.size + resultSlots p.result +
+          3 * p.raw.accesses.size + p.raw.checks.size + 2 * perm
+        operations := n.operations + ops }
+    | .entry e =>
+      n := { n with
+        entries := n.entries + 1
+        slots := n.slots + 1 + keySlots e.key + resultSlots e.result + 3 * e.deps.accesses.size + e.deps.checks.size +
+          3 * e.deps.cacheOps.size + 3 * e.ops.size + 2 * e.defEq.perm.size
+        operations := n.operations + e.ops.size }
+  return n
+
+private structure Retained where
+  stored : Array Stored
+  count : RetentionCount
+  /-- Lookup clock at the last replacement; used only with reuse statistics enabled. -/
+  born : Nat
+
+private abbrev EntryMap := PersistentHashMap Key Retained
+
+/-- Recently inserted/looked-up keys and the preceding generation. A lookup promotes an older key;
+when the recent generation fills, the older one is discarded and the recent one becomes older.
+There is no growing FIFO of stale key references. Hits in the recent generation do not rewrite its
+map. Eviction only loses an optimization opportunity: the ordinary search remains the fallback. -/
+private structure Entries where
+  recent : EntryMap := {}
+  older : EntryMap := {}
+  recentCount : RetentionCount := {}
+  olderCount : RetentionCount := {}
+  clock : Nat := 0
+  keyHits : Nat := 0
+  ageSum : Nat := 0
+  ageMax : Nat := 0
+  evictedKeys : Nat := 0
+  oversized : Nat := 0
+  peakKeys : Nat := 0
+  peakSlots : Nat := 0
+
+private def Entries.erase (s : Entries) (key : Key) : Entries := Id.run do
+  let mut s := s
+  if let some r := s.recent.find? key then
+    s := { s with recent := s.recent.erase key, recentCount := s.recentCount.sub r.count }
+  if let some r := s.older.find? key then
+    s := { s with older := s.older.erase key, olderCount := s.olderCount.sub r.count }
+  return s
+
+private def Entries.insertRetained (s : Entries) (key : Key) (r : Retained) : Entries := Id.run do
+  let mut s := s.erase key
+  if !retentionUnbounded && (retentionKeys == 0 || r.count.slots > retentionSlots) then
+    return { s with oversized := s.oversized + 1 }
+  if !retentionUnbounded &&
+      (s.recentCount.keys + 1 > retentionKeys || s.recentCount.slots + r.count.slots > retentionSlots) then
+    s := { s with
+      older := s.recent, olderCount := s.recentCount, recent := {}, recentCount := {}
+      evictedKeys := s.evictedKeys + s.olderCount.keys }
+  s := { s with recent := s.recent.insert key r, recentCount := s.recentCount.add r.count }
+  return { s with
+    peakKeys := max s.peakKeys (s.recentCount.keys + s.olderCount.keys)
+    peakSlots := max s.peakSlots (s.recentCount.slots + s.olderCount.slots) }
+
+private def Entries.insert (s : Entries) (key : Key) (stored : Array Stored) : Entries :=
+  if stored.isEmpty then s.erase key else
+    s.insertRetained key ⟨stored, retainedCount key stored, s.clock⟩
+
+private def Entries.find (s : Entries) (key : Key) : (Key × Array Stored) × Entries := Id.run do
+  let mut s := if retentionDiagnostics then { s with clock := s.clock + 1 } else s
+  let found := match s.recent.findEntry? key with
+    | some r => some (r, false)
+    | none => s.older.findEntry? key |>.map (·, true)
+  let some ((key, r), promote) := found | return ((key, #[]), s)
+  if retentionDiagnostics then
+    let age := s.clock - r.born
+    s := { s with keyHits := s.keyHits + 1, ageSum := s.ageSum + age, ageMax := max s.ageMax age }
+  if promote then s := s.insertRetained key r
+  return ((key, r.stored), s)
+
+/-- The entries (`empty` if none were put yet), out of the native store where they are kept,
+which leaves it taken; none if it is taken, which turns reuse off. Unlike a global reference,
+the entries and the objects they share with Lean's caches and terms are not marked multi-threaded.
+The private retention store uses the same opaque native slot, without a serialized layout change. -/
 @[extern "lean_paperlean_take_store"]
 private opaque takeEntries (slot : UInt8) (empty : Entries) : BaseIO (Option Entries)
-
 /-- Puts `m` into the native store of the entries, which `takeEntries` left taken. -/
 @[extern "lean_paperlean_put_store"]
 private opaque putEntries (slot : UInt8) (m : Entries) : BaseIO Unit
 
-/-- The entries, which stay in the store while the caller uses them; none if it is taken.
+/-- Only the selected records escape this call, so a running search does not retain a snapshot of
+both complete generations while nested searches rotate or replace the store.
 
 One thread at a time uses the stores of reuse (also `SectionVars.takeEntries`) and their objects,
 which are not marked multi-threaded, so a use needs to hold no store. Only threads on which
@@ -488,14 +608,24 @@ waits for a task does not run another one; what a thread hands to another (a tas
 promise's value, a reference's value) is marked multi-threaded first, by that thread. The take and
 the put of the store also see a second thread at once, which would be a defect, and turn reuse
 off. -/
-private def getEntries? : BaseIO (Option Entries) := do
-  let some m ← takeEntries 0 {} | return none
-  putEntries 0 m
-  return some m
+private def getStored? (key : Key) : BaseIO (Option (Key × Array Stored)) := do
+  let some s ← takeEntries 0 {} | return none
+  let (found, s) := s.find key
+  putEntries 0 s
+  return some found
 
 private def modifyEntries (f : Entries → Entries) : BaseIO Unit := do
-  if let some m ← takeEntries 0 {} then
-    putEntries 0 (f m)
+  if let some s ← takeEntries 0 {} then putEntries 0 (f s)
+
+private def retentionReport : BaseIO String := do
+  let some s ← takeEntries 0 {} | return "retention unavailable"
+  let n := s.recentCount.add s.olderCount
+  let report := s!"retention keys={n.keys} pending={n.pending} entries={n.entries} cheap={n.cheap} \
+    slots={n.slots} operations={n.operations} peakKeys={s.peakKeys} peakSlots={s.peakSlots} \
+    evictedKeys={s.evictedKeys} oversized={s.oversized} keyHits={s.keyHits} \
+    hitAgeSum={s.ageSum} hitAgeMax={s.ageMax}"
+  putEntries 0 s
+  return report
 
 /-- Reused, searched (cache missed), and searched because an entry's dependencies did not hold. -/
 private builtin_initialize statsRef : IO.Ref (Nat × Nat × Nat) ← IO.mkRef (0, 0, 0)
@@ -509,8 +639,10 @@ def stats : BaseIO (Nat × Nat × Nat) := statsRef.get
 
 /-- Why searches of this process were not kept, entries not reused, or searches left out
 (`Speculation.Reasons.render`). -/
-def reasons : BaseIO (List String) :=
-  return (← reasonsRef.render) ++ (← Speculation.renderExclusions true)
+def reasons : BaseIO (List String) := do
+  let reasons := (← reasonsRef.render) ++ (← Speculation.renderExclusions true)
+  if retentionDiagnostics then return reasons ++ [← retentionReport]
+  return reasons
 
 /-- The position of `ref` in the file, as `line:column`. -/
 def posOf (fileMap : FileMap) (ref : Syntax) : String :=
@@ -573,6 +705,7 @@ private structure RawCanon where
   lmvars : Array LMVarId := #[]
   lmvarNums : Std.HashMap LMVarId Nat := {}
   cache : Std.HashMap USize Expr := {}
+  levelCache : Std.HashMap USize Level := {}
 
 /-- The monad of `canonRaw`, which fails with the exclusion of the problem
 (`Speculation.Exclusion`). -/
@@ -580,21 +713,25 @@ private abbrev KeyM := StateT RawCanon (Except Speculation.Exclusion)
 
 /-- The universe level `u` of a problem's context with its assigned universe metavariables replaced
 by their numbers (`RawCanon.lmvars`), if each is assigned a level without metavariables. -/
-private def canonRawLevel (mctx : MetavarContext) (u : Level) : KeyM Level :=
-  if !u.hasMVar then pure u else
-  match u with
-  | .mvar id => do
-    let some v := mctx.lAssignment.find? id | throw 4
-    if v.hasMVar then throw 4
-    let s ← get
-    let i := s.lmvarNums.getD id s.lmvars.size
-    if i == s.lmvars.size then
-      set { s with lmvars := s.lmvars.push id, lmvarNums := s.lmvarNums.insert id i }
-    return .mvar ⟨.num `_paperlean_lmv i⟩
-  | .succ v => return u.updateSucc! (← canonRawLevel mctx v)
-  | .max a b => return u.updateMax! (← canonRawLevel mctx a) (← canonRawLevel mctx b)
-  | .imax a b => return u.updateIMax! (← canonRawLevel mctx a) (← canonRawLevel mctx b)
-  | _ => pure u
+private unsafe def canonRawLevel (mctx : MetavarContext) (u : Level) : KeyM Level := do
+  if !u.hasMVar then return u
+  let key := ptrAddrUnsafe u
+  if let some r := (← get).levelCache[key]? then return r
+  let r ← match u with
+    | .mvar id => do
+      let some v := mctx.lAssignment.find? id | throw 4
+      if v.hasMVar then throw 4
+      let s ← get
+      let i := s.lmvarNums.getD id s.lmvars.size
+      if i == s.lmvars.size then
+        set { s with lmvars := s.lmvars.push id, lmvarNums := s.lmvarNums.insert id i }
+      pure <| .mvar ⟨.num `_paperlean_lmv i⟩
+    | .succ v => pure (u.updateSucc! (← canonRawLevel mctx v))
+    | .max a b => pure (u.updateMax! (← canonRawLevel mctx a) (← canonRawLevel mctx b))
+    | .imax a b => pure (u.updateIMax! (← canonRawLevel mctx a) (← canonRawLevel mctx b))
+    | _ => pure u
+  modify fun s => { s with levelCache := s.levelCache.insert key r }
+  return r
 
 /-- `e`, a type or value of a problem's context as it is, with the free variables `num` replaced by
 their numbers and its assigned metavariables and universe metavariables by their numbers
@@ -823,6 +960,23 @@ private def madeBy (ngen0 : NameGenerator) (idx1 : Nat) : Name → Bool
   | .str p _ => madeBy ngen0 idx1 p
   | .anonymous => false
 
+private unsafe def levelMentionsImpl (p : Name → Bool) (u : Level) : Bool := Id.run do
+  let mut todo := #[u]
+  let mut seen : Std.HashSet USize := {}
+  while let some l := todo.back? do
+    todo := todo.pop
+    if !l.hasMVar then continue
+    let key := ptrAddrUnsafe l
+    if seen.contains key then continue
+    seen := seen.insert key
+    match l with
+    | .mvar id => if p id.name then return true
+    | .succ v => todo := todo.push v
+    | .max a b | .imax a b => todo := todo.push b |>.push a
+    | _ => pure ()
+  return false
+
+@[implemented_by levelMentionsImpl]
 private partial def levelMentions (p : Name → Bool) : Level → Bool
   | .mvar id => p id.name
   | .succ u => levelMentions p u
@@ -937,24 +1091,46 @@ private unsafe def appTypeKey (env : Environment) (c : UInt8) (k : NonScalar) : 
 private unsafe def pureKey (env : Environment) (c : UInt8) (k : NonScalar) : Bool :=
   realizedKey env c k || constTypeKey env c k || appTypeKey env c k
 
-/-- `ops` (kept operations) with the index of the insertion that ends each `pureLookup` that found
-none, if the operations up to it are on pure keys only (and none is a lookup of the same key). -/
+/-- The exact equivalence used by `sameKey`, with the cache discriminator. Other cache-key
+fields deliberately do not participate: `sameKey` compares only these expressions, with `Expr.equal`
+(including binder names and annotations), even when the ordinary cache key compares more fields. -/
+private structure OpIndexKey where
+  cache : UInt8
+  exprs : Array Expr
+
+private local instance : BEq OpIndexKey where
+  beq a b := a.cache == b.cache && a.exprs.size == b.exprs.size &&
+    (a.exprs.zip b.exprs).all fun (x, y) => x.equal y
+
+private local instance : Hashable OpIndexKey where
+  hash k := k.exprs.foldl (fun h e => mixHash h (hash e)) (hash k.cache)
+
+/-- `ops` with the insertion ending each pure miss. Scan backwards, remembering the next insertion
+per exact key. A same-key lookup removes its candidate. An ordinary lookup clears every candidate;
+an impure insertion clears them too, but is itself a candidate (the forward scan tests equality
+before purity). Each operation is classified once. Hash collisions still use exact expression
+comparison, so the expected linear table work does not assume collision-free hashes. -/
 private unsafe def withInsertAt (env : Environment) (ops : Array CacheOp) : Array CacheOp :=
     Id.run do
+  unless ops.any (· matches .pureLookup _ _ none _) do return ops
   let mut out := ops
-  for h : i in [0:ops.size] do
-    let .pureLookup c k none _ := ops[i] | continue
-    let mut j := i + 1
-    while h' : j < ops.size do
-      match ops[j] with
-      | .insert c' k' _ =>
-        if c' == c && sameKey c k' k then
+  let mut next : Std.HashMap OpIndexKey Nat := {}
+  let mut i := ops.size
+  while i > 0 do
+    i := i - 1
+    let some op := ops[i]? | break
+    match op with
+    | .insert c k _ =>
+      let key : OpIndexKey := ⟨c, keyExprs c k⟩
+      unless pureKey env c k do next := {}
+      next := next.insert key i
+    | .pureLookup c k found? _ =>
+      let key : OpIndexKey := ⟨c, keyExprs c k⟩
+      if found?.isNone then
+        if let some j := next[key]? then
           out := out.set! i (.pureLookup c k none (some j))
-          break
-        unless pureKey env c' k' do break
-      | .pureLookup c' k' .. => if c' == c && sameKey c k' k then break
-      | .lookup .. => break
-      j := j + 1
+      next := next.erase key
+    | .lookup .. => next := {}
   return out
 
 /-- Whether an expression mentions a name that the search made (`made`), and whether it mentions a
@@ -1445,11 +1621,10 @@ def withCache (localInsts : LocalInstances) (type : Expr) (maxResultSize : Nat)
       setHeartbeats heartbeats
       return (← search)
   -- (an update of the key's entries inserts the key found, which compares with it at once)
-  let some all ← getEntries? |
+  let some (key0, stored) ← getStored? key |
     noteExcluded 0
     setHeartbeats heartbeats
     return (← search)
-  let (key0, stored) := (all.findEntry? key).getD (key, #[])
   let entries ← finished env key0 stored
   let ns ← getCurrNamespace
   let openDecls ← getOpenDecls

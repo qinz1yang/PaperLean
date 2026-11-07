@@ -506,7 +506,8 @@ private def close (ch : Bounded α) : EIO Error Unit := do
     let st ← get
     if st.closed then throw .alreadyClosed
     for consumer in st.consumers.toArray do consumer.resolve false
-    set { st with consumers := ∅, closed := true }
+    for producer in st.producers.toArray do producer.resolve false
+    set { st with consumers := ∅, producers := ∅, closed := true }
     return ()
 
 private def isClosed (ch : Bounded α) : BaseIO Bool :=

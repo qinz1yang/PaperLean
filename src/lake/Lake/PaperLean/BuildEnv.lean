@@ -16,22 +16,49 @@ the request to reuse results (`PAPERLEAN_REUSE`, `Lean.PaperLean.Speculation.reu
 
 namespace Lake.PaperLean.BuildEnv
 
-private builtin_initialize packsRef : IO.Ref (Array String) ← IO.mkRef #[]
+/-- Packs published to children of a single build. -/
+public abbrev PackList := IO.Ref (Array String)
 
-/-- Records the pack `pack`, written during this build or for its toolchain. -/
-public def addPack (pack : String) : BaseIO Unit :=
-  packsRef.modify (·.push pack)
+private initialize standalone : IO.Ref PackList ← IO.mkRef (← IO.mkRef #[])
 
-/-- Forgets the packs, at the end of the build. -/
-public def clear : BaseIO Unit :=
-  packsRef.set #[]
+public def standalonePacks : BaseIO PackList := standalone.get
 
-/-- The environment for a `lean` process that the build starts: the packs written so far, and under a
-`paperlean` command (`accelerated`) the request to reuse results. -/
-public def leanEnv : BaseIO (Array (String × Option String)) := do
-  let packs ← packsRef.get
+/-- New standalone jobs cannot inherit a retiring session's pack list. -/
+public def renewStandalone : BaseIO Unit := do
+  standalone.set (← IO.mkRef #[])
+private initialize live : IO.Ref (List (PackList × Bool)) ← IO.mkRef []
+
+/-- Register an empty pack list before this run starts any compiler children. -/
+public def enter (enabled : Bool) : BaseIO PackList := do
+  let packs ← IO.mkRef #[]
+  live.modify ((packs, enabled) :: ·)
+  return packs
+
+public def leave (packs : PackList) : BaseIO Unit :=
+  live.modify fun xs => xs.eraseP fun (p, _) => unsafe ptrEq packs p
+
+/-- Context-free callers use the sole enabled build, or a standalone list outside builds. -/
+private def selected? : BaseIO (Option PackList) := do
+  match ← live.get with
+  | [] => return some (← standalonePacks)
+  | [(packs, true)] => return some packs
+  | _ => return none
+
+public def addPack (pack : String) : BaseIO Unit := do
+  if let some packs ← selected? then packs.modify (·.push pack)
+
+public def clear : BaseIO Unit := do
+  if let some packs ← selected? then packs.set #[]
+
+public def makeEnv (packs? : Option PackList) : BaseIO (Array (String × Option String)) := do
   let env := if (← accelerated) then #[("PAPERLEAN_REUSE", some "1")] else #[]
-  if packs.isEmpty then return env
-  return env.push ("LEAN_OLEAN_PACK", some (String.intercalate ":" packs.toList))
+  let some packs := packs? | return env
+  let paths ← packs.get
+  if paths.isEmpty then return env
+  return env.push ("LEAN_OLEAN_PACK", some (String.intercalate ":" paths.toList))
+
+/-- Environment for a standalone caller, or for the only active workspace build. -/
+public def leanEnv : BaseIO (Array (String × Option String)) := do
+  makeEnv (← selected?)
 
 end Lake.PaperLean.BuildEnv

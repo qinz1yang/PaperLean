@@ -31,10 +31,15 @@ structure Options where
   blockSigProfSignal : Bool := False
 
 /--
-Configures the event loop with the specified options.
+Applies the requested loop options on a best-effort basis. Use `configureChecked` to
+receive an error when the platform cannot apply an option.
 -/
 @[extern "lean_uv_event_loop_configure"]
 opaque configure (options : Options) : BaseIO Unit
+
+/-- Applies the requested event loop options and reports configuration errors. -/
+@[extern "lean_uv_event_loop_configure_checked"]
+opaque configureChecked (options : @& Options) : IO Unit
 
 /--
 Checks if the event loop is still active and processing events.

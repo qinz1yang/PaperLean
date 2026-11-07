@@ -19,7 +19,7 @@ namespace lean {
 namespace {
 class mvars_instantiated_fn {
     b_obj_arg m_mctx;
-    // the shared subterms visited, open addressing
+    // Pointers to shared expression and universe nodes visited in this input DAG.
     std::vector<lean_object *> m_seen;
     size_t m_count = 0;
 
@@ -61,6 +61,7 @@ class mvars_instantiated_fn {
     }
     bool visit_level(level const & l) {
         if (!has_mvar(l)) return true;
+        if (is_shared(l) && seen(l.raw())) return true;
         switch (l.kind()) {
         case level_kind::Succ: return visit_level(succ_of(l));
         case level_kind::Max: case level_kind::IMax: return visit_level(level_lhs(l)) && visit_level(level_rhs(l));

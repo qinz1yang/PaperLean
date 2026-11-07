@@ -20,6 +20,14 @@ namespace lean {
 struct env_recorder {
     std::vector<object *> m_accesses;
     std::vector<object *> m_checks;
+    // The payload is useful only until the first invalidation; the frame and reasons remain live
+    // for nesting, pauses and diagnostics even after the payload has been discarded.
+    void discard_payload() {
+        for (object * access : m_accesses) lean_dec(access);
+        for (object * check : m_checks) lean_dec(check);
+        std::vector<object *>().swap(m_accesses);
+        std::vector<object *>().swap(m_checks);
+    }
     // why the recording is unusable, if it is
     char const * m_unusable = nullptr;
     // the other reasons, distinct, for debugging (`PAPERLEAN_DEBUG_REUSE`)
@@ -67,7 +75,8 @@ extern "C" LEAN_EXPORT uint8 lean_paperlean_env_recording(b_obj_arg) {
 
 /* record (access check : NonScalar) (r : α) : α -- records `access` and its `check`, returns `r` */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_env_record(obj_arg access, obj_arg check, obj_arg r) {
-    if (env_recorder * rec = current_env_recorder()) {
+    env_recorder * rec = current_env_recorder();
+    if (rec && !rec->m_unusable) {
         rec->m_accesses.push_back(access);
         rec->m_checks.push_back(check);
     } else {
@@ -89,6 +98,7 @@ static constexpr size_t g_max_more_reasons = 16;
 static void add_reason(env_recorder * rec, char const * why) {
     if (!rec->m_unusable) {
         lean_paperlean_env_became_unusable(&rec->m_unusable, why);
+        rec->discard_payload();
         return;
     }
     if (rec->m_more_reasons.size() >= g_max_more_reasons || strcmp(rec->m_unusable, why) == 0)
@@ -136,7 +146,8 @@ extern "C" LEAN_EXPORT void lean_paperlean_env_note_task() {
 /* recordAll (accesses : @& Array EnvAccess) (checks : @& Array NonScalar) : BaseIO Unit -- records the
    accesses of an earlier recording, e.g. of a result reused within this one */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_env_record_all(b_obj_arg accesses, b_obj_arg checks) {
-    if (env_recorder * rec = current_env_recorder()) {
+    env_recorder * rec = current_env_recorder();
+    if (rec && !rec->m_unusable) {
         size_t n = lean_array_size(accesses);
         for (size_t i = 0; i < n; i++) {
             object * a = lean_array_get_core(accesses, i);
@@ -170,14 +181,16 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_env_stop_recording() {
     // one read
     if (!t_env_recorders->empty()) {
         if (env_recorder * below = t_env_recorders->back()) {
-            for (size_t i = 0; i < rec->m_accesses.size(); i++) {
-                lean_inc(rec->m_accesses[i]);
-                lean_inc(rec->m_checks[i]);
-                below->m_accesses.push_back(rec->m_accesses[i]);
-                below->m_checks.push_back(rec->m_checks[i]);
-            }
             if (rec->m_unusable) add_reason(below, rec->m_unusable);
             for (char const * r : rec->m_more_reasons) add_reason(below, r);
+            if (!below->m_unusable) {
+                for (size_t i = 0; i < rec->m_accesses.size(); i++) {
+                    lean_inc(rec->m_accesses[i]);
+                    lean_inc(rec->m_checks[i]);
+                    below->m_accesses.push_back(rec->m_accesses[i]);
+                    below->m_checks.push_back(rec->m_checks[i]);
+                }
+            }
         }
     }
     object * accesses = lean_alloc_array(rec->m_accesses.size(), rec->m_accesses.size());

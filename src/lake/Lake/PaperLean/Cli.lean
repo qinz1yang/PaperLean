@@ -123,9 +123,13 @@ def dataUse (ws : Workspace) : IO String := do
       let ignored ← packs.filterMapM fun p => do
         let why ← Lean.PaperLean.OLeanPack.whyIgnored p.toString
         return if why.isEmpty then none else some s!"{p}: {why}"
+      let native ← d.libs.filterM (nativeEntryUsable d.cache)
+      let image ← importImageUsable (dataDir ws.dir) d.image?
+      let damaged := native.size < d.native.size || (d.image?.isSome && !image)
       let some first := ignored[0]?
-        | return s!"used: {packs.size} pack(s){if d.image?.isSome then ", an import image" else ""}\
-            {if d.native.isEmpty then "" else s!", {d.native.size} native libraries"}"
+        | return s!"used: {packs.size} pack(s){if image then ", an import image" else ""}\
+            {if native.isEmpty then "" else s!", {native.size} native libraries"}\
+            {if damaged then "; native data is missing or unusable; run `paperlean prepare`" else ""}"
       let more := if ignored.size > 1 then s!" (and {ignored.size - 1} more)" else ""
       if ignored.size == packs.size then return s!"not used: {first}{more}; run `paperlean prepare`"
       return s!"used in part: {packs.size - ignored.size} of {packs.size} pack(s), but not {first}{more}; \
@@ -247,8 +251,12 @@ def packStatus (ws : Workspace) (d : PreparedData) (p : PreparedPackage) : IO St
     | some l =>
       if l.entry.isEmpty then pure "" else
       let name := (l.entry.splitOn "/").getLast!
-      if ← ((d.cache : FilePath) / l.manifest).pathExists then pure s!", native library {name}"
-      else pure s!", its native library {name} is missing from the cache; run `paperlean prepare`"
+      if ← nativeEntryUsable d.cache l then pure s!", native library {name}"
+      else
+        let missing := !(← ((d.cache : FilePath) / l.manifest).pathExists) ||
+          !(← ((d.cache : FilePath) / l.lib).pathExists)
+        pure s!", its native library {name} is {if missing then "missing from" else "unusable in"} the cache; \
+          run `paperlean prepare`"
     | none => pure ""
   return pack ++ native
 
@@ -266,7 +274,12 @@ def status (ws : Workspace) (verify := false) : IO UInt32 := do
     if let some t := d.toolchain? then
       let why ← Lean.PaperLean.OLeanPack.whyIgnored ((d.cache : FilePath) / t).toString
       IO.println s!"  Lean's library: {if why.isEmpty then "packed" else s!"its pack is not used ({why})"}"
+    let unavailable ← d.libs.filterM fun l => do
+      return l.modules > 0 && !(← nativeEntryUsable d.cache l)
     for line in ← currentSummary ws d.libs d.summary do
+      let line := match unavailable.find? (fun l => line.startsWith s!"{l.pkg}: ") with
+        | some l => s!"{l.pkg}: unavailable (its cache entry is missing or unusable; run `paperlean prepare`)"
+        | none => line
       IO.println s!"  native library of {line}"
     for l in ← d.libs.mapM (statusFindings ws d) do
       for (m, why) in l.interpreted do
@@ -307,7 +320,7 @@ def status (ws : Workspace) (verify := false) : IO UInt32 := do
             | "" => pure ", verified"
             | why => pure s!", not usable: {why}"
           | true, "image" =>
-            match ← Lean.PaperLean.OLeanPack.verifyImportImage f with
+            match ← verifyImportImage file with
             | "" => pure ", verified"
             | why => pure s!", not usable: {why}"
           | _, _ => pure ""

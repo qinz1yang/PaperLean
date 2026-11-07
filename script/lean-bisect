@@ -702,9 +702,9 @@ def bisect_commits(
             info("CI artifact download available (will try before building from source)")
         else:
             if not build_artifact.check_gh_available():
-                warn("gh CLI not available or not authenticated; will build from source")
+                warn("gh CLI not available or not authenticated; using cached artifacts or source builds")
             elif not build_artifact.check_zstd_support():
-                warn("tar does not support zstd; will build from source")
+                warn("tar does not support zstd; using cached artifacts or source builds")
             elif build_artifact.get_artifact_name() is None:
                 warn("No CI artifacts available for this platform; will build from source")
         print()
@@ -716,13 +716,11 @@ def bisect_commits(
             Returns toolchain path or None if unavailable.
             """
             # Try CI artifact first (unless we know there isn't one)
+            if sha not in no_artifact and build_artifact.is_cached(sha):
+                print(f"  Checking {sha[:12]}... " + color("cached", Colors.GREEN))
+                return build_artifact.get_cache_path(sha)
             if use_artifacts and sha not in no_artifact:
                 print(f"  Checking {sha[:12]}... ", end='', flush=True)
-
-                # Check if already cached
-                if build_artifact.is_cached(sha):
-                    print(color("cached", Colors.GREEN))
-                    return build_artifact.get_cache_path(sha)
 
                 artifact_result = build_artifact.download_ci_artifact(sha)
                 if artifact_result is CI_FAILED:
@@ -1109,12 +1107,7 @@ Examples:
 
     # Handle cache clearing
     if args.clear_cache:
-        if ARTIFACT_CACHE.exists():
-            size = sum(f.stat().st_size for f in ARTIFACT_CACHE.rglob('*') if f.is_file())
-            shutil.rmtree(ARTIFACT_CACHE)
-            info(f"Cleared cache at {ARTIFACT_CACHE} ({size / 1024 / 1024:.1f} MB)")
-        else:
-            info(f"Cache directory does not exist: {ARTIFACT_CACHE}")
+        build_artifact.clear_cache()
         return
 
     # Handle selftest

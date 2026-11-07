@@ -40,7 +40,7 @@ public def dataDir (wsDir : FilePath) : FilePath := wsDir / ".lake" / "paperlean
 public def dataVars : Array String := #["LEAN_OLEAN_PACK", "LEAN_IMPORT_IMAGE", "PAPERLEAN_NATIVE_LIBS"]
 
 /-- The format of `env.json`. -/
-public def dataFormat : Nat := 3
+public def dataFormat : Nat := 8
 
 /-- A dependency package's pack: an entry of the cache, and the workspace's binding of it. -/
 public structure PreparedPackage where
@@ -243,16 +243,6 @@ public def removePath (p : FilePath) : IO Unit := do
   let .ok md ← p.symlinkMetadata.toBaseIO | return
   if md.type == .dir then IO.FS.removeDirAll p else IO.FS.removeFile p
 
-/-- Writes `text` to the side file `file`, replacing what only damage puts there: a directory or a FIFO,
-on which a write would fail or wait for ever, and a file that cannot be written. Whether it did. -/
-public def writeSideFile (file : FilePath) (text : String) : BaseIO Bool := do
-  let write : IO Unit := do
-    if let .ok md ← file.metadata.toBaseIO then
-      unless md.type == .file do removePath file
-    IO.FS.writeFile file text
-  if (← write.toBaseIO) matches .ok _ then return true
-  return (← (do removePath file; IO.FS.writeFile file text : IO Unit).toBaseIO) matches .ok _
-
 /-- Makes `d` the `env.json` of the data directory `dir`, replacing the one there whatever it is:
 written to a temporary file and renamed into place, so that readers see either. -/
 public def PreparedData.install (d : PreparedData) (dir : FilePath) : IO Unit := do
@@ -269,14 +259,69 @@ public def availableSpace (dir : FilePath) : IO Nat := do
   | some n => return n
   | none => Lean.PaperLean.freeSpace dir.toString
 
-/-- Removes the temporary files `<file>.tmp.<pid>` of writers of `file` whose process ended. -/
+/-- Distinguishes immutable resources of overlapping runs in the same process. -/
+public def freshGeneration : BaseIO Nat := Lean.PaperLean.nextFileGeneration
+
+-- The handle's scope ends before its caller may rename or remove the temporary.
+private def fillNew (file : FilePath) (write : IO.FS.Handle → IO Unit) :
+    IO (Option (Except IO.Error Unit)) := do
+  let h ← try IO.FS.Handle.mk file .writeNew catch
+    | .alreadyExists .. => return none
+    | err => throw err
+  return some (← (do write h; h.flush).toBaseIO)
+
+/-- Write a new file exclusively. A collision leaves the existing file alone; a failed
+write removes only the file created by this invocation. -/
+public def writeNewFile (file : FilePath) (write : IO.FS.Handle → IO Unit) : IO Bool := do
+  let some written ← fillNew file write | return false
+  if let .error err := written then
+    discard <| (IO.FS.removeFile file).toBaseIO
+    throw err
+  return true
+
+private partial def writeSibling (file : FilePath) (pid : UInt32) (write : IO.FS.Handle → IO Unit) :
+    IO FilePath := do
+  let tmp := file.addExtension s!"tmp.{pid}-{← freshGeneration}"
+  if ← writeNewFile tmp write then return tmp
+  writeSibling file pid write
+
+/-- Atomically replace a file after its new contents have been flushed and closed. The
+optional directory repair applies only to a real directory at the destination. -/
+public def publishFile (file : FilePath) (write : IO.FS.Handle → IO Unit) (replaceDir := false) :
+    IO Unit := do
+  let tmp ← writeSibling file (← IO.Process.getPID) write
+  let move : IO Unit := do
+    try IO.FS.rename tmp file catch err =>
+      unless replaceDir do throw err
+      if let .ok md ← file.symlinkMetadata.toBaseIO then
+        if md.type == .dir then discard <| (IO.FS.removeDirAll file).toBaseIO
+      -- A concurrent publisher may already have removed the directory.
+      IO.FS.rename tmp file
+  if let .error err ← move.toBaseIO then
+    discard <| (IO.FS.removeFile tmp).toBaseIO
+    throw err
+
+/-- Publish a complete side file, replacing a damaged directory when possible. -/
+public def writeSideFile (file : FilePath) (text : String) : BaseIO Bool := do
+  return (← (publishFile file (·.putStr text) (replaceDir := true)).toBaseIO).isOk
+
+/-- The PID in a legacy PID-only name or a current PID-generation name. -/
+public def writerPid? (name : String) : Option UInt32 := do
+  let pid ← match name.split '-' |>.toStringList with
+    | [pid] => pid.toNat?
+    | [pid, gen] => gen.toNat? *> pid.toNat?
+    | _ => none
+  guard (pid > 0 && pid ≤ UInt32.size - 1)
+  return pid.toUInt32
+
+/-- Removes this file’s abandoned temporary writers (including pre-generation names). -/
 public def removeStaleTemps (file : FilePath) : BaseIO Unit := do
   let some dir := file.parent | return
   let some name := file.fileName | return
   let .ok entries ← dir.readDir.toBaseIO | return
   for e in entries do
-    if let some pid := (e.fileName.dropPrefix? s!"{name}.tmp.").bind (·.toString.toNat?) then
-      unless ← Lean.PaperLean.processAlive pid.toUInt32 do
+    if let some pid := (e.fileName.dropPrefix? s!"{name}.tmp.").bind (writerPid? ·.toString) then
+      unless ← Lean.PaperLean.processAlive pid do
         discard <| (IO.FS.removeFile e.path).toBaseIO
 
 /-- Set by the `paperlean` commands for the Lake they run: only then does Lake use prepared data and

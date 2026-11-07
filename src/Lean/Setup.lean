@@ -8,6 +8,8 @@ module
 prelude
 public import Lean.Data.Json.Parser
 public import Lean.Util.LeanOptions
+import Std.Data.HashMap.Basic
+import Std.Data.HashSet.Basic
 
 set_option doc.verso true
 
@@ -412,6 +414,63 @@ def encode (roots : Array String) (records : Array Record) : ByteArray := Id.run
 def fileName (bytes : ByteArray) : String :=
   s!"setup-{String.ofList (Nat.toDigits 16 bytes.hash.toNat)}.paperlean"
 
+section
+set_option genSizeOf false
+
+/-- A record in an immutable base index, or an immutable single-module file. -/
+inductive RecordRef where
+  | base (hash : UInt64) (record : Nat)
+  | node (hash : UInt64)
+
+/-- The declared module name is checked against the referenced record. An external
+import has no workspace record. -/
+structure LinkedImport where
+  module : Name
+  target : Option RecordRef
+  importAll : Bool
+  isExported : Bool
+  isMeta : Bool
+
+structure LinkedRecord where
+  name : Name
+  root : String
+  isModule : Bool
+  imports : Array LinkedImport
+
+private def linkedPrefix := "setup-node-"
+
+private def linkedMagic : String := "paperlean-setup-node 1\n"
+
+/-- A node's filename is derived entirely from its bytes. -/
+def linkedFileName (hash : UInt64) : String :=
+  s!"{linkedPrefix}{String.ofList (Nat.toDigits 16 hash.toNat)}.paperlean"
+
+private def baseFileName (hash : UInt64) : String :=
+  s!"setup-{String.ofList (Nat.toDigits 16 hash.toNat)}.paperlean"
+
+private def pushHash (b : ByteArray) (h : UInt64) : ByteArray :=
+  pushU32 (pushU32 b h.toNat) (h >>> 32).toNat
+
+private def pushName (b : ByteArray) (n : Name) : ByteArray :=
+  let cs := if hasOnlyStrComponents n then components n else #[]
+  cs.foldl pushStr (pushU32 b cs.size)
+
+/-- Encodes one module. References contain only a digest and, for a base index, a
+record number. Generation paths are never serialized in an edge. -/
+def encodeLinked (r : LinkedRecord) : ByteArray := Id.run do
+  let b := pushStr (pushName linkedMagic.toUTF8 r.name) r.root
+  let b := pushU32 (b.push (if r.isModule then 1 else 0)) r.imports.size
+  return r.imports.foldl (init := b) fun b e =>
+    let b := pushName b e.module
+    let b := b.push <| (if e.importAll then 1 else 0) |||
+      (if e.isExported then 2 else 0) ||| (if e.isMeta then 4 else 0)
+    match e.target with
+    | none => b.push 0
+    | some (.base h i) => pushU32 (pushHash (b.push 1) h) i
+    | some (.node h) => pushHash (b.push 2) h
+
+end
+
 /-- An index read from a file. -/
 structure Index where
   bytes : ByteArray
@@ -436,10 +495,8 @@ private def getStr (b : ByteArray) (i : Nat) : Except String (String × Nat) := 
     | throw "it has a string that is not UTF-8"
   return (s, i + 4 + n)
 
-/-- The index {name}`bytes` read from {name}`file`. -/
-def Index.read (file : System.FilePath) (bytes : ByteArray) : Except String Index := do
-  unless file.fileName == some (fileName bytes) do
-    throw "its contents do not have the hash it is named by"
+/-- The prefix of an index through its record count; the offset table need not be present. -/
+private def Index.readHeader (bytes : ByteArray) : Except String Index := do
   unless (bytes.extract 0 magic.utf8ByteSize).data == magic.toUTF8.data do
     throw "it is not a setup index of this version"
   let numRoots ← getU32 bytes magic.utf8ByteSize
@@ -450,14 +507,20 @@ def Index.read (file : System.FilePath) (bytes : ByteArray) : Except String Inde
     roots := roots.push ⟨r⟩
     i := j
   let size ← getU32 bytes i
-  unless i + 4 + 4 * size ≤ bytes.size do throw "it is truncated"
   return { bytes, roots, table := i + 4, size }
 
-/-- The record {name}`i` of {name}`ix`. -/
-def Index.record (ix : Index) (i : Nat) : Except String Record := do
-  unless i < ix.size do throw s!"it has no record {i}"
-  let b := ix.bytes
-  let mut p ← getU32 b (ix.table + 4 * i)
+/-- The index {name}`bytes` read from {name}`file`. Independent or unreceipted files retain this
+full content-hash validation path. -/
+def Index.read (file : System.FilePath) (bytes : ByteArray) : Except String Index := do
+  unless file.fileName == some (fileName bytes) do
+    throw "its contents do not have the hash it is named by"
+  let ix ← Index.readHeader bytes
+  unless ix.table + 4 * ix.size ≤ bytes.size do throw "it is truncated"
+  return ix
+
+/-- Decodes one record, from a whole index or an individually read record. -/
+private def decodeRecord (b : ByteArray) (start numRoots : Nat) : Except String Record := do
+  let mut p := start
   let numComponents ← getU32 b p
   p := p + 4
   let mut name := Name.anonymous
@@ -466,7 +529,7 @@ def Index.record (ix : Index) (i : Nat) : Except String Record := do
     name := name.str c
     p := q
   let root ← getU32 b p
-  unless root < ix.roots.size do throw s!"the record of {name} has no root"
+  unless root < numRoots do throw s!"the record of {name} has no root"
   let isModule := (← getU8 b (p + 4)) == 1
   let numImports ← getU32 b (p + 5)
   p := p + 9
@@ -479,29 +542,34 @@ def Index.record (ix : Index) (i : Nat) : Except String Record := do
     p := p + 5
   return { name, root, isModule, imports }
 
-/-- The state of {lit}`Index.importArts`: per record, the record once decoded, its entry, and
-whether the walk visited it for {lit}`import all` and for {lit}`meta`; and the records with an
-entry. -/
+/-- The record {name}`i` of {name}`ix`. -/
+def Index.record (ix : Index) (i : Nat) : Except String Record := do
+  unless i < ix.size do throw s!"it has no record {i}"
+  decodeRecord ix.bytes (← getU32 ix.bytes (ix.table + 4 * i)) ix.roots.size
+
+/-- State only for reached records, independent of the total module count in the index. -/
 private structure Walk where
-  recs : Array (Option Record)
-  arts : Array (Option ImportArtifacts)
-  allVisited : Array Bool
-  metaVisited : Array Bool
+  recs : Std.HashMap Nat (Record × System.FilePath) := {}
+  arts : Std.HashMap Nat ImportArtifacts := {}
+  allVisited : Std.HashSet Nat := {}
+  metaVisited : Std.HashSet Nat := {}
   entries : Array Nat := #[]
+  deriving Inhabited
 
-private def Walk.record (w : Walk) (ix : Index) (i : Nat) : Except String (Record × Walk) := do
-  if let some (some r) := w.recs[i]? then return (r, w)
+private def Walk.record [Monad m] [MonadExceptOf String m] (w : Walk)
+    (read : Nat → m (Record × System.FilePath)) (i : Nat) :
+    m ((Record × System.FilePath) × Walk) := do
+  if let some r := w.recs[i]? then return (r, w)
   if i == unknown then throw "it has no record of an imported module"
-  let r ← ix.record i
-  return (r, { w with recs := w.recs.set! i (some r) })
+  let r ← read i
+  return (r, { w with recs := w.recs.insert i r })
 
-private def Walk.insert (w : Walk) (ix : Index) (i : Nat) (r : Record) (all : Bool) : Walk :=
-  let arts := some (artifactsAt ix.roots[r.root]! r.name r.isModule all)
-  -- Inspect the old slot before updating it, so the update need not copy the array.
-  if w.arts[i]!.isNone then
-    { w with entries := w.entries.push i, arts := w.arts.set! i arts }
+private def Walk.insert (w : Walk) (i : Nat) (r : Record) (root : System.FilePath) (all : Bool) : Walk :=
+  let arts := artifactsAt root r.name r.isModule all
+  if !w.arts.contains i then
+    { w with entries := w.entries.push i, arts := w.arts.insert i arts }
   else
-    { w with arts := w.arts.set! i arts }
+    { w with arts := w.arts.insert i arts }
 
 /-- {lit}`enqueue` of {lit}`Lake.fetchTransImportArts`: pushes the imports of {name}`r` that the
 walk visits. -/
@@ -514,49 +582,304 @@ private def enqueue (nonModule importAll needsMeta : Bool) (r : Record)
     let needsMeta := needsMeta || (reachable && e.isMeta)
     if reachable || needsMeta then q.push (e.target, importAll, needsMeta) else q
 
-/-- {lit}`walk` of {lit}`Lake.fetchTransImportArts`. -/
-private partial def Walk.walk (w : Walk) (ix : Index) (nonModule : Bool)
-    (q : Array (Nat × Bool × Bool)) : Except String Walk := do
-  let some (m, importAll, needsMeta) := q.back? | return w
+/-- {lit}`walk` of {lit}`Lake.fetchTransImportArts`, shared by full and demand readers. -/
+private partial def Walk.walk [Monad m] [MonadExceptOf String m] (w : Walk)
+    (read : Nat → m (Record × System.FilePath)) (nonModule : Bool)
+    (q : Array (Nat × Bool × Bool)) : m Walk := do
+  let some (i, importAll, needsMeta) := q.back? | return w
   let q := q.pop
-  let (r, w) ← w.record ix m
-  let doAll := importAll && !w.allVisited[m]!
-  let doMeta := needsMeta && !w.metaVisited[m]!
-  let existing? := w.arts[m]!
+  let ((r, root), w) ← w.record read i
+  let doAll := importAll && !w.allVisited.contains i
+  let doMeta := needsMeta && !w.metaVisited.contains i
+  let existing? := w.arts[i]?
   if let some a := existing? then
-    unless a.oleanServer?.isSome && (doAll || doMeta) do return ← w.walk ix nonModule q
+    unless a.oleanServer?.isSome && (doAll || doMeta) do return ← w.walk read nonModule q
   let w := { w with
-    allVisited := if importAll then w.allVisited.set! m true else w.allVisited
-    metaVisited := if needsMeta then w.metaVisited.set! m true else w.metaVisited }
-  let wantAll := w.allVisited[m]! || existing?.any (·.oleanPrivate?.isSome)
-  (w.insert ix m r wantAll).walk ix nonModule (enqueue nonModule importAll needsMeta r q)
+    allVisited := if importAll then w.allVisited.insert i else w.allVisited
+    metaVisited := if needsMeta then w.metaVisited.insert i else w.metaVisited }
+  let wantAll := w.allVisited.contains i || existing?.any (·.oleanPrivate?.isSome)
+  (w.insert i r root wantAll).walk read nonModule (enqueue nonModule importAll needsMeta r q)
 
-/--
-The artifacts of the transitive imports of {name}`mod`, whose record is {name}`i`: those of
-{lit}`Lake.fetchImportInfo` for its direct imports, then those that {lit}`Lake.fetchTransImportArts`
-adds, whose steps this follows, with all files at their default location.
--/
-def Index.importArts (ix : Index) (mod : Name) (i : Nat) :
-    Except String (NameMap ImportArtifacts) := do
-  let n := ix.size
-  let w : Walk := { recs := .replicate n none, arts := .replicate n none,
-                    allVisited := .replicate n false, metaVisited := .replicate n false }
-  let (root, w) ← w.record ix i
+/-- Replays Lake's direct-import and transitive visibility rules with a record reader. -/
+private def importArtsWith [Monad m] [MonadExceptOf String m]
+    (read : Nat → m (Record × System.FilePath)) (mod : Name) (i : Nat) :
+    m (NameMap ImportArtifacts) := do
+  let ((root, _), w) ← Walk.record {} read i
   unless root.name == mod do throw s!"its record {i} is not of {mod}"
   let nonModule := !root.isModule
   let w ← root.imports.foldlM (init := w) fun w e => do
     if e.target == noModule then return w
-    let (r, w) ← w.record ix e.target
+    let ((r, path), w) ← w.record read e.target
     let all := nonModule || e.importAll
     -- (an entry is only replaced by one with `.olean.private`)
-    if w.arts[e.target]!.isSome && !all then return w
-    return w.insert ix e.target r all
+    if w.arts.contains e.target && !all then return w
+    return w.insert e.target r path all
   let (q, w) ← root.imports.foldrM (init := (#[], w)) fun e (q, w) => do
     if e.target == noModule then return (q, w)
-    let (r, w) ← w.record ix e.target
+    let ((r, _), w) ← w.record read e.target
     return (enqueue nonModule (nonModule || e.importAll) e.isMeta r q, w)
-  let w ← w.walk ix nonModule q
-  return w.entries.foldl (init := {}) fun m j => m.insert (w.recs[j]!.get!).name (w.arts[j]!.get!)
+  let w ← w.walk read nonModule q
+  return w.entries.foldl (init := {}) fun m j => m.insert w.recs[j]!.1.name w.arts[j]!
+
+/--
+The artifacts of the transitive imports of {name}`mod`, whose record is {name}`i`: those of
+{lit}`Lake.fetchImportInfo` for its direct imports, then those that {lit}`Lake.fetchTransImportArts`
+adds, whose steps this follows, with all files at their default location. Storage is proportional to
+records reached, even on the independent full-validation path.
+-/
+def Index.importArts (ix : Index) (mod : Name) (i : Nat) :
+    Except String (NameMap ImportArtifacts) :=
+  importArtsWith (fun j => do
+    let r ← ix.record j
+    return (r, ix.roots[r.root]!)) mod i
+
+/-- An owned read-only descriptor of a writer-validated immutable generation. -/
+private opaque DemandIndex : Type := Unit
+
+/-- Publishes a v1 index without overwriting an existing generation. For larger indices the
+native writer reads back and compares the file to {name}`bytes` before publishing an identity
+receipt. Small indices use full content-hash validation. Returns false on platforms without the demand reader. -/
+@[extern "lean_paperlean_setup_index_publish"]
+opaque publish (file : @& String) (bytes : @& ByteArray) : IO Bool
+
+@[extern "lean_paperlean_setup_index_open"]
+private opaque openDemand (file : @& String) : IO (Option (DemandIndex × ByteArray))
+
+@[extern "lean_paperlean_setup_index_record"]
+private opaque readDemand (index : @& DemandIndex) (i : @& Nat) : IO ByteArray
+
+@[extern "lean_paperlean_setup_index_check"]
+private opaque checkDemand (index : @& DemandIndex) : IO Unit
+
+@[extern "lean_paperlean_setup_index_close"]
+private opaque closeDemand (index : @& DemandIndex) : BaseIO Unit
+
+/-- Demand reading is available only for the exact opened file covered by a complete receipt.
+Missing or stale receipts choose full validation; an opened generation changing during traversal
+is rejected. The handle is closed on both successful and exceptional exits. -/
+private def demandImportArts (file : System.FilePath) (mod : Name) (i : Nat) :
+    IO (Option (Except String (NameMap ImportArtifacts))) := do
+  let opened ← openDemand file.toString
+  let some (handle, headerBytes) := opened | return none
+  try
+    let action : ExceptT String IO (NameMap ImportArtifacts) := do
+      let ix ← liftExcept (Index.readHeader headerBytes)
+      let read (j : Nat) : ExceptT String IO (Record × System.FilePath) := do
+        let bytes ← readDemand handle j
+        let r ← liftExcept (decodeRecord bytes 0 ix.roots.size)
+        return (r, ix.roots[r.root]!)
+      let arts ← importArtsWith read mod i
+      checkDemand handle
+      return arts
+    return some (← action.run)
+  finally
+    closeDemand handle
+
+
+section
+set_option genSizeOf false
+
+-- Quoted module components can contain punctuation and path separators. They are
+-- used exactly as in v1 artifact paths. Paths to other index files use only digests.
+private def validLinkedPart (c : String) : Bool := !c.toUTF8.data.contains 0
+
+private def getName (b : ByteArray) (pos : Nat) : Except String (Name × Nat) := do
+  let count ← getU32 b pos
+  unless count > 0 && count ≤ (b.size - (pos + 4)) / 4 do throw "invalid module name"
+  let mut n := Name.anonymous
+  let mut p := pos + 4
+  for _ in [0:count] do
+    let (c, next) ← getStr b p
+    unless validLinkedPart c do throw "invalid module name component"
+    n := n.str c
+    p := next
+  return (n, p)
+
+private def getHash (b : ByteArray) (i : Nat) : Except String UInt64 := do
+  let lo ← getU32 b i
+  let hi ← getU32 b (i + 4)
+  return lo.toUInt64 ||| (hi.toUInt64 <<< 32)
+
+/-- Decode exactly one node. Its edge tags contain digest values, never filenames. -/
+private def decodeLinked (bytes : ByteArray) : Except String LinkedRecord := do
+  let m := linkedMagic.toUTF8
+  unless (bytes.extract 0 m.size).data == m.data do throw "unrecognized setup node version"
+  let (name, p) ← getName bytes m.size
+  let (root, p) ← getStr bytes p
+  if root.toUTF8.data.contains 0 then throw "invalid root"
+  let flag ← getU8 bytes p
+  if flag > 1 then throw "invalid module flag"
+  let count ← getU32 bytes (p + 1)
+  let mut p := p + 5
+  let mut imports : Array LinkedImport := #[]
+  for _ in [0:count] do
+    let (module, q) ← getName bytes p
+    let f ← getU8 bytes q
+    if f > 7 then throw "invalid import flags"
+    let (target, next) ← match ← getU8 bytes (q + 1) with
+      | 0 => pure (none, q + 2)
+      | 1 => do
+        let h ← getHash bytes (q + 2)
+        let i ← getU32 bytes (q + 10)
+        pure (some (RecordRef.base h i), q + 14)
+      | 2 => do
+        let h ← getHash bytes (q + 2)
+        pure (some (RecordRef.node h), q + 10)
+      | _ => throw "unknown import reference tag"
+    imports := imports.push {
+      module, target, importAll := f &&& 1 != 0, isExported := f &&& 2 != 0, isMeta := f &&& 4 != 0 }
+    p := next
+  unless p == bytes.size do throw "unexpected trailing node bytes"
+  return {name, root, isModule := flag == 1, imports}
+
+private def RecordRef.key : RecordRef → Bool × UInt64 × Nat
+  | .node h => (true, h, 0)
+  | .base h i => (false, h, i)
+
+/-- Translates immutable content references to the compact traversal IDs used by
+{lit}`Walk`. One logical module must resolve to the same record on every path. -/
+private structure LinkedGraph where
+  ids : Std.HashMap (Bool × UInt64 × Nat) Nat := {}
+  refs : Array (RecordRef × Option Name) := #[]
+  names : NameMap Nat := {}
+
+private def LinkedGraph.checkName (g : LinkedGraph) (i : Nat) (name : Name) :
+    Except String LinkedGraph := do
+  let some (ref, expected?) := g.refs[i]? | throw "missing internal record"
+  if let some expected := expected? then
+    unless expected == name do throw s!"record {i} expected {expected} but contains {name}"
+  if let some previous := g.names.find? name then
+    if previous != i then throw s!"conflicting setup records for {name}"
+    return g
+  return {g with refs := g.refs.setIfInBounds i (ref, some name), names := g.names.insert name i}
+
+private def LinkedGraph.intern (g : LinkedGraph) (ref : RecordRef) (name? : Option Name) :
+    Except String (Nat × LinkedGraph) := do
+  let (i, g) ← match g.ids[ref.key]? with
+    | some i => pure (i, g)
+    | none => do
+      let i := g.refs.size
+      if i ≥ unknown then throw "too many reached records"
+      pure (i, {g with ids := g.ids.insert ref.key i, refs := g.refs.push (ref, none)})
+  let g ← match name? with | some name => g.checkName i name | none => pure g
+  return (i, g)
+
+private abbrev ReadLinked := ExceptT String IO
+
+private def internRef (graph : IO.Ref LinkedGraph) (ref : RecordRef) (name? : Option Name) :
+    ReadLinked Nat := do
+  liftExcept (← graph.modifyGet fun g =>
+    match g.intern ref name? with
+    | .ok (i, next) => (.ok i, next)
+    | .error e => (.error e, {}))
+
+private structure Segment where
+  index : Index
+  handle? : Option DemandIndex
+
+/-- Read a stable regular file from a single descriptor, returning its total size and
+at most {name}`limit` bytes. Platforms without this primitive return {lit}`none`. -/
+@[extern "lean_paperlean_setup_read_regular"]
+opaque readRegularPrefix (file : @& String) (limit : USize) : IO (Option (UInt64 × ByteArray))
+
+private def readRegularFile (path : System.FilePath) : IO ByteArray := do
+  if let some (size, bytes) ← readRegularPrefix path.toString (USize.size - 1).toUSize then
+    unless size.toNat == bytes.size do throw <| IO.userError "incomplete setup file"
+    return bytes
+  unless (← path.symlinkMetadata).type == .file do throw <| IO.userError "expected a regular setup file"
+  IO.FS.readBinFile path
+
+/-- Independent v1 indexes may be symlinks. Resolve a link only after the normal
+descriptor read declined it. The caller validates bytes against the original filename. -/
+private def readV1File (file : System.FilePath) : IO ByteArray := do
+  try readRegularFile file catch e =>
+    let .ok st ← file.symlinkMetadata.toBaseIO | throw e
+    unless st.type == .symlink do throw e
+    readRegularFile (← IO.FS.realPath file)
+
+/-- Unreceipted v1 segments retain their original full content validation. Receipted
+segments keep a descriptor through the entire walk and read only reached records. -/
+private def openSegment (segments : IO.Ref (Std.HashMap UInt64 Segment)) (dir : System.FilePath)
+    (hash : UInt64) : ReadLinked Segment := do
+  if let some seg := (← segments.get)[hash]? then return seg
+  let path := dir / baseFileName hash
+  let seg ← match ← openDemand path.toString with
+    | some (h, bytes) => do
+      match Index.readHeader bytes with
+      | .ok ix => pure { index := ix, handle? := some h }
+      | .error e => do closeDemand h; throw e
+    | none => do
+      let bytes ← readV1File path
+      let ix ← liftExcept (Index.read path bytes)
+      pure {index := ix, handle? := none}
+  segments.modify (·.insert hash seg)
+  return seg
+
+private def readLinkedFile (file : System.FilePath) : IO ByteArray := do
+  let bytes ← readRegularFile file
+  unless file.fileName == some (linkedFileName bytes.hash) do
+    throw <| IO.userError "setup node contents do not match its filename"
+  return bytes
+
+private def readLinkedRef (graph : IO.Ref LinkedGraph) (segments : IO.Ref (Std.HashMap UInt64 Segment))
+    (dir : System.FilePath) (rootHash : UInt64) (root : LinkedRecord) (i : Nat) :
+    ReadLinked (Record × System.FilePath) := do
+  let some (ref, _) := (← graph.get).refs[i]? | throw "missing linked reference"
+  let (record, path) ← match ref with
+    | .node hash => do
+      let r ← if hash == rootHash then pure root else do
+        liftExcept (decodeLinked (← readLinkedFile (dir / linkedFileName hash)))
+      let imports ← r.imports.mapM fun e => do
+        let target ← match e.target with
+          | none => pure noModule
+          | some ref => internRef graph ref (some e.module)
+        pure {target, importAll := e.importAll, isExported := e.isExported, isMeta := e.isMeta : Edge}
+      pure ({name := r.name, root := 0, isModule := r.isModule, imports : Record}, ⟨r.root⟩)
+    | .base hash j => do
+      let seg ← openSegment segments dir hash
+      let r ← match seg.handle? with
+        | some h => do
+          let bytes ← readDemand h j
+          liftExcept (decodeRecord bytes 0 seg.index.roots.size)
+        | none => liftExcept (seg.index.record j)
+      unless !r.name.isAnonymous && hasOnlyStrComponents r.name && (components r.name).all validLinkedPart do
+        throw "invalid module name in base record"
+      let imports ← r.imports.mapM fun e => do
+        if e.target == unknown || e.target == noModule then return e
+        return {e with target := ← internRef graph (.base hash e.target) none}
+      pure ({r with imports}, seg.index.roots[r.root]!)
+  liftExcept (← graph.modifyGet fun g =>
+    match g.checkName i record.name with
+    | .ok next => (.ok (), next)
+    | .error e => (.error e, {}))
+  return (record, path)
+
+private def isLinkedFile (file : System.FilePath) : Bool :=
+  file.fileName.any fun s => (s.toUTF8.extract 0 linkedPrefix.utf8ByteSize).data == linkedPrefix.toUTF8.data
+
+private def linkedImportArts (file : System.FilePath) (mod : Name) (i : Nat) :
+    IO (Except String (NameMap ImportArtifacts)) := do
+  if i != 0 then return .error "a node contains only record zero"
+  let bytes ← readLinkedFile file
+  let root ← match decodeLinked bytes with
+    | .ok r => pure r
+    | .error e => return .error e
+  let dir := file.parent.getD "."
+  let graph ← IO.mkRef ({} : LinkedGraph)
+  let segments ← IO.mkRef (∅ : Std.HashMap UInt64 Segment)
+  try
+    let action : ReadLinked (NameMap ImportArtifacts) := do
+      let i ← internRef graph (.node bytes.hash) (some mod)
+      let arts ← importArtsWith (readLinkedRef graph segments dir bytes.hash root) mod i
+      for (_, seg) in ← segments.get do
+        if let some h := seg.handle? then checkDemand h
+      return arts
+    action.run
+  finally
+    for (_, seg) in ← segments.get do
+      if let some h := seg.handle? then closeDemand h
+
+end
 
 /-- The entry of the anonymous name in {lit}`importArts` that refers to record {name}`i` of the
 index {name}`file`. -/
@@ -573,17 +896,26 @@ end SetupIndex
 {name}`setup` with the artifacts of its module's transitive imports from the setup index that its
 {lit}`importArts` refer to, if they do.
 -/
-def withSetupIndex (setup : ModuleSetup) : IO (Except String ModuleSetup) := do
+@[noinline, nospecialize] def withSetupIndex (setup : ModuleSetup) : IO (Except String ModuleSetup) := do
   let some ref := setup.importArts.find? .anonymous | return .ok setup
   let some file := ref.toArrays[0]?.bind (·[0]?) | return .error "it refers to no setup index"
   let some record := ref.toArrays[1]?.bind (·[0]?) | return .error "it refers to no record"
   let .ok i := Json.parse record.toString >>= fromJson? (α := Nat)
     | return .error "it refers to no record"
-  let bytes ← match ← (IO.FS.readBinFile file).toBaseIO with
-    | .ok bytes => pure bytes
-    | .error e => return .error s!"its setup index {file} cannot be read ({e}); a setup that \
-        refers to one is only valid during the build that wrote it"
-  match (SetupIndex.Index.read file bytes).bind (·.importArts setup.name i) with
+  let resolved ← if SetupIndex.isLinkedFile file then
+    match ← (SetupIndex.linkedImportArts file setup.name i).toBaseIO with
+    | .ok r => pure r
+    | .error e => pure (.error (toString e))
+  else match ← (SetupIndex.demandImportArts file setup.name i).toBaseIO with
+    | .ok (some r) => pure r
+    | .error e => pure (.error s!"cannot read its immutable generation ({e})")
+    | .ok none =>
+      let bytes ← match ← (SetupIndex.readV1File file).toBaseIO with
+        | .ok bytes => pure bytes
+        | .error e => return .error s!"its setup index {file} cannot be read ({e}); a setup that \
+            refers to one is only valid during the build that wrote it"
+      pure <| (SetupIndex.Index.read file bytes).bind (·.importArts setup.name i)
+  match resolved with
   | .ok arts => return .ok { setup with importArts :=
       (setup.importArts.erase .anonymous).foldl (init := arts) fun m n a => m.insert n a }
   | .error e => return .error s!"its setup index {file} is damaged: {e}"

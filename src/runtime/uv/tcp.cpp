@@ -33,6 +33,7 @@ void lean_uv_tcp_socket_finalizer(void* ptr) {
 
     lean_always_assert(tcp_socket->m_promise_shutdown == nullptr);
     lean_always_assert(tcp_socket->m_promise_accept == nullptr);
+    lean_always_assert(tcp_socket->m_client == nullptr);
     lean_always_assert(tcp_socket->m_promise_read == nullptr);
     lean_always_assert(tcp_socket->m_byte_array == nullptr);
 
@@ -489,34 +490,30 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_tcp_listen(b_obj_arg socket, int32_t
         }
 
         lean_object* promise = tcp_socket->m_promise_accept;
-
-        if (status < 0) {
-            lean_promise_resolve_with_code(status, promise);
-            lean_dec(promise);
-            tcp_socket->m_promise_accept = nullptr;
-            return;
-        }
-
         lean_object* client = tcp_socket->m_client;
-        lean_uv_tcp_socket_object* client_socket = lean_to_uv_tcp_socket(client);
+        lean_object* listener = (lean_object*)stream->data;
 
-        int result = uv_accept((uv_stream_t*)tcp_socket->m_uv_tcp, (uv_stream_t*)client_socket->m_uv_tcp);
-
+        // Take all pending ownership before completing either the success or failure path.
         tcp_socket->m_promise_accept = nullptr;
         tcp_socket->m_client = nullptr;
+
+        int result = status;
+        if (result >= 0) {
+            lean_uv_tcp_socket_object* client_socket = lean_to_uv_tcp_socket(client);
+            result = uv_accept((uv_stream_t*)tcp_socket->m_uv_tcp, (uv_stream_t*)client_socket->m_uv_tcp);
+        }
 
         if (result < 0) {
             lean_dec(client);
             lean_promise_resolve_with_code(result, promise);
-            lean_dec(promise);
-            return;
+        } else {
+            lean_promise_resolve(mk_except_ok(client), promise);
         }
-
-        lean_promise_resolve(mk_except_ok(client), promise);
         lean_dec(promise);
 
-        // The accept increases the count and then the listen decreases
-        lean_dec((lean_object*)stream->data);
+        // Balance the reference acquired by accept on every completion path. Do not use stream
+        // or tcp_socket after this release: it may finalize the listener.
+        lean_dec(listener);
     });
 
     event_loop_unlock(&global_ev);
@@ -536,13 +533,19 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_tcp_accept(b_obj_arg socket) {
     event_loop_lock(&global_ev);
 
     if (tcp_socket->m_promise_accept != nullptr) {
+        event_loop_unlock(&global_ev);
         return lean_io_result_mk_error(lean_decode_uv_error(UV_EALREADY, mk_string("parallel accept is not allowed! consider binding multiple sockets to the same address and accepting on them instead")));
     }
 
+    lean_object* client_result = lean_uv_tcp_new();
+    if (lean_io_result_is_error(client_result)) {
+        event_loop_unlock(&global_ev);
+        return client_result;
+    }
+    lean_object* client = lean_io_result_take_value(client_result);
+
     lean_object* promise = lean_promise_new();
     mark_mt(promise);
-
-    lean_object* client = lean_io_result_take_value(lean_uv_tcp_new());
 
     lean_uv_tcp_socket_object* client_socket = lean_to_uv_tcp_socket(client);
 
@@ -581,7 +584,12 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_tcp_try_accept(b_obj_arg socket) {
         return lean_io_result_mk_error(lean_decode_uv_error(UV_EALREADY, mk_string("parallel accept is not allowed! consider binding multiple sockets to the same address and accepting on them instead")));
     }
 
-    lean_object* client = lean_io_result_take_value(lean_uv_tcp_new());
+    lean_object* client_result = lean_uv_tcp_new();
+    if (lean_io_result_is_error(client_result)) {
+        event_loop_unlock(&global_ev);
+        return client_result;
+    }
+    lean_object* client = lean_io_result_take_value(client_result);
     lean_uv_tcp_socket_object* client_socket = lean_to_uv_tcp_socket(client);
 
     int result = uv_accept((uv_stream_t*)tcp_socket->m_uv_tcp, (uv_stream_t*)client_socket->m_uv_tcp);

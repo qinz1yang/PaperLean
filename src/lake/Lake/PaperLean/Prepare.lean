@@ -14,11 +14,11 @@ public import Lake.PaperLean.Env
 import Lake.PaperLean.Native
 import Lake.PaperLean.BuildData
 import Lake.PaperLean.Cache
+import Lake.PaperLean.SourceInputs
 import Lean.PaperLean.OLeanPack
 import Lean.PaperLean.System
 import Std.Data.HashMap
 import Lean.Data.NameMap
-import Lean.Elab.ParseImportsFast
 import Init.Data.ByteArray.Extra
 
 /-!
@@ -74,65 +74,19 @@ public def defaultModules (pkg : Package) : IO (Array Module) := do
         mods := mods.push mod
   return mods
 
-/-- A parsed source header, reusable only while its file keeps its full identity. Name components
-are stored separately so that escaped dots in module names round-trip. -/
-structure ImportHeader where
-  path : String
-  identity : Array UInt64
-  imports : Array (Array String)
-  deriving ToJson, FromJson
+/-- A prepare command uses the same verified source headers as builtin module inputs.
+Older workspace-local header files are not inputs to dependency selection. -/
+private abbrev ImportHeaders := SourceInputs.HeaderReader
 
-structure ImportHeaders where
-  entries : Std.HashMap String ImportHeader := {}
-  changed : Bool := false
+private def readImportHeaders (ws : Workspace) (write := false) : IO ImportHeaders :=
+  SourceInputs.headerReader ws.dir write
 
-/-- The workspace's parsed source headers. Damaged data or data from another build is ignored. -/
-def readImportHeaders (ws : Workspace) : IO (IO.Ref ImportHeaders) := do
-  try
-    let json ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dataDir ws.dir / "imports.paperlean"))
-    let (build, digest, entries) : String × String × Array ImportHeader ← IO.ofExcept (fromJson? json)
-    if build != Cache.buildName || digest != Cache.key #[build, (toJson entries).compress] then
-      return ← IO.mkRef {}
-    return ← IO.mkRef { entries := entries.foldl (fun m e => m.insert e.path e) {} }
-  catch _ => IO.mkRef {}
-
-/-- Saves newly parsed headers only after a successful prepare, holding its data lock. -/
-def writeImportHeaders (dir : FilePath) (headers : IO.Ref ImportHeaders) : IO Unit := do
-  let headers ← headers.get
-  unless headers.changed do return
-  let entries := headers.entries.toArray.map (·.2) |>.qsort (·.path < ·.path)
-  let build := Cache.buildName
-  let digest := Cache.key #[build, (toJson entries).compress]
-  let tmp := dir / s!"imports.paperlean.tmp.{← IO.Process.getPID}"
-  try
-    IO.FS.writeFile tmp ((toJson (build, digest, entries)).compress ++ "\n")
-    IO.FS.rename tmp (dir / "imports.paperlean")
-  finally
-    try IO.FS.removeFile tmp catch _ => pure ()
-
-/-- The source's direct imports, using a cached header only for the same file identity. -/
-def sourceImports (headers : IO.Ref ImportHeaders) (mod : Module) : IO (Array Name) := do
-  let path := mod.leanFile.toString
-  let before ← Lean.PaperLean.fileIdentity path
-  let identity := before.map fun id =>
-    (Array.range (id.size / 8)).map fun i => (id.extract (8 * i) (8 * (i + 1))).toUInt64LE!
-  if let some identity := identity then
-    if let some entry := (← headers.get).entries[path]? then
-      if entry.identity == identity then
-        return entry.imports.map fun parts => parts.foldl Name.mkStr .anonymous
-  unless ← mod.leanFile.pathExists do return #[]
-  let some header ← (some <$> Lean.parseImports' (← IO.FS.readFile mod.leanFile) path)
-    <|> pure none | return #[]
-  let imports := header.imports.map (·.module)
-  if let some identity := identity then
-    if before == (← Lean.PaperLean.fileIdentity path) then
-      let names := imports.map fun n => n.components.toArray.map Name.getString!
-      let entry : ImportHeader := { path, identity, imports := names }
-      headers.modify fun h => { h with entries := h.entries.insert path entry, changed := true }
-  return imports
+private def sourceImports (headers : ImportHeaders) (mod : Module) : IO (Array Name) := do
+  let some h ← headers.read mod.leanFile | return #[]
+  return h.imports.map (·.module)
 
 /-- The dependency modules in the root package's import closure, using parsed source headers. -/
-partial def importedDependencyModulesWith (ws : Workspace) (headers : IO.Ref ImportHeaders) :
+partial def importedDependencyModulesWith (ws : Workspace) (headers : ImportHeaders) :
     IO (Array Module) := do
   let mut todo ← defaultModules ws.root
   let mut seen : NameSet := todo.foldl (·.insert ·.name) {}
@@ -157,7 +111,7 @@ public def importedDependencyModules (ws : Workspace) : IO (Array Module) := do
 
 /-- Those of `modules` that import one of `below` directly or indirectly, leaving out `below`: a
 module runs in the interpreter if one of its imports does. By their sources' headers. -/
-def importersIn (headers : IO.Ref ImportHeaders) (modules : Array Module) (below : NameSet) :
+def importersIn (headers : ImportHeaders) (modules : Array Module) (below : NameSet) :
     IO (Array Name) := do
   if below.isEmpty then return #[]
   let mut mods : Array (Name × Array Name) := #[]
@@ -394,7 +348,8 @@ def nativeKey (lean : LeanInstall) (pkg : Package) (pack : String) (mods others 
     (hashes : FileHashes) (deps : Array String) : IO String := do
   let vars ← #["PAPERLEAN_EVAL_SECONDS", "PAPERLEAN_EVAL_MEMORY", "PAPERLEAN_UNIT_BYTES"].mapM fun v =>
     return s!"{v}={(← IO.getEnv v).getD ""}"
-  return Cache.key <| #["native", pack, packageConfig lean pkg] ++ vars ++
+  let compilerId := (← nativeCompiler? lean).map (·.2) |>.getD "unsupported compiler"
+  return Cache.key <| #["native-portable-checked-v6", compilerId, pack, packageConfig lean pkg] ++ vars ++
     mods.map (fun m => s!"{m.name}\t{(hashes.getD m.cFile.toString default).2}") ++
     others.map (s!"other\t{·.name}") ++ deps
 
@@ -408,6 +363,13 @@ structure NativeEntry where
   own : Array (String × String)
   onPlugin : Array String
   excluded : Array String
+  /-- Full identities of the library and manifest after `finishNativeLib` has validated and written
+  them. Entries from before this receipt was recorded are rebuilt once. -/
+  files : Array (String × String) := #[]
+  /-- Pack digest of the symbols exported by the verified, linked module set. -/
+  metaHash : String
+  /-- Payloads of every native dependency against which this library was linked. -/
+  dependencies : Array (String × String) := #[]
   deriving ToJson, FromJson
 
 /-- What the prepared data of a workspace whose root package imports the modules `imported` lists of
@@ -429,11 +391,159 @@ def nativeView (pkg : Package) (n : NativeEntry) (imported : NameSet) :
     (if others.isEmpty then "" else s!", {others.size} outside its default libraries")
   (lib, s!"{pkg.prettyName}: {lib.modules} modules{excl}", left)
 
-/-- The native entry `entry` of `cdir`, if it is there. -/
-def readNativeEntry (cdir : FilePath) (entry : String) : IO (Option NativeEntry) := do
-  let file := cdir / entry / "native.json"
-  unless ← file.pathExists do return none
-  return (Json.parse (← IO.FS.readFile file) >>= fromJson?).toOption
+/-- The full identity of a regular owned cache file. Reject special files before opening them,
+including a FIFO in place of JSON; cache entries never need symlinks. -/
+private def regularFileStamp (file : FilePath) : BaseIO (Option ByteArray) :=
+  Lean.PaperLean.OLeanPack.ownedFileIdentity file.toString
+
+def regularFileIdentity (file : FilePath) : BaseIO (Option String) :=
+  return (← regularFileStamp file).map Lean.PaperLean.identityText
+
+/-- The native entry of this build and package, only while its writer-validated library and manifest
+are still the same regular files. The receipt includes ctime as well as mtime, inode and size, so a
+modified or replaced payload is rebuilt even if its mtime was preserved. No library code is loaded
+into the prepare/status process to check a cache hit. -/
+def readNativeEntry (root : FilePath) (entry pkg : String) : IO (Option NativeEntry) := do
+  let some name := entry.dropPrefix? (Cache.entryPath "native/") | return none
+  let name := name.toString
+  if name.isEmpty || name.contains '/' || name == "." || name == ".." then return none
+  let file := root / entry / "native.json"
+  try
+    let some before ← regularFileStamp file | return none
+    let bytes ← Lean.PaperLean.OLeanPack.readVerifiedOwnedBytes file.toString before ""
+    let some text := String.fromUTF8? bytes | return none
+    let .ok n := Json.parse text >>= fromJson? (α := NativeEntry) | return none
+    if n.lib.entry != entry || n.lib.pkg != pkg || n.lib.failed || n.lib.modules == 0 then return none
+    if n.metaHash.length != 32 then return none
+    let paths := #[n.lib.lib, n.lib.manifest, s!"{entry}/meta-symbols.json"]
+    -- Each payload is directly inside its owned entry, never an arbitrary path from JSON.
+    unless paths.all fun p =>
+        ((p : FilePath).fileName).any fun name => !name.isEmpty && name != "." && name != ".." &&
+          p == s!"{entry}/{name}" do return none
+    if n.files.map (·.1) != paths then return none
+    for (path, _) in n.dependencies do
+      let some rel := path.dropPrefix? (Cache.entryPath "native/") | return none
+      let [owner, file] := rel.toString.splitOn "/" | return none
+      if [owner, file].any (fun p => p.isEmpty || p == "." || p == "..") then return none
+    for (path, identity) in n.files ++ n.dependencies do
+      if (← regularFileIdentity (root / path)) != some identity then return none
+    return some n
+  catch _ => return none
+
+/-- Preparation checks the bytes as well as the file identities. A malformed symbol sidecar or
+an incorrect but well-formed digest in native.json makes the entry eligible for repair. -/
+private def readNativeSymbols (root : FilePath) (entry pkg : String) :
+    IO (Option (NativeEntry × Array String)) := do
+  let some n ← readNativeEntry root entry pkg | return none
+  try
+    let relative := s!"{entry}/meta-symbols.json"
+    let file := root / relative
+    let some id ← regularFileStamp file | return none
+    unless n.files.contains (relative, Lean.PaperLean.identityText id) do return none
+    let bytes ← Lean.PaperLean.OLeanPack.readVerifiedOwnedBytes file.toString id n.metaHash
+    let some str := String.fromUTF8? bytes | return none
+    let .ok own := Json.parse str >>= fromJson? (α := Array String) | return none
+    return some (n, own)
+  catch _ => return none
+
+private def readPreparedNativeEntry (root : FilePath) (entry pkg : String) : IO (Option NativeEntry) :=
+  return (← readNativeSymbols root entry pkg).map (·.1)
+
+/-- The exact symbol lists and payload identities of the dependency entries held under lock.
+Never infer a published library's capabilities from the current workspace. -/
+private def dependencyData (root : FilePath) (libs : Array PreparedNative) :
+    LoggerIO (Array String × Array (String × String)) := do
+  let mut symbols := #[]
+  let mut files := #[]
+  for l in libs do
+    let some (n, own) ← readNativeSymbols root l.entry l.pkg | error s!"invalid native dependency entry: {l.pkg}"
+    unless n.lib.lib == l.lib && n.lib.manifest == l.manifest && n.lib.modules == l.modules do
+      error s!"native dependency changed: {l.pkg}"
+    symbols := symbols ++ own
+    files := files ++ n.files
+  return (symbols, files)
+
+/-- Whether the library that prepared data names is a usable entry of this build. Preparation and
+status share this definition; a JSON file alone does not make a native library ready. -/
+public def nativeEntryUsable (root : FilePath) (lib : PreparedNative) : IO Bool := do
+  if lib.failed || lib.modules == 0 then return false
+  let some n ← readNativeEntry root lib.entry lib.pkg | return false
+  return n.lib.lib == lib.lib && n.lib.manifest == lib.manifest && n.lib.modules == lib.modules
+
+/-- Full image verification, with an opt-in event file for operation-count regressions. This is
+used by preparation and explicit `status --verify`, never ordinary prepared-build reporting. -/
+public def verifyImportImage (file : FilePath) : IO String := do
+  if let some events ← IO.getEnv "PAPERLEAN_IMAGE_VERIFY_EVENTS" then
+    let h ← IO.FS.Handle.mk events .append
+    h.putStrLn file.toString
+  Lean.PaperLean.OLeanPack.verifyImportImage file.toString
+
+/-- The receipt of the image's full verification by prepare, next to the image. -/
+def imageReceipt (file : FilePath) : FilePath :=
+  file.addExtension "checked.json"
+
+/-- A cheap readiness check: the image must still be the regular file that prepare fully verified.
+Missing receipts, including legacy ones, and changed identities do not claim readiness. This reads
+only a bounded receipt and metadata; it never reads the image's contents. -/
+public def importImageUsable (dir : FilePath) (image : Option String) : IO Bool := do
+  let some image := image | return false
+  let file := dir / image
+  let receipt := imageReceipt file
+  try
+    let some identity ← regularFileIdentity file | return false
+    let .ok info ← receipt.symlinkMetadata.toBaseIO | return false
+    if info.type != .file || info.byteSize > 4096 then return false
+    let some before ← regularFileIdentity receipt | return false
+    let bytes ← match ← Lean.PaperLean.SetupIndex.readRegularPrefix receipt.toString 4096 with
+      | some (size, bytes) => if size.toNat == bytes.size then pure bytes else return false
+      | none => do
+        let handle ← IO.FS.Handle.mk receipt .read
+        handle.read 4097
+    unless bytes.size ≤ 4096 do return false
+    let some text := String.fromUTF8? bytes | return false
+    let .ok (build, checked) := Json.parse text >>= fromJson? (α := String × String) | return false
+    return build == Cache.buildName && checked == identity &&
+      (← regularFileIdentity receipt) == some before &&
+      (← regularFileIdentity file) == some identity
+  catch _ => return false
+
+/-- Fully verifies an image and atomically records the identity verified, holding the workspace data
+lock. The receipt is written only if the image keeps its full identity throughout verification. -/
+def checkImportImage (dir : FilePath) (image : Option String) : IO Bool := do
+  let some image := image | return false
+  let file := dir / image
+  let receipt := imageReceipt file
+  try
+    let some before ← regularFileIdentity file | return false
+    unless (← verifyImportImage file).isEmpty do return false
+    if (← regularFileIdentity file) != some before then return false
+    publishFile receipt (·.putStr ((toJson (Cache.buildName, before)).compress ++ "\n"))
+    return true
+  catch _ => return false
+
+/-- Replaces an invalid native entry with a complete private directory while its key lock is held.
+The old directory is quarantined until the rename succeeds; a failed publication restores it. -/
+def publishNativeEntry (cdir tmp : FilePath) (entry : String) : IO Unit := do
+  let dest := cdir / entry
+  let old := tmp.withFileName s!"{tmp.fileName.getD ""}-replaced"
+  removePath old
+  let hadOld := (← dest.symlinkMetadata.toBaseIO).isOk
+  if hadOld then IO.FS.rename dest old
+  try
+    Cache.publish cdir tmp entry
+  catch e =>
+    if hadOld then IO.FS.rename old dest
+    throw e
+  removePath old
+
+/-- Opt-in repair-set diagnostics for deterministic concurrent-repair regressions. One atomic
+marker per phase and process lets tests observe scheduling without relying on stdout buffering. -/
+def traceNativeRepairs (phase : String) (entries : Array (Package × String)) : IO Unit := do
+  if let some events ← IO.getEnv "PAPERLEAN_NATIVE_REPAIR_EVENTS" then
+    let dir : FilePath := events
+    IO.FS.createDirAll dir
+    let file := dir / s!"{phase}-{← IO.Process.getPID}.json"
+    publishFile file (·.putStr ((toJson (entries.map (pkgKey ·.1))).compress ++ "\n"))
 
 /-- Prints examples of the modules of the native entry `n` that run in the interpreter, of which those
 of `left` are left out of it. -/
@@ -448,7 +558,7 @@ def cacheRootOf (ws : Workspace) : IO FilePath := do
   let root ← match ← Cache.root? with
     | some r => pure r
     | none => pure (dataDir ws.dir / "cache")
-  IO.FS.createDirAll root
+  Cache.ensureRoot root
   IO.FS.realPath root
 
 /-- The packs of the dependency packages and of Lean's library in the data directory `dir`, as
@@ -460,7 +570,7 @@ def depPacks (dir cacheRoot : FilePath) (deps : Array PreparedPackage) (toolchai
 
 /-- The modules of `deps` whose files the import image describes: those that the root package's
 modules import (all of the packages' modules if they import none). -/
-def imageModules (ws : Workspace) (deps : Array Package) (headers : IO.Ref ImportHeaders) :
+def imageModules (ws : Workspace) (deps : Array Package) (headers : ImportHeaders) :
     IO (Array Module × Array Module) := do
   let imported := (← importedDependencyModulesWith ws headers).filter fun m => deps.any (·.baseName == m.pkg.baseName)
   let candidates ← if imported.isEmpty then (deps.flatMapM defaultModules : IO (Array Module)) else pure imported
@@ -497,6 +607,8 @@ def writeImage (ws : Workspace) (dir : FilePath) (stamp : String) (mods : Array 
   }
   IO.FS.removeDirAll tmp
   if out.exitCode == 0 then
+    unless ← checkImportImage dir (some s!"{name}/image.paperlean") do
+      throw <| IO.userError "the new import image failed verification; run `paperlean prepare` again"
     -- (the last line: packages' initializers may print too)
     IO.println s!"  {((out.stdout.dropEndWhile Char.isWhitespace).toString.splitOn "\n").getLast!} entries \
       ({showTime ((← IO.monoMsNow) - start)})"
@@ -571,7 +683,7 @@ are missing, and those of the others kept from `old?`; their import image; the r
 def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp : String)
     (deps : Array Package) (built : Array String) (keepDeps : Bool) (depMods : Array Module)
     (rootMods rootUnbuilt : Nat) (native : Bool) (old? : Option PreparedData)
-    (headers : IO.Ref ImportHeaders) : LoggerIO UInt32 := do
+    (headers : ImportHeaders) : LoggerIO UInt32 := do
   let stored := storedRootsFor ws
   let cacheRoot ← cacheRootOf ws
   let cdir := Cache.buildDir cacheRoot
@@ -671,6 +783,7 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
       let imported : NameSet := depMods.foldl (·.insert ·.name) {}
       let mut nativeEntries : Std.HashMap String String := {}
       let mut toBuild : Array (Package × String) := #[]
+      let mut replacing : Std.HashSet String := {}
       if native then
         for pkg in deps do
           let key := pkgKey pkg
@@ -686,13 +799,36 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
           let kn ← nativeKey lean pkg (entries[i]!.drop "pack/".length).toString mods others hashes depKeys
           let e := s!"native/{Cache.entryName key kn}"
           nativeEntries := nativeEntries.insert key (Cache.entryPath e)
-          unless ← (cdir / e / "native.json").pathExists do
+          -- A metadata-only repair still replaces payload identities. Schedule every native
+          -- dependent now, even while its old receipt still matches the not-yet-replaced payload.
+          if (needsOf pkg).any replacing.contains ||
+              (← readPreparedNativeEntry cacheRoot (Cache.entryPath e) key).isNone then
             toBuild := toBuild.push (pkg, e)
+            replacing := replacing.insert key
       -- (the locks of the entries to write, in the order of their names, so that runs do not wait for
       -- each other in a cycle; another run may have written an entry meanwhile)
-      for (_, e) in toBuild.qsort (·.2 < ·.2) do
-        locks := locks.push (← Cache.lockKey cdir e)
-      toBuild ← toBuild.filterM fun (_, e) => return !(← (cdir / e / "native.json").pathExists)
+      traceNativeRepairs "scheduled" toBuild
+      let writers : Std.HashSet String := .ofArray (toBuild.map (·.2))
+      let mut locked := writers
+      for (pkg, _) in toBuild do
+        for d in needsOf pkg do
+          if let some entry := nativeEntries[d]? then
+            if let some e := entry.dropPrefix? (Cache.entryPath "") then locked := locked.insert e.toString
+      for e in locked.toArray.qsort (· < ·) do
+        locks := locks.push (← Cache.takeKeyLock cdir e (writers.contains e))
+      -- Recompute the dependency-closed repair set under the complete sorted lock set. A
+      -- concurrent winner may have repaired all of it, but a still-scheduled dependency prevents
+      -- its currently healthy importer from being filtered out before that dependency is replaced.
+      let mut rechecked : Array (Package × String) := #[]
+      replacing := {}
+      for (pkg, e) in toBuild do
+        let key := pkgKey pkg
+        if (needsOf pkg).any replacing.contains ||
+            (← readPreparedNativeEntry cacheRoot (Cache.entryPath e) key).isNone then
+          rechecked := rechecked.push (pkg, e)
+          replacing := replacing.insert key
+      toBuild := rechecked
+      traceNativeRepairs "rechecked" toBuild
       let builtNow := toBuild.map (pkgKey ·.1)
       -- (first: what changes while it is built then shows as something else)
       let (inputs, plans) ← try
@@ -723,11 +859,9 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
       -- the packs and bindings, which the process reads)
       let verdictsTask ← IO.mapTask (t := packTask) (prio := .dedicated) fun _ => do
         if plans.isEmpty then return ({} : Lean.PaperLean.EvalVerdicts)
-        let tmp := dir / "tmp-eval"
         let start ← IO.monoMsNow
-        let verdicts ← evalImpurities ws (toBuild.map (·.1))
-          (depPacks dir cacheRoot prepared' (← IO.ofExcept (← IO.wait toolchainTask))) tmp
-        IO.FS.removeDirAll tmp
+        let toolchain? ← IO.ofExcept (← IO.wait toolchainTask)
+        let verdicts ← evalImpurities ws (toBuild.map (·.1)) (depPacks dir cacheRoot #[] toolchain?) hashes
         IO.println s!"  evaluated the packages' constants ({showTime ((← IO.monoMsNow) - start)})"
         return verdicts
       let done ← IO.mkRef 0
@@ -785,7 +919,7 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
             continue
           let some entry := nativeEntries[key]? | continue
           unless builtNow.contains key do
-            match ← readNativeEntry cacheRoot entry with
+            match ← readPreparedNativeEntry cacheRoot entry key with
             | some n =>
               let (l, line, left) := nativeView pkg n imported
               pluginCode := n.excluded.foldl (·.erase ·.toName) pluginCode
@@ -803,13 +937,18 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
           let tmp := tmps[i]!
           while (← remaining.get) > 0 do
             IO.sleep 20
-          let depLibs : Array NativeLib := libs.filter (fun l => needs.contains l.pkg && l.modules > 0) |>.map fun l =>
+          let linkedDeps := libs.filter (fun l => needs.contains l.pkg && l.modules > 0)
+          let depLibs : Array NativeLib := linkedDeps.map fun l =>
             { pkg := l.pkg.toName, lib := cacheRoot / l.lib, manifest := cacheRoot / l.manifest, modules := l.modules,
               excluded := #[] }
           let verdicts ← IO.ofExcept (← IO.wait verdictsTask)
-          let (lib?, log) ← (finishNativeLib ws plan (← results.get) depLibs tmp jobs hashes verdicts).captureLog
+          let finishLib : LoggerIO (NativeLib × String × Array (String × String)) := do
+            let (symbols, receipts) ← dependencyData cacheRoot linkedDeps
+            let (lib, metaHash) ← finishNativeLibWithSymbols ws plan (← results.get) depLibs tmp jobs hashes verdicts symbols
+            return (lib, metaHash, receipts)
+          let (lib?, log) ← finishLib.captureLog
           log.replay
-          let some lib := lib?
+          let some (lib, metaHash, receipts) := lib?
             | -- the first line of the error, for the summary and `status`
               let why := (log.entries.find? (·.level == .error)).map (·.message.splitOn "\n" |>.head!) |>.getD "error"
               IO.eprintln s!"paperlean: the native library of {pkg.prettyName} could not be built (the error above)"
@@ -853,11 +992,18 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
               others := others.map (·.name.toString)
               config := packageConfig lean pkg }
             left := str left, own := str own, onPlugin := onPlugin.map toString
-            excluded := lib.excluded.map (·.1.toString) }
+            excluded := lib.excluded.map (·.1.toString)
+            files := ← if lib.modules == 0 then pure #[] else
+              #[lib.lib, lib.manifest, tmp / "meta-symbols.json"].mapM fun f => do
+                let some identity ← regularFileIdentity f
+                  | error s!"native payload disappeared before publication: {f}"
+                return (file f, identity)
+            metaHash
+            dependencies := receipts }
           if lib.modules > 0 then
             removePath (tmp / "obj")
             IO.FS.writeFile (tmp / "native.json") ((toJson n).pretty ++ "\n")
-            Cache.publish cdir tmp toBuild[i]!.2
+            publishNativeEntry cdir tmp toBuild[i]!.2
           let (l, line, left) := nativeView pkg n imported
           libs := libs.push l
           summary := summary.push line
@@ -883,7 +1029,8 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
             `lake build`, then run `paperlean prepare` again."
       -- The import image of the packs, written again if they changed.
       imagePacks := toolchain?.toArray ++ (prepared.map (·.pack)).filter (!·.isEmpty)
-      if old?.any (fun old => old.imagePacks == imagePacks && old.image?.isSome) then
+      if old?.any (fun old => old.imagePacks == imagePacks) &&
+          (← checkImportImage dir (old?.bind (·.image?))) then
         image? := old?.bind (·.image?)
       else
         image? ← writeImage ws dir stamp depMods (depPacks dir cacheRoot prepared toolchain?)
@@ -977,17 +1124,24 @@ public def prepare (ws : Workspace) (opts : PrepareOptions) : LoggerIO UInt32 :=
     | some (.ok d) => if d.mismatch?.isNone then some d else none
     | _ => none
   let before := old?.map (·.packages) |>.getD #[]
-  let (deps, built) := plan allDeps before (old?.map (·.libs) |>.getD #[]) opts.packages opts.root
+  -- Named preparation repairs damaged retained entries too, and rebuilds their dependents.
+  let oldLibs ← (old?.map (·.libs) |>.getD #[]).filterM fun l => do
+    if l.entry.isEmpty then return true
+    let some old := old? | return false
+    let some n ← readPreparedNativeEntry old.cache l.entry l.pkg | return false
+    return n.lib.lib == l.lib && n.lib.manifest == l.manifest && n.lib.modules == l.modules
+  let (deps, built) := plan allDeps before oldLibs opts.packages opts.root
+  let oldImageUsable ← importImageUsable dir (old?.bind (·.image?))
   -- the dependency data stays as it is if it holds these packages and no library is built again
   let keepDeps := old?.isSome && opts.packages.isSome && built.isEmpty &&
-    deps.size == before.size && deps.all (before.contains <| pkgKey ·)
+    deps.size == before.size && deps.all (before.contains <| pkgKey ·) && oldImageUsable
   if keepDeps && !opts.root then
     IO.println s!"{", ".intercalate ((opts.packages.getD #[]).map (·.prettyName)).toList} and the \
       packages they depend on are prepared already."
     return 0
   -- The dependency modules that the root package imports must be built: their packed files are
   -- what imports read. (Without root modules, the built modules of the dependencies.)
-  let headers ← readImportHeaders ws
+  let headers ← readImportHeaders ws (write := true)
   let (imported, candidates) ← imageModules ws deps headers
   let mut missing := 0
   let mut missingEx := #[]
@@ -1025,8 +1179,7 @@ public def prepare (ws : Workspace) (opts : PrepareOptions) : LoggerIO UInt32 :=
     let stamp ← freshStamp dir
     try
       let code ← prepareIn ws opts dir stamp deps built keepDeps depMods rootMods rootUnbuilt native old? headers
-      if code == 0 then
-        try writeImportHeaders dir headers catch _ => pure ()
+      if code == 0 then headers.save
       return code
     catch e => removeFailedRun ws dir stamp; throw e
 
@@ -1139,8 +1292,8 @@ def removeLeftDeltas (dir : FilePath) (base : String) (packs : Array String) : I
     match p.splitOn ".tmp." with
     | [pack, pid] =>
       if isDeltaPath pack then
-        if let some pid := pid.toNat? then
-          unless ← Lean.PaperLean.processAlive pid.toUInt32 do removePath e.path
+        if let some pid := writerPid? pid then
+          unless ← Lean.PaperLean.processAlive pid do removePath e.path
     | _ => if isDeltaPath p && !packs.contains p then BuildData.removePack e.path
 
 /-- `paperlean build --prepare`: packs the files of the root package's current modules that its

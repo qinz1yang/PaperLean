@@ -54,13 +54,23 @@ def slots(cache):
     return json.loads((cache / "slots.json").read_text())
 
 
-def lock_held(lock):
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return True
-    fcntl.flock(lock, fcntl.LOCK_UN)
-    return False
+def opened_lock(pid, path):
+    # The parent holds the lock, so the writer keeps its descriptor open while
+    # blocked inside the production allocator/publisher. No scheduling delay
+    # or assumption about the kernel's eventual waiter order is needed.
+    fds = Path("/proc") / str(pid) / "fd"
+    if fds.is_dir():
+        for fd in fds.iterdir():
+            try:
+                if fd.samefile(path):
+                    return True
+            except OSError:
+                continue
+        return False
+    # macOS has no procfs. lsof can inspect the test's own child.
+    return subprocess.run(["lsof", "-nP", "-a", "-p", str(pid), "--", str(path)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=5).returncode == 0
 
 
 def assert_disjoint(rows):
@@ -76,21 +86,21 @@ try:
     wait_until(lambda: (a / "ready").exists(), "waiting for first reservation")
     _, pending, base = (a / "ready").read_text().splitlines()
     before = (cache / "slots.json").read_bytes()
-    # readSlots opens this FIFO only after taking slots.lock. Unlike gating its output, this leaves
-    # the helper's following writeSlots free to atomically replace the FIFO with regular metadata.
-    (cache / "slots.json").unlink()
-    os.mkfifo(cache / "slots.json")
-    (a / "release").touch()
-    with open(cache / "slots.lock", "a") as lock:
-        wait_until(lambda: lock_held(lock), "waiting for publisher's metadata read")
-        assert (cache / pending).is_dir(), "publisher renamed the pack before recording final ownership"
+    lock_path = cache / "slots.lock"
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        (a / "release").touch()
+        wait_until(lambda: opened_lock(pa.pid, lock_path), "publisher reaching slots.lock")
+        assert (cache / pending).is_dir(), "publisher renamed its pack before taking slots.lock"
         assert not (cache / "pack/a").exists()
         (b / "release").touch()
         pb = spawn(["writer", cache, "b", b], "b")
         wait_until(lambda: (b / "started").exists(), "starting different-entry allocator")
-        assert not (b / "ready").exists(), "allocator bypassed publisher's slot lock"
-        with open(cache / "slots.json", "wb", buffering=0) as fifo:
-            fifo.write(before)
+        wait_until(lambda: opened_lock(pb.pid, lock_path), "allocator reaching slots.lock")
+        assert not (b / "ready").exists(), "allocator bypassed the slot lock"
+        assert (cache / "slots.json").read_bytes() == before, "metadata changed without the slot lock"
+    # Either waiter may acquire the released lock first. The ranges must be
+    # disjoint both before and after the pending owner's directory is renamed.
     finish(pa)
     finish(pb)
     rows = slots(cache)

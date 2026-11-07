@@ -10,6 +10,16 @@ normalize_mvar_suffixes
 normalize_reference_urls
 normalize_measurements
 check_out_file
-check_exit_is_fail
+# A matching diagnostic followed by a signal is still a crashing test. Fixtures
+# requiring a different ordinary failure code must state it explicitly.
+EXPECTED_ELAB_EXIT=1
+if [[ -f "$1.exit.expected" ]]; then
+    EXPECTED_ELAB_EXIT=$(cat "$1.exit.expected")
+    if [[ ! "$EXPECTED_ELAB_EXIT" =~ ^[1-9][0-9]{0,2}$ ]] || (( 10#$EXPECTED_ELAB_EXIT > 125 )); then
+        echo "invalid expected elaborator exit in $1.exit.expected (expected 1..125)" >&2
+        exit 1
+    fi
+fi
+check_exit_is "$EXPECTED_ELAB_EXIT"
 
 run_after "$1"

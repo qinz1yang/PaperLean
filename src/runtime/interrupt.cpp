@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include <limits>
+#include <utility>
 #include "runtime/thread.h"
 #include "runtime/interrupt.h"
 #include "runtime/exception.h"
@@ -26,6 +27,11 @@ extern "C" LEAN_EXPORT obj_res lean_internal_get_default_max_heartbeat() {
 }
 
 void inc_heartbeat() { g_heartbeat++; }
+
+// Snapshot the kernel check counter for a PaperLean trial, restoring it on scope exit.
+extern "C" LEAN_EXPORT size_t lean_paperlean_swap_kernel_heartbeats(size_t n) {
+    return std::exchange(g_heartbeat, n);
+}
 
 void reset_heartbeat() { g_heartbeat = 0; }
 
@@ -85,13 +91,13 @@ LEAN_THREAD_VALUE(lean_object *, g_cancel_tk, nullptr);
 
 LEAN_EXPORT scope_cancel_tk::scope_cancel_tk(lean_object * o):flet<lean_object *>(g_cancel_tk, o) {}
 
-// `IO.CancelToken` is `structure { promise : IO.Promise Unit; setRef : IO.Ref Bool }`. We read
-// the `Bool` flag (field 1) directly: cheaper than walking the promise's task state, and this
-// is on the hot `Core.checkInterrupted` path. Must stay in sync with the field order in
-// `Init/System/CancelToken.lean`.
+// IO.CancelToken.setRef is an IO.Ref Bool. A shared reference can be temporarily
+// empty while another reader owns its value, so use the synchronized reference API.
 static bool cancel_tk_is_set(lean_object * tk) {
-    lean_object * setRef = lean_ctor_get(tk, 1);
-    return lean_unbox(lean_to_ref(setRef)->m_value) != 0;
+    lean_object * flag = lean_st_ref_get(lean_ctor_get(tk, 1));
+    bool set = lean_unbox(flag) != 0;
+    lean_dec(flag);
+    return set;
 }
 
 void check_interrupted() {

@@ -17,6 +17,7 @@ import Lake.Build.Target
 import Init.Omega
 import Lake.PaperLean.BuildData
 import Lake.PaperLean.Schedule
+import Lake.PaperLean.SourceInputs
 import Lake.PaperLean.SetupIndex
 import Lake.PaperLean.Env
 
@@ -30,6 +31,10 @@ namespace Lake
 Build function definitions for a module's builtin facets.
 -/
 
+initialize PaperLean.SetupIndex.registerHeaderParser fun source =>
+  let s := Lean.ParseImports.main source (Lean.ParseImports.whitespace source {})
+  if s.error?.isSome then none else some ({s with}, s.pos.byteIdx)
+
 /-- Parse the header of a Lean file from its source. -/
 def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async do
   let path := mod.leanFile
@@ -41,28 +46,17 @@ def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async 
     return ⟨imp, (← findModule? imp.module)⟩
   return {path, header, imports, trace}
 
-/-- PaperLean: `recFetchInput`, the facet's build function, with the import graph noted. -/
-def PaperLean.recFetchInputNoted (mod : Module) : FetchM (Job ModuleInput) := Job.async do
-  let path := mod.leanFile
-  let contents ← IO.FS.readFile path
-  let trace := {caption := path.toString, mtime := ← getMTime path, hash := .ofText contents}
-  setTrace trace
-  let header ← Lean.parseImports' contents path.toString
-  let imports ← header.imports.mapM fun imp => do
-    return ⟨imp, (← findModule? imp.module)⟩
-  -- PaperLean: under `paperlean build`, the import graph for the order of compiles
-  -- (`Lake.PaperLean.Schedule`), and the imports' headers read meanwhile, which the build otherwise
-  -- reads one at a time as it walks into the imports (`Module.importInfoFacetConfig`); an import
-  -- cycle that this runs into is left to the walk to report, as without this
-  PaperLean.Schedule.noteModule mod imports (·.module?) contents.utf8ByteSize
-  if ← PaperLean.accelerated then
-    PaperLean.SetupIndex.note (← getWorkspace) mod header.isModule imports
-      (fun i => (i.toImport, i.module?.isSome))
-    for imp in imports do
-      if let some m := imp.module? then
-        let s ← get
-        try discard <| m.header.fetch catch _ => set s
-  return {path, header, imports, trace}
+private def selectedInput (mod : Module) (r : PaperLean.SourceInputs.Result) : JobM ModuleInput := do
+  let imports ← r.header.imports.mapM fun imp => do return ⟨imp, (← findModule? imp.module)⟩
+  (← PaperLean.Schedule.sessionFor (← getBuildContext)).noteModule mod imports (·.module?) r.bytes
+  return {path := mod.leanFile, header := r.header, imports, trace := r.trace}
+
+/-- Resolve the selected input against this execution's workspace. Only a
+descriptor-verified cache hit can be delivered without a fresh source read. -/
+def PaperLean.recFetchInputNoted (mod : Module) : FetchM (Job ModuleInput) := do
+  match ← PaperLean.SourceInputs.selectRead (← getBuildContext) mod.leanFile with
+  | .hit r => Job.sync do setTrace r.trace; selectedInput mod r
+  | .miss read => Job.async do selectedInput mod (← read)
 
 /-- The `ModuleFacetConfig` for the builtin `inputFacet`. -/
 -- PaperLean: (not inlined: its body refers to PaperLean's code)
@@ -706,8 +700,8 @@ fallback in the conventional setup file (`Lake.compileLeanModule`).
 -/
 def PaperLean.moduleSetup (mod : Module) (presetup : ModulePreSetup) : FetchM ModuleSetup := do
   if ← PaperLean.accelerated then
-    if let some (file, i) ← PaperLean.SetupIndex.indexFor (← getWorkspace).dir mod then
-      let moved ← PaperLean.SetupIndex.moved
+    if let some (file, i) ← PaperLean.SetupIndex.indexForModule (← getWorkspace) mod then
+      let moved ← PaperLean.SetupIndex.indexedMoves (← getBuildContext)
       let arts ← if moved.isEmpty then pure {} else
         (·.filter fun n _ => moved.contains n) <$>
           fetchTransImportArts presetup.directImports presetup.directImportArts !presetup.isModule
@@ -1053,7 +1047,8 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   (mod : Module) (presetup : ModulePreSetup)
 : JobM ModuleOutputArtifacts := do
   -- PaperLean: a module that compiles first waits for a slot (`Module.recBuildLean`)
-  if (← PaperLean.Schedule.deferCompile mod) then failure
+  let scheduler ← PaperLean.Schedule.sessionFor (← getBuildContext)
+  if ← scheduler.deferCompile mod then failure
   buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
@@ -1061,11 +1056,12 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   -- PaperLean: packs modules compiled by this build for later ones (`Lake.PaperLean.BuildData`)
-  PaperLean.BuildData.compileStarting mod (← getWorkspace).dir (← getLeanInstall).leanLibDir
+  let ctx ← getBuildContext
+  PaperLean.BuildData.compileStartingFor ctx mod (← getWorkspace).dir (← getLeanInstall).leanLibDir
   let start ← IO.monoMsNow
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
-    (← getLeanPath) (← getLean) (← getLeanir)
-  PaperLean.Schedule.compiled mod ((← IO.monoMsNow) - start)
+  compileLeanModuleForBuild (PaperLean.BuildData.leanEnvFor ctx) (PaperLean.SetupIndex.launchDirFor ctx)
+    presetup.srcFile relSrcFile setup mod.setupFile arts args (← getLeanPath) (← getLean) (← getLeanir)
+  scheduler.compiled mod ((← IO.monoMsNow) - start)
   mod.clearOutputHashes
   mod.computeArtifacts setup.isModule
 
@@ -1215,23 +1211,24 @@ def PaperLean.recBuildLeanScheduled (mod : Module) : FetchM (Job ModuleOutputArt
   -- PaperLean: under `paperlean build`, a module that compiles waits for a slot of the build's
   -- scheduler (`Lake.PaperLean.Schedule`): its job runs up to its compile (`Module.buildLean`), which
   -- it then does not do, and runs again once it has a slot; the job is settled when it ends
-  if (← PaperLean.Schedule.active) && !(← getNoBuild) then
-    PaperLean.Schedule.register mod
+  let scheduler ← PaperLean.Schedule.sessionFor (← getBuildContext)
+  if scheduler.active && !(← getNoBuild) then
+    scheduler.register mod
     let job ← presetupJob.bindM fun presetup => do
       let s ← get
       setTrace presetup.trace
-      PaperLean.Schedule.beginDry mod
+      scheduler.beginDry mod
       let r ← try Except.ok <$> run presetup catch e => pure (.error e)
-      unless ← PaperLean.Schedule.endDry mod do
+      unless ← scheduler.endDry mod do
         match r with
         | .ok arts => return .ofTask (.pure (.ok arts {trace := ← getTrace}))
         | .error e => throw e
       set s
-      let slot ← PaperLean.Schedule.request mod
+      let slot ← scheduler.request mod
       Job.ofTask (slot.map (sync := true) fun _ => .ok () {}) |>.mapM fun _ => do
         setTrace presetup.trace
         run presetup
-    PaperLean.Schedule.settleAfter mod (job.task.map (sync := true) (· matches .ok ..))
+    scheduler.settleAfter mod (job.task.map (sync := true) (· matches .ok ..))
     return job
   presetupJob.mapM fun presetup => do
     setTrace presetup.trace
@@ -1241,9 +1238,7 @@ where
     let arts ← Module.recBuildLean.fetchCore mod presetup
     let arts ← Module.recBuildLean.trackOutputsIfEnabled mod arts
     let arts ← Module.recBuildLean.adjustMTime mod arts
-    PaperLean.BuildData.moduleDone mod
-    PaperLean.SetupIndex.noteArtifacts mod presetup.isModule <| #[some arts.olean,
-      arts.oleanServer?, arts.oleanPrivate?, arts.irSig?, arts.ir?].filterMap (·.map (·.path))
+    PaperLean.BuildData.moduleDoneFor (← getBuildContext) mod
     return arts
 
 /-- The `ModuleFacetConfig` for the builtin `leanArtsFacet`. -/

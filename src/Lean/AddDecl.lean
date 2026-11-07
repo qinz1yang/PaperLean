@@ -14,6 +14,7 @@ import Lean.Linter.Init
 import Lean.Compiler.MetaAttr
 import Lean.Util.RecDepth
 import all Lean.OriginalConstKind  -- for accessing `privateConstKindsExt`
+import Lean.PaperLean.ProofInputs
 
 public section
 
@@ -157,7 +158,9 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
     (exportedKind? := exportedInfo?.map (.ofConstantInfo))
   -- report preliminary constant info immediately
   async.commitConst async.asyncEnv (some info) (exportedInfo? <|> info)
-  setEnv async.mainEnv
+  let mainEnv ← PaperLean.ProofInputs.record async.mainEnv decl (← getOptions)
+    (exportedInfo?.any (fun i => i matches .defnInfo _))
+  setEnv mainEnv
 
   let doAddAndCommit := do
     setEnv async.asyncEnv
@@ -178,7 +181,7 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
     try
       doAddAndCommit
     finally
-      setEnv async.mainEnv
+      setEnv mainEnv
 where
   doAdd := do
     profileitM Exception "type checking" (← getOptions) do

@@ -5,8 +5,9 @@ open Lean
 set_option Elab.async false
 
 /-!
-Reproducer for the reference-count overflow of #14383. Actual reproduction needs `depth` bump below
-and ~12GB of free RAM.
+Regression for the reference-count overflow of #14383. The daily test uses depth 12.
+The separate `tests/stress/rc_overflow.py` runner uses depth 30 with time and resource limits;
+actual overflow reproduction requires roughly 12GB of free RAM.
 
 `maxDag` builds a `Level` DAG that expands to `2 ^ depth` occurrences of a single shared leaf, so
 checking a declaration whose type mentions it drives that leaf object's 32-bit reference count past
@@ -37,9 +38,8 @@ theorem encOneFalse (value : Enc.{1}.val) : False :=
 
 private def candidateName := `RCOverflow.Candidate
 
-private def falseName := `RCOverflow.false
+private def controlName := `RCOverflow.Control
 
---private def depth := 30
 private def depth := 12
 
 private def maxDag (leaf : Level) : Nat → Level
@@ -56,26 +56,31 @@ private def targetType (dag : Level) (paddingDepth : Nat) : Expr :=
     (mkLet `padding (mkConst ``Nat) (paddingTree 1 paddingDepth)
       (mkProj ``Subtype 0 (mkConst ``Enc [dag])) true) true
 
-private def perform (env : Environment) (depth paddingDepth : Nat) :
+private def perform (env : Environment) (name : Name) (leaf : Level) (depth paddingDepth : Nat) :
     IO (Except Kernel.Exception Environment) := do
   let declaration : Declaration := .thmDecl {
-    name := candidateName, levelParams := [`u]
-    type := targetType (maxDag (Level.param `u) depth) paddingDepth
+    name, levelParams := [`u]
+    type := targetType (maxDag leaf depth) paddingDepth
     value := mkConst ``encZero }
   return env.addDeclCore 0 4000 declaration none
 
 end RCOverflow
 
 run_meta do
-  let task ← IO.asTask (RCOverflow.perform (← getEnv) RCOverflow.depth 13) Task.Priority.dedicated
+  let env ← getEnv
+  -- An equally shaped legal declaration must reach and pass the kernel checker.
+  let controlTask ← IO.asTask
+    (RCOverflow.perform env RCOverflow.controlName Level.zero RCOverflow.depth 13)
+    Task.Priority.dedicated
+  let .ok control := controlTask.get | throwError "positive-control task failed"
+  let .ok _ := control | throwError "kernel rejected the legal positive control"
+  let task ← IO.asTask
+    (RCOverflow.perform env RCOverflow.candidateName (Level.param `u) RCOverflow.depth 13)
+    Task.Priority.dedicated
   let .ok candidate := task.get | throwError "dedicated task failed"
-  let .ok env := candidate | return
-  let falseDecl : Declaration := .thmDecl {
-    name := RCOverflow.falseName, levelParams := []
-    type := mkConst ``False
-    value := mkApp (mkConst ``RCOverflow.encOneFalse)
-      (mkConst RCOverflow.candidateName [Level.one]) }
-  let .ok env := env.addDeclCore 0 4000 falseDecl none
-    | throwError "candidate accepted, but `False` was rejected"
-  setEnv env
-  logInfo m!"`False` accepted with axioms {← collectAxioms RCOverflow.falseName}"
+  match candidate with
+  | .error (.declTypeMismatch _ (.thmDecl info) _) =>
+    unless info.name == RCOverflow.candidateName do
+      throwError "kernel reported a type mismatch for the wrong declaration"
+  | .error _ => throwError "expected the candidate's universe/type mismatch, not another kernel error"
+  | .ok _ => throwError "kernel accepted the invalid polymorphic candidate"

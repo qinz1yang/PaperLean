@@ -1150,6 +1150,9 @@ compared with the one of `whnf`, and the process exits on a difference. -/
 private builtin_initialize projOracle : Bool ← return (← IO.getEnv "PAPERLEAN_PROJ_ORACLE").isSome
 private builtin_initialize projOracleCount : IO.Ref Nat ← IO.mkRef 0
 
+@[extern "lean_paperlean_projection_oracle_log"]
+private opaque logProjectionOracle (line : @& String) : BaseIO Unit
+
 /-- PaperLean: checks that `whnfImp r` caches nothing and gives `r`, whose field `i` is `f`; reports
 to the process's standard error, which elaboration does not capture. -/
 private def checkProjOracle (r f : Expr) (i : Nat) : MetaM Unit := do
@@ -1158,8 +1161,7 @@ private def checkProjOracle (r f : Expr) (i : Nat) : MetaM Unit := do
   let ok := !(← useWHNFCache r) && r'.equal r && f'.any (·.equal f)
   let n ← projOracleCount.modifyGet fun n => (n + 1, n + 1)
   if !ok || (n &&& (n - 1)) == 0 then
-    let h ← IO.FS.Handle.mk "/dev/stderr" .append
-    h.putStrLn <| if ok then s!"PAPERLEAN_PROJ_ORACLE: {n} fields checked" else
+    logProjectionOracle <| if ok then s!"PAPERLEAN_PROJ_ORACLE: {n} fields checked" else
       s!"PAPERLEAN_PROJ_ORACLE: field {i} of {r}\nis {f'}, not {f}, whnf {r'}"
     unless ok do IO.Process.exit 77
 
@@ -1184,17 +1186,27 @@ private def unfoldDefaultProj? (fInfo : ConstantInfo) (us : List Level) (e : Exp
   let max ← MonadRecDepth.getMaxRecDepth
   if max != 0 && (← MonadRecDepth.getRecDepth) == max then return none
   recordUnfold fInfo.name
-  let val ← instantiateValueLevelParams fInfo us
+  -- Reuse an existing full-value memo. On a miss instantiate only the selected raw field; populating
+  -- the full-value memo would traverse all the fields this fast path is meant to avoid.
+  let rawField := b.getArg! (cval.numParams + i)
+  let memo := (← getThe Core.State).cache.instLevelValue.find? fInfo.name
+  let field? := match memo with
+    | some (us', val) =>
+      if us == us' then (betaBody? val n).map (·.getArg! (cval.numParams + i))
+      else some (rawField.instantiateLevelParams fInfo.levelParams us)
+    | none => some (rawField.instantiateLevelParams fInfo.levelParams us)
   -- (`unfoldDefault`'s check of a class field, which leaves a constructor application as it is)
   if backward.whnf.reducibleClassField.get (← getOptions) && (← getTransparency) matches .reducible then
     discard <| isProjInst fInfo.name
   let revArgs := e.getAppRevArgs
-  if let some b := betaBody? val n then
-    let f := PaperLean.exprInstantiate (b.getArg! (cval.numParams + i)) revArgs
+  if let some field := field? then
+    let f := PaperLean.exprInstantiate field revArgs
     if (← read).customCanUnfoldPredicate?.isSome || f.hasFVar || f.hasExprMVar then
-      if projOracle then checkProjOracle (val.betaRev revArgs) f i
+      if projOracle then
+        checkProjOracle ((← instantiateValueLevelParams fInfo us).betaRev revArgs) f i
       return some (.inr f)
-  return some (.inl (PaperLean.betaRev val revArgs))
+  -- The fallback and the oracle still instantiate and memoize the complete value as before.
+  return some (.inl (PaperLean.betaRev (← instantiateValueLevelParams fInfo us) revArgs))
 
 /-- PaperLean: `unfoldDefault fInfo us e` for a definition with as many universe parameters as `us`,
 beta-reducing with `PaperLean.betaRev`. -/

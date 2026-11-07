@@ -6,6 +6,7 @@ module
 
 prelude
 public import Lake.Config.Module
+public import Lake.PaperLean.BuildSessions
 import Lake.PaperLean.Env
 import Lean.PaperLean.System
 import Std.Data.HashMap.Basic
@@ -55,6 +56,7 @@ inductive Event where
   | finished (mod : Key) (ok : Bool)
 
 structure State where
+  keepMs : UInt32 := 50
   /-- Set by `finish`. -/
   closed : Bool := false
   /-- The number of slots that are free and not kept for a module. -/
@@ -101,10 +103,23 @@ structure State where
   file : FilePath
   deriving Inhabited
 
-private builtin_initialize stateRef : IO.Ref (Option (IO.Ref State)) ← IO.mkRef none
+/-- The scheduler of a single build, shared by exactly that build’s jobs. -/
+public structure Session where
+  private state? : Option (IO.Ref State) := none
+  deriving Inhabited
 
-/-- How long a slot is kept for a coming module at most (ms): its job may still wait for others. -/
-private builtin_initialize keepFor : IO.Ref UInt32 ← IO.mkRef 50
+/-- A queue is freshly allocated for each Lake runner. A custom job can also replace
+the workspace in its build context; in that case it uses ordinary Lake scheduling. -/
+private initialize sessions : BuildSessions Session ← BuildSessions.new
+private initialize standalone : IO.Ref Session ← IO.mkRef {}
+
+/-- Returns the scheduler that registered this job, or an inactive session. -/
+public def sessionFor (ctx : BuildContext) : BaseIO Session := do
+  return (← sessions.find? ctx).getD {}
+
+/-- The legacy standalone API can also observe an unambiguous active workspace build. -/
+private def currentSession : BaseIO Session := do
+  return (← sessions.singleOr? (some (← standalone.get))).getD {}
 
 /-- The first line of the record: its format, and the version and build of PaperLean and Lean's
 commit that wrote it. -/
@@ -135,25 +150,26 @@ private def poolSize : BaseIO Nat := do
 
 /-- Starts scheduling at the start of a build of the workspace in `wsDir` under a `paperlean` command
 (`accelerated`). -/
-public def start (wsDir : FilePath) : BaseIO Unit := do
-  stateRef.set none
-  unless ← accelerated do return
-  if (← IO.getEnv "PAPERLEAN_SCHEDULE") == some "0" then return
+private def newSession (wsDir : FilePath) : BaseIO Session := do
+  unless ← accelerated do return {}
+  if (← IO.getEnv "PAPERLEAN_SCHEDULE") == some "0" then return {}
   let slots ← match (← IO.getEnv "PAPERLEAN_SCHEDULE_SLOTS").bind (·.toNat?) with
     | some n => pure (max 1 n)
     | none => poolSize
-  if let some ms := (← IO.getEnv "PAPERLEAN_SCHEDULE_KEEP").bind (·.toNat?) then
-    keepFor.set ms.toUInt32
+  let keepMs := ((← IO.getEnv "PAPERLEAN_SCHEDULE_KEEP").bind (·.toNat?)).getD 50
   let file := recordFile wsDir
   let times ← if ← isSpecialFile file then pure {} else
     match ← (IO.FS.readFile file).toBaseIO with
     | .ok text => pure (parseTimes text)
     | .error _ => pure {}
-  stateRef.set (some (← IO.mkRef { free := slots, times, file }))
+  return ⟨some (← IO.mkRef {free := slots, keepMs := keepMs.toUInt32, times, file})⟩
 
-/-- Whether this build schedules its compiles. -/
-public def active : BaseIO Bool :=
-  return (← stateRef.get).isSome
+public def startFor (ctx : BuildContext) (wsDir : FilePath) (enable := true) : BaseIO Session := do
+  let session ← if enable then newSession wsDir else pure {}
+  sessions.insert ctx session
+  return session
+
+public def Session.active (session : Session) : Bool := session.state?.isSome
 
 /-- The estimated compile time (ms) of a module whose source has `bytes` bytes, by a fit to the
 compile times of Mathlib's modules. -/
@@ -217,24 +233,25 @@ private def drain (s : State) : State :=
   events.foldr (fun e s => apply s e) { s with events := [] }
 
 /-- Runs `f` on the state of this build unless there is none or it is closed. -/
-@[inline] private def update (f : State → α × State) (dflt : α) : BaseIO α := do
-  let some m ← stateRef.get | return dflt
+@[inline] private def Session.update (session : Session) (f : State → α × State) (dflt : α) : BaseIO α := do
+  let some m := session.state? | return dflt
   m.modifyGet fun s => if s.closed then (dflt, s) else f s
 
 /-- Notes the module `mod`, whose source has `bytes` bytes, and its imports in the workspace. -/
-public def noteModule {α : Type} (mod : Module) (imports : Array α) (module? : α → Option Module)
+public def Session.noteModule {α : Type} (session : Session) (mod : Module) (imports : Array α) (module? : α → Option Module)
     (bytes : Nat) : BaseIO Unit := do
   -- (the imports' modules taken here, not by `Module.recFetchInput`, whose code then specializes
   -- as official Lean's)
+  unless session.active do return
   let imports := imports.filterMap module?
-  update (dflt := ()) fun s =>
+  session.update (dflt := ()) fun s =>
     let w := s.times[recordName mod]?.getD (estimate bytes)
     ((), { s with events := .note (keyOf mod) (imports.map keyOf) w :: s.events })
 
 /-- Records that the module `mod` has a job in this build (`Lake.Module.recBuildLean`), which
 `settleAfter` settles. -/
-public def register (mod : Module) : BaseIO Unit := do
-  update (dflt := ()) fun s => ((), { s with events := .registered (keyOf mod) :: s.events })
+public def Session.register (session : Session) (mod : Module) : BaseIO Unit := do
+  session.update (dflt := ()) fun s => ((), { s with events := .registered (keyOf mod) :: s.events })
 
 /-- The bottom level of module `i`: its time plus the longest bottom level of its importers. -/
 private partial def levelOf (weight : Array (Option Nat)) (importers : Array (Array Nat)) (i : Nat) :
@@ -312,7 +329,7 @@ private partial def wake (m : IO.Ref State) : Array (IO.Promise Unit) × Array N
     for p in ps do p.resolve ()
     for i in kept do
       discard <| BaseIO.asTask (prio := .dedicated) do
-        IO.sleep (← keepFor.get)
+        IO.sleep (← m.get).keepMs
         expire m i
 
 /-- Ends keeping a slot for the module `i` if it is still kept. -/
@@ -325,9 +342,9 @@ end
 
 /-- Requests a slot for the module `mod`, which is about to compile: the task completes once it has
 one, which goes back when its job ends (`settleAfter`). -/
-public def request (mod : Module) : BaseIO (Task Unit) := do
+public def Session.request (session : Session) (mod : Module) : BaseIO (Task Unit) := do
   let p ← IO.Promise.new
-  let granted ← update (dflt := true) fun s =>
+  let granted ← session.update (dflt := true) fun s =>
     let (i, s) := nodeOf (keyOf mod) (drain s)
     let s := { s with coming := s.coming.erase i, requested := s.requested.set! i true }
     if s.kept.contains i then (true, { s with kept := s.kept.erase i, holding := s.holding.insert i })
@@ -350,49 +367,72 @@ private def settle (m : IO.Ref State) (k : Key) (ok : Bool) : BaseIO Unit := do
 
 /-- Settles the module `mod` once `t`, whether its job succeeded, completes, whatever the job did:
 also if it failed before it ran or was cancelled. -/
-public def settleAfter (mod : Module) (t : Task Bool) : BaseIO Unit := do
-  let some m ← stateRef.get | return
+public def Session.settleAfter (session : Session) (mod : Module) (t : Task Bool) : BaseIO Unit := do
+  let some m := session.state? | return
   let k := keyOf mod
   discard <| BaseIO.mapTask (t := t) (sync := true) fun ok => settle m k ok
 
 /-- Starts running the job of the module `mod` up to its compile, which it does not do then
 (`deferCompile`). -/
-public def beginDry (mod : Module) : BaseIO Unit :=
-  update (dflt := ()) fun s => ((), { s with dry := s.dry.insert (keyOf mod) })
+public def Session.beginDry (session : Session) (mod : Module) : BaseIO Unit :=
+  session.update (dflt := ()) fun s => ((), { s with dry := s.dry.insert (keyOf mod) })
 
 /-- Ends `beginDry`: whether the job reached its compile. -/
-public def endDry (mod : Module) : BaseIO Bool :=
+public def Session.endDry (session : Session) (mod : Module) : BaseIO Bool :=
   let k := keyOf mod
-  update (dflt := false) fun s =>
+  session.update (dflt := false) fun s =>
     (s.deferred.contains k, { s with dry := s.dry.erase k, deferred := s.deferred.erase k })
 
 /-- Called before the module `mod` compiles: whether it is to stop there (`beginDry`). -/
-public def deferCompile (mod : Module) : BaseIO Bool :=
+public def Session.deferCompile (session : Session) (mod : Module) : BaseIO Bool :=
   let k := keyOf mod
-  update (dflt := false) fun s =>
+  session.update (dflt := false) fun s =>
     if s.dry.contains k then (true, { s with deferred := s.deferred.insert k }) else (false, s)
 
 /-- Records that the module `mod` compiled in `ms` milliseconds. -/
-public def compiled (mod : Module) (ms : Nat) : BaseIO Unit :=
-  update (dflt := ()) fun s =>
+public def Session.compiled (session : Session) (mod : Module) (ms : Nat) : BaseIO Unit :=
+  session.update (dflt := ()) fun s =>
     ((), { s with events := .compiled (keyOf mod) :: s.events,
                   measured := (recordName mod, ms) :: s.measured })
 
 /-- Ends scheduling at the end of the build: closes the state, lets modules still waiting (whose jobs
 the build did not wait for) go on, and writes the compile times measured, with those of earlier
 builds. -/
-public def finish : BaseIO Unit := do
-  let some m ← stateRef.swap none | return
+private def Session.close (session : Session) : BaseIO Unit := do
+  let some m := session.state? | return
   let s ← m.modifyGet fun s => (s, { s with closed := true, waiting := #[] })
   for (_, p) in s.waiting do p.resolve ()
   removeStaleTemps s.file
   if s.measured.isEmpty then return
   let times := s.measured.foldr (fun (n, ms) t => t.insert n ms) s.times
   let text := times.fold (init := header ++ "\n") fun out n ms => out ++ s!"{ms} {n}\n"
-  let tmp := s.file.addExtension s!"tmp.{← IO.Process.getPID}"
   discard <| (do
     if let some dir := s.file.parent then IO.FS.createDirAll dir
-    IO.FS.writeFile tmp text
-    IO.FS.rename tmp s.file).toBaseIO
+    publishFile s.file (·.putStr text)).toBaseIO
+
+public def finishFor (ctx : BuildContext) (session : Session) : BaseIO Unit := do
+  discard <| sessions.take? ctx
+  session.close
+
+-- Keep the standalone entry points for callers compiled against earlier releases.
+public def start (wsDir : FilePath) : BaseIO Unit := do
+  (← standalone.swap (← newSession wsDir)).close
+
+public def finish : BaseIO Unit := do
+  (← standalone.swap {}).close
+
+public def active : BaseIO Bool := return (← currentSession).active
+
+public def noteModule {α : Type} (mod : Module) (imports : Array α) (module? : α → Option Module)
+    (bytes : Nat) : BaseIO Unit := do (← currentSession).noteModule mod imports module? bytes
+
+public def register (mod : Module) : BaseIO Unit := do (← currentSession).register mod
+public def request (mod : Module) : BaseIO (Task Unit) := do (← currentSession).request mod
+public def settleAfter (mod : Module) (t : Task Bool) : BaseIO Unit := do
+  (← currentSession).settleAfter mod t
+public def beginDry (mod : Module) : BaseIO Unit := do (← currentSession).beginDry mod
+public def endDry (mod : Module) : BaseIO Bool := do (← currentSession).endDry mod
+public def deferCompile (mod : Module) : BaseIO Bool := do (← currentSession).deferCompile mod
+public def compiled (mod : Module) (ms : Nat) : BaseIO Unit := do (← currentSession).compiled mod ms
 
 end Lake.PaperLean.Schedule

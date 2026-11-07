@@ -6,7 +6,7 @@ A high-performance fork of the Lean 4 compiler.
 
 **If Lean rejects a proof at every resource limit, PaperLean rejects it too.**
 
-PaperLean preserves mathematical statements and results. Lean’s unmodified kernel checks every proof, and build caches work with either toolchain.
+PaperLean preserves mathematical statements and results. Lean’s unmodified kernel checks every proof. Official Lean reads the `.olean` files PaperLean produces. Acceleration data is stored separately.
 
 A proof that exhausts Lean’s heartbeat budget may pass in PaperLean. The guarantee covers ordinary mathematical code. Adversarial meta-code that exploits compiler internals or caches is outside its scope.
 
@@ -14,7 +14,7 @@ A proof that exhausts Lean’s heartbeat budget may pass in PaperLean. The guara
 
 ### Time and memory
 
-![Mathlib and KrullDimension.Field compilation time and peak memory](paperlean/performance.svg)
+![Mathlib and KrullDimension.Field compilation time and memory](paperlean/performance.svg)
 
 ### Disk usage
 
@@ -25,8 +25,8 @@ A proof that exhausts Lean’s heartbeat budget may pass in PaperLean. The guara
 ## How to use
 
 ```bash
-elan toolchain install qinz1yang/PaperLean:v0.2.2-lean4.35.0-rc3
-elan run qinz1yang/PaperLean:v0.2.2-lean4.35.0-rc3 paperlean install
+elan toolchain install qinz1yang/PaperLean:v0.2.3-lean4.35.0-rc3
+elan run qinz1yang/PaperLean:v0.2.3-lean4.35.0-rc3 paperlean install
 ```
 
 In a project on Lean `v4.35.0-rc3`:
@@ -57,7 +57,7 @@ As Mathlib and other Lean libraries grow, including those maintained by AI, thes
 - **Meta code** — tactics, elaborators and linters of dependencies run as native code.
 - **Reuse** — type class results and section variables across commands.
 - **Setup** — a shared index replaces repeated transitive artifact paths in `paperlean build`.
-- **Build** — release toolchains are built with PGO, and BOLT on Linux; the build in this repository does not do this.
+- **Build** — release toolchains use [PGO and, on Linux, BOLT](doc/dev/optimized-builds.md). A default source build uses neither.
 
 ## License
 

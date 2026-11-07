@@ -14,26 +14,43 @@ option(USE_MIMALLOC "use mimalloc" ON)
 # Use standard release build (discarding LEAN_EXTRA_CXX_FLAGS etc.) for stage0 by default since it is assumed to be "good", but still pass through CMake platform arguments (compiler, toolchain file, ..).
 # Use `STAGE0_` prefix to pass variables to stage0 explicitly.
 get_cmake_property(vars CACHE_VARIABLES)
+# ExternalProject decodes LIST_SEPARATOR in the final command line. Keep semicolons inside a
+# single -D argument through all intermediate CMake lists, including escaped literal semicolons.
+# Choose a deterministic delimiter absent from the actual inputs to avoid rewriting literal text.
+set(_stage_inputs "${CMAKE_SOURCE_DIR}\n${CMAKE_BINARY_DIR}\n${CMAKE_COMMAND}\n${CMAKE_GENERATOR}")
+foreach(var IN LISTS vars)
+  string(APPEND _stage_inputs "\n${var}=${${var}}")
+endforeach()
+set(_stage_list_separator "__LEAN_STAGE_LIST_SEPARATOR__")
+while(_stage_inputs MATCHES "${_stage_list_separator}")
+  string(APPEND _stage_list_separator "_")
+endwhile()
+unset(_stage_inputs)
 foreach(var ${vars})
   get_property(currentType CACHE "${var}" PROPERTY TYPE)
+  string(REPLACE ";" "${_stage_list_separator}" _stage_value "${${var}}")
   if(var MATCHES "STAGE0_(.*)")
-    list(APPEND STAGE0_ARGS "-D${CMAKE_MATCH_1}=${${var}}")
+    list(APPEND STAGE0_ARGS "-D${CMAKE_MATCH_1}=${_stage_value}")
   elseif(var MATCHES "STAGE1_(.*)")
-    list(APPEND STAGE1_ARGS "-D${CMAKE_MATCH_1}=${${var}}")
+    list(APPEND STAGE1_ARGS "-D${CMAKE_MATCH_1}=${_stage_value}")
+  elseif(var STREQUAL "CMAKE_OSX_ARCHITECTURES")
+    # The target architectures apply to every stage, regardless of the outer cache entry type.
+    list(APPEND PLATFORM_ARGS "-D${var}=${_stage_value}")
+    list(APPEND CL_ARGS "-D${var}=${_stage_value}")
   # NOTE: does not catch `-DFOO:BAR=` typed uses
   elseif(currentType STREQUAL "UNINITIALIZED")
-    list(APPEND CL_ARGS "-D${var}=${${var}}")
+    list(APPEND CL_ARGS "-D${var}=${_stage_value}")
     if(var MATCHES "USE_GMP|CHECK_OLEAN_VERSION|LEAN_VERSION_.*|LEAN_SPECIAL_VERSION_DESC")
       # must forward options that generate incompatible .olean format
-      list(APPEND STAGE0_ARGS "-D${var}=${${var}}")
+      list(APPEND STAGE0_ARGS "-D${var}=${_stage_value}")
     elseif(var MATCHES "LLVM*|PKG_CONFIG|USE_LAKE|USE_MIMALLOC|FORCE_GMP")
-      list(APPEND STAGE0_ARGS "-D${var}=${${var}}")
+      list(APPEND STAGE0_ARGS "-D${var}=${_stage_value}")
     endif()
   elseif(var MATCHES "USE_MIMALLOC")
-    list(APPEND CL_ARGS "-D${var}=${${var}}")
-    list(APPEND STAGE0_ARGS "-D${var}=${${var}}")
+    list(APPEND CL_ARGS "-D${var}=${_stage_value}")
+    list(APPEND STAGE0_ARGS "-D${var}=${_stage_value}")
   elseif((var MATCHES "CMAKE_.*") AND NOT (var MATCHES "CMAKE_BUILD_TYPE") AND NOT (var MATCHES "CMAKE_HOME_DIRECTORY"))
-    list(APPEND PLATFORM_ARGS "-D${var}=${${var}}")
+    list(APPEND PLATFORM_ARGS "-D${var}=${_stage_value}")
   endif()
 endforeach()
 # PaperLean: the version description of the upstream release this source tree is compatible with
@@ -45,6 +62,15 @@ if(NOT DEFINED LEAN_SPECIAL_VERSION_DESC)
 endif()
 
 project(LEAN CXX C)
+
+# Native libuv runs its event loop on a Lean worker; the single-thread runtime calls it inline.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+  foreach(opt MULTI_THREAD STAGE0_MULTI_THREAD STAGE1_MULTI_THREAD)
+    if(DEFINED ${opt} AND NOT ${opt})
+      message(FATAL_ERROR "Native libuv requires MULTI_THREAD=ON (${opt} is disabled)")
+    endif()
+  endforeach()
+endif()
 
 if(NOT (DEFINED STAGE0_CMAKE_EXECUTABLE_SUFFIX))
   set(STAGE0_CMAKE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
@@ -130,8 +156,10 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
       )
     endif()
   endif()
-  list(APPEND STAGE0_ARGS -DLEANTAR=${LEANTAR})
-  list(APPEND CL_ARGS -DCADICAL=${CADICAL} -DLEANTAR=${LEANTAR})
+  string(REPLACE ";" "${_stage_list_separator}" _stage_leantar "${LEANTAR}")
+  string(REPLACE ";" "${_stage_list_separator}" _stage_cadical "${CADICAL}")
+  list(APPEND STAGE0_ARGS "-DLEANTAR=${_stage_leantar}")
+  list(APPEND CL_ARGS "-DCADICAL=${_stage_cadical}" "-DLEANTAR=${_stage_leantar}")
 endif()
 
 if(USE_MIMALLOC)
@@ -156,6 +184,7 @@ if(NOT STAGE1_PREV_STAGE)
     SOURCE_DIR "${LEAN_SOURCE_DIR}/stage0"
     SOURCE_SUBDIR src
     BINARY_DIR stage0
+    LIST_SEPARATOR "${_stage_list_separator}"
     # do not rebuild stage0 when git hash changes; it's not from this commit anyway
     # (however, CI will override this as we need to embed the githash into the stage 1 library built
     # by stage 0)
@@ -173,6 +202,7 @@ ExternalProject_Add(
   SOURCE_DIR "${LEAN_SOURCE_DIR}"
   SOURCE_SUBDIR src
   BINARY_DIR stage1
+  LIST_SEPARATOR "${_stage_list_separator}"
   CMAKE_ARGS
     -DSTAGE=1 -DPREV_STAGE=${CMAKE_BINARY_DIR}/stage0
     -DPREV_STAGE_CMAKE_EXECUTABLE_SUFFIX=${STAGE0_CMAKE_EXECUTABLE_SUFFIX} ${CL_ARGS} ${STAGE1_ARGS}
@@ -186,6 +216,7 @@ ExternalProject_Add(
   SOURCE_DIR "${LEAN_SOURCE_DIR}"
   SOURCE_SUBDIR src
   BINARY_DIR stage2
+  LIST_SEPARATOR "${_stage_list_separator}"
   CMAKE_ARGS
     -DSTAGE=2 -DPREV_STAGE=${CMAKE_BINARY_DIR}/stage1 -DPREV_STAGE_CMAKE_EXECUTABLE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}
     ${CL_ARGS}
@@ -200,6 +231,7 @@ ExternalProject_Add(
   SOURCE_DIR "${LEAN_SOURCE_DIR}"
   SOURCE_SUBDIR src
   BINARY_DIR stage3
+  LIST_SEPARATOR "${_stage_list_separator}"
   CMAKE_ARGS
     -DSTAGE=3 -DPREV_STAGE=${CMAKE_BINARY_DIR}/stage2 -DPREV_STAGE_CMAKE_EXECUTABLE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}
     ${CL_ARGS}
@@ -241,6 +273,22 @@ add_custom_target(clean-stdlib COMMAND $(MAKE) -C stage1 clean-stdlib DEPENDS st
 
 add_custom_target(cache-get COMMAND $(MAKE) -C stage1 cache-get DEPENDS stage1-configure)
 
-install(CODE "execute_process(COMMAND make -C stage1 install)")
+install(CODE "
+  set(stage1_install_command \"${CMAKE_COMMAND}\" --install \"${CMAKE_BINARY_DIR}/stage1\"
+    --prefix \"\${CMAKE_INSTALL_PREFIX}\")
+  if(CMAKE_INSTALL_CONFIG_NAME)
+    list(APPEND stage1_install_command --config \"\${CMAKE_INSTALL_CONFIG_NAME}\")
+  endif()
+  if(CMAKE_INSTALL_COMPONENT)
+    list(APPEND stage1_install_command --component \"\${CMAKE_INSTALL_COMPONENT}\")
+  endif()
+  if(CMAKE_INSTALL_DO_STRIP)
+    list(APPEND stage1_install_command --strip)
+  endif()
+  execute_process(COMMAND \${stage1_install_command} RESULT_VARIABLE stage1_install_result)
+  if(NOT stage1_install_result STREQUAL \"0\")
+    message(FATAL_ERROR \"stage1 installation failed: \${stage1_install_result}\")
+  endif()
+" ALL_COMPONENTS)
 
 add_custom_target(check-stage3 COMMAND diff "stage2/bin/lean" "stage3/bin/lean" DEPENDS stage3)

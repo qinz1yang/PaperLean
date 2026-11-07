@@ -94,6 +94,9 @@ def wfRecursion (docCtx : LocalContext × LocalInstances) (preDefs : Array PreDe
           WF.mkBinaryUnfoldEq preDef preDefNonRec.declName
   -- must happen before `addPreDefAttributes` enables realizations for the top-level functions,
   -- which may need to use realizations on `preDefNonRec`
+  -- The first enable captures its environment. The unary definition may itself be one
+  -- of the public functions, so save its policy before that snapshot.
+  saveEqnAffectingOptions preDefNonRec.declName
   enableRealizationsForConst preDefNonRec.declName
   Mutual.addPreDefAttributes preDefs
 

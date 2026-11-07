@@ -43,9 +43,11 @@ extension, and restoring them when the equations are lazily realized.
 def eqnAffectingOptions : Array (Lean.Option Bool) :=
   #[backward.eqns.nonrecursive, backward.eqns.deepRecursiveSplit, backward.defeqAttrib.useBackward]
 
-/-- Environment extension that stores the values of `eqnAffectingOptions` at definition time,
-keyed by declaration name. Only populated when at least one option has a non-default value.
-Stores an association list of (option name, value) pairs for options that differ from defaults. -/
+private def equationTransparencyOptions : Array Name :=
+  #[`backward.isDefEq.respectTransparency, `backward.isDefEq.respectTransparency.types]
+
+/-- Equation options saved at definition time, keyed by declaration name. Definitions store
+their effective transparency pair so official rc3 can also reproduce their lazy equations. -/
 builtin_initialize eqnOptionsExt : MapDeclarationExtension (Array (Name × DataValue)) ←
   mkMapDeclarationExtension (asyncMode := .local)
 
@@ -159,23 +161,67 @@ structure EqnsExtState where
 builtin_initialize eqnsExt : EnvExtension EqnsExtState ←
   registerEnvExtension (pure {}) (asyncMode := .local)
 
+-- Inspect the declared binders, without substituting the arguments. A value parameter
+-- such as (a : α) is still a value parameter when the caller instantiates α with Prop.
+private def onlyTypeParams : Nat → Expr → Bool
+  | 0, _ => true
+  | n+1, .forallE _ (.sort _) body _ => onlyTypeParams n body
+  | _, _ => false
+
+-- Drop only the binders introduced by the matcher. A lambda left at this point
+-- constructs a new function. A global can be specialized on types, but applying
+-- it to a value can also construct a new function, as in Function.const.
+private def forwardsFunction (env : Environment) (owner : Name) (isMatcher : Name → Bool) :
+    Nat → Expr → Bool
+  | n+1, .lam _ _ b _ => forwardsFunction env owner isMatcher n b
+  | 0, e => match e.getAppFn with
+    | .bvar _ => true
+    | .const n _ => Id.run do
+      if isMatcher n then return false
+      let argc := e.getAppNumArgs
+      if argc == 0 then return true
+      -- Use only signatures already imported when the owner is defined.
+      if env.getModuleIdxFor? n == env.getModuleIdxFor? owner then return false
+      let some info := env.findImportedConst? n | return false
+      return onlyTypeParams argc info.type
+    | _ => false
+  | _, _ => false
+
+-- A direct, nonoverlapping case distinction dispatching to an existing function
+-- in every branch should publish those branch equations. Only consult already
+-- available matcher metadata; never wait for a local declaration's value.
+private def isFunctionDispatch (env : Environment) (owner : Name) (value : Expr) : Bool := Id.run do
+  let body := value.getLambdaBody
+  let .const name _ := body.getAppFn | return false
+  let argc := body.getAppNumArgs
+  if argc < 4 then return false
+  let matchers := (Match.Extension.extension.getState (asyncMode := .local) env).map
+  let some info := matchers.find? name | return false
+  unless info.numDiscrs == 1 && info.numAlts > 1 && info.overlaps.isEmpty &&
+      info.getNumDiscrEqs == 0 && argc == info.arity do return false
+  let args := body.getAppArgs
+  unless args[info.getFirstDiscrPos]!.isBVar && args[info.getMotivePos]!.getLambdaBody.isForall do
+    return false
+  for alt in args.extract info.getFirstAltPos info.arity, fields in info.altNumParams do
+    unless forwardsFunction env owner (fun n => (matchers.find? n).isSome) fields alt do return false
+  return true
+
 /--
-Runs `act` with the equation-affecting options restored to the values stored for `declName`
-at definition time (or reset to their defaults if none were stored). Use this inside
-`realizeConst` callbacks, which otherwise see the caller-independent `ctx.opts` rather than
-the outer `getEqnsFor?` context. -/
+Runs `act` after resetting the three built-in `eqnAffectingOptions` to their defaults and
+replaying the entries stored for `declName`. A missing transparency key inherits the
+caller’s setting in `getEqnsFor?` and the captured setting inside `realizeConst`.
+New PaperLean producers store both transparency keys for definitions. -/
 def withEqnOptions (declName : Name) (act : MetaM α) : MetaM α := do
   let env ← getEnv
-  let setOpts : Options → Options :=
-    if let some values := eqnOptionsExt.find? env declName then
-      fun os => Id.run do
-        let mut os := eqnAffectingOptions.foldl (fun os o => o.set os o.defValue) os
-        for (name, v) in values do
-          os := os.insert name v
-        return os
-    else
-      fun os => eqnAffectingOptions.foldl (fun os o => o.set os o.defValue) os
-  withOptions setOpts act
+  let values := (eqnOptionsExt.find? env declName).getD #[]
+  withOptions (fun opts => Id.run do
+    -- rc3 resets these three options and replays the stored entries. A legacy
+    -- producer that omitted transparency keys leaves the current context's settings
+    -- in effect, including inside a realization. New producers store both keys.
+    let mut opts := eqnAffectingOptions.foldl (fun os o => o.set os o.defValue) opts
+    for (name, v) in values do
+      opts := opts.insert name v
+    return opts) act
 
 /--
 Simple equation theorem for nonrecursive definitions.
@@ -256,19 +302,40 @@ def getEqnsFor? (declName : Name) : MetaM (Option (Array Name)) := withLCtx {} {
   withEqnOptions declName do
     getEqnsFor?Core declName
 
-/--
-If any equation theorem affecting option is not the default value, store the option values
-for later use during lazy equation generation.
--/
+/-- Save the equation options that must be restored during lazy equation generation. -/
 def saveEqnAffectingOptions (declName : Name) : MetaM Unit := do
   let opts ← getOptions
-  let mut nonDefaults : Array (Name × DataValue) := #[]
+  let mut values : Array (Name × DataValue) := #[]
   for o in eqnAffectingOptions do
     if o.get opts != o.defValue then
-      nonDefaults := nonDefaults.push (o.name, KVMap.Value.toDataValue (o.get opts))
-  unless nonDefaults.isEmpty do
+      values := values.push (o.name, KVMap.Value.toDataValue (o.get opts))
+  -- A generated equation belongs to its definition. Even an unannotated definition must
+  -- give every consumer the same policy, including a consumer running official rc3.
+  -- Inspect only the declaration kind, never its asynchronous signature or value.
+  let info? := ((← getEnv).setExporting false).findAsync? declName (skipRealize := true)
+  if info?.any (fun info => info.kind == .defn) || equationTransparencyOptions.any opts.contains then
+    -- Read the registered defaults without importing the definitional equality implementation.
+    let decls ← getOptionDecls
+    let saved? := equationTransparencyOptions.mapM (m := Option) fun name => do
+      let decl ← decls.find? name
+      let .ofBool defaultValue := decl.defValue | none
+      return (name, DataValue.ofBool (opts.get name defaultValue))
+    if let some saved := saved? then
+      values := values ++ saved
+  unless values.isEmpty do
     trace[Elab.definition.eqns] "saving equation-affecting options for {declName}"
-    modifyEnv (eqnOptionsExt.insert · declName nonDefaults)
+    modifyEnv (eqnOptionsExt.insert · declName values)
+
+/-- Record the equation policy for an ordinary nonrecursive declaration. Its elaborator
+already has the body, so this never waits on a declaration task to classify it. -/
+def saveNonRecEqnOptions (declName : Name) (decl : Declaration) : MetaM Unit := do
+  let opts ← getOptions
+  if !equationTransparencyOptions.any opts.contains then
+    if let .defnDecl d := decl then
+      if isFunctionDispatch (← getEnv) declName d.value then
+        return ← withOptions (·.setBool `backward.isDefEq.respectTransparency.types false) <|
+          saveEqnAffectingOptions declName
+  saveEqnAffectingOptions declName
 
 @[expose] def GetUnfoldEqnFn := Name → MetaM (Option Name)
 

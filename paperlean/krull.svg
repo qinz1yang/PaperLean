@@ -1,19 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="400" height="298" viewBox="0 0 400 298" font-family="Helvetica, Arial, sans-serif" font-size="13">
-<style>.t{fill:#111111}.m{fill:#6b6b6b}.l{fill:#8c8c8c}.p{fill:#1f6feb}.ax{stroke:#d0d0d0}@media (prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.l{fill:#6b6b6b}.p{fill:#4493f8}.ax{stroke:#3a3a3a}}</style>
-<rect class="l" x="66.0" y="14" width="10" height="10"/><text class="m" x="82.0" y="23">Lean v4.35.0-rc3</text>
-<rect class="p" x="214.0" y="14" width="10" height="10"/><text class="p" x="230.0" y="23">PaperLean v0.2.0</text>
-<path class="l" d="M80.0 206v-147.0a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v147.0z"/>
-<text class="m" x="102.0" y="48.0" text-anchor="middle" font-size="12">2.21</text>
-<path class="p" d="M126.0 206v-16.7a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v16.7z"/>
-<text class="p" x="148.0" y="178.31674208144796" text-anchor="middle" font-size="12">0.29</text>
-<text class="m" x="125.0" y="228" text-anchor="middle">Wall time (s)</text>
-<text class="p" x="125.0" y="248" text-anchor="middle" font-weight="bold">−87%</text>
-<path class="l" d="M230.0 206v-147.0a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v147.0z"/>
-<text class="m" x="252.0" y="48.0" text-anchor="middle" font-size="12">1,021</text>
-<path class="p" d="M276.0 206v-95.1a3 3 0 0 1 3 -3h38a3 3 0 0 1 3 3v95.1z"/>
-<text class="p" x="298.0" y="99.86092066601371" text-anchor="middle" font-size="12">668</text>
-<text class="m" x="275.0" y="228" text-anchor="middle">Peak memory (MiB)</text>
-<text class="p" x="275.0" y="248" text-anchor="middle" font-weight="bold">−35%</text>
-<line class="ax" x1="50.0" y1="206.5" x2="350.0" y2="206.5"/>
-<text class="t" x="200.0" y="284" text-anchor="middle" font-size="14">Compiling Mathlib.RingTheory.KrullDimension.Field</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="568" viewBox="0 0 720 568" font-family="Helvetica, Arial, sans-serif" role="img" aria-labelledby="title desc">
+<title id="title">KrullDimension.Field: compilation time and memory</title>
+<desc id="desc">Lean 4.35.0-rc3 versus PaperLean 0.2.3. Wall time: 2.2301619159998154 and 0.32380912500002523 seconds. Peak RSS: 1021.953125 and 679.421875 MiB. Wall time changes by -85.48046567036562 percent; memory changes by -33.51731518997019 percent.</desc>
+<style>.t{fill:#111111}.m{fill:#6b6b6b}.l{fill:#969A98}.p{fill:#1f6feb}.ax{stroke:#d0d0d0}.sep{stroke:#e9e9e9}.caption{fill:#777777}
+@media(prefers-color-scheme:dark){.t{fill:#e6e6e6}.m{fill:#9a9a9a}.l{fill:#707875}.p{fill:#4493f8}.ax{stroke:#3a3a3a}.sep{stroke:#282828}.caption{fill:#92999f}}</style>
+<text class="t" x="360" y="34" font-size="30" text-anchor="middle">KrullDimension.Field</text>
+<text class="m" x="344" y="77" font-size="24" text-anchor="end">Lean 4.35.0-rc3</text>
+<text class="p" x="376" y="77" font-size="24" text-anchor="start">PaperLean 0.2.3</text>
+<line class="ax" x1="52" y1="282.5" x2="308" y2="282.5"/>
+<path class="l" d="M88 282V127.000q0 -5.000 5.000 -5.000h54.000q5.000 0 5.000 5.000V282Z"/>
+<text class="m" x="120" y="108.000" font-size="26" text-anchor="middle">2.230</text>
+<path class="p" d="M208 282V263.769q0 -5.000 5.000 -5.000h54.000q5.000 0 5.000 5.000V282Z"/>
+<text class="p" x="240" y="244.769" font-size="26" text-anchor="middle">0.324</text>
+<text class="m" x="180" y="318" font-size="24" text-anchor="middle">Wall time (s)</text>
+<text class="p" x="180" y="356" font-size="30" text-anchor="middle" font-weight="600">−85.48%</text>
+<line class="ax" x1="412" y1="282.5" x2="668" y2="282.5"/>
+<path class="l" d="M448 282V127.000q0 -5.000 5.000 -5.000h54.000q5.000 0 5.000 5.000V282Z"/>
+<text class="m" x="480" y="108.000" font-size="26" text-anchor="middle">1,021.95</text>
+<path class="p" d="M568 282V180.628q0 -5.000 5.000 -5.000h54.000q5.000 0 5.000 5.000V282Z"/>
+<text class="p" x="600" y="161.628" font-size="26" text-anchor="middle">679.42</text>
+<text class="m" x="540" y="318" font-size="24" text-anchor="middle">Peak RSS (MiB)</text>
+<text class="p" x="540" y="356" font-size="30" text-anchor="middle" font-weight="600">−33.52%</text>
+<line class="sep" x1="48" y1="386.5" x2="672" y2="386.5"/>
+<text class="caption" x="360" y="420" font-size="24" text-anchor="middle">Apple M5 Max · macOS 26.6.1</text>
+<text class="caption" x="360" y="452" font-size="24" text-anchor="middle">Lean 4.35.0-rc3 · PaperLean 0.2.3</text>
+<text class="caption" x="360" y="484" font-size="24" text-anchor="middle">C++ and generated C PGO · 16 interleaved jobs</text>
+<text class="caption" x="360" y="516" font-size="24" text-anchor="middle">Same Mathlib options · prebuilt dependencies</text>
+<text class="caption" x="360" y="548" font-size="24" text-anchor="middle">PaperLean prepared before timing</text>
 </svg>

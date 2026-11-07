@@ -28,8 +28,37 @@ open Lean hiding SearchPath
 
 namespace Lake
 
+/-- Each accelerated compiler invocation owns its input through both Lean and leanir.
+Concurrent invocations may replace the display file for the same module. -/
+private def withChildSetup (launchDir : BaseIO (Option FilePath)) (file : FilePath)
+    (setup : ModuleSetup) (run : FilePath → FilePath → LogIO Unit) : LogIO Unit := do
+  unless ← PaperLean.accelerated do
+    IO.FS.writeFile file (toJson setup).pretty
+    return ← run file file
+  let side := file.withExtension "paperlean"
+  let compactText := (PaperLean.setupToJsonCompact setup).compress
+  let compact ← if PaperLean.SetupIndex.refersToIndex setup then pure true
+    else PaperLean.writeSideFile side compactText
+  let (display, text) ← if compact then pure (side, compactText) else do
+    let text := (toJson setup).pretty
+    PaperLean.publishFile file (·.putStr text)
+    pure (file, text)
+  if let some dir ← launchDir then
+    let path := dir / s!"launch-{← PaperLean.freshGeneration}.paperlean"
+    let written ← (do IO.FS.createDirAll dir; PaperLean.writeNewFile path (·.putStr text)).toBaseIO
+    if let .ok true := written then
+      try return ← run path display finally discard <| (IO.FS.removeFile path).toBaseIO
+  -- Standalone callers and workspaces that cannot write a generation directory
+  -- still use an exclusively created file for this invocation.
+  IO.FS.withTempFile fun h path => do
+    h.putStr text
+    h.flush
+    run path display
+
 -- PaperLean: (not inlined: its body calls PaperLean's code)
-@[noinline] public def compileLeanModule
+@[noinline] public def compileLeanModuleForBuild
+  (childEnv : BaseIO (Array (String × Option String)))
+  (launchDir : BaseIO (Option FilePath))
   (leanFile relLeanFile : FilePath)
   (setup : ModuleSetup) (setupFile : FilePath)
   (arts : ModuleArtifacts)
@@ -55,19 +84,9 @@ namespace Lake
     createParentDirs bcFile
     args := args ++ #["-b", bcFile.toString]
   createParentDirs setupFile
-  -- PaperLean: under `paperlean build`, compact in a side file, which saves writing and reading it,
-  -- unless that file cannot be written; that of a setup that refers to the build's setup index is
-  -- written with it (`Lake.PaperLean.moduleSetup`)
-  let side := setupFile.withExtension "paperlean"
-  let compact ← if ← PaperLean.accelerated then
-      if PaperLean.SetupIndex.refersToIndex setup then pure true
-      else PaperLean.writeSideFile side (PaperLean.setupToJsonCompact setup).compress
-    else pure false
-  let setupPath := if compact then side else setupFile
-  unless compact do
-    IO.FS.writeFile setupFile (toJson setup).pretty
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
+  withChildSetup launchDir setupFile setup fun setupPath displayPath => do
   withLogErrorPos do
   let spawnArgs : IO.Process.SpawnArgs := {
     args
@@ -81,7 +100,7 @@ namespace Lake
   logVerbose (mkCmdLog spawnArgs)
   let out ← rawProc (quiet := true) { spawnArgs with
     args := args.set! (args.size - 2) setupPath.toString
-    env := spawnArgs.env ++ (← PaperLean.BuildEnv.leanEnv) }
+    env := spawnArgs.env ++ (← childEnv) }
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
@@ -115,17 +134,35 @@ namespace Lake
       createParentDirs irFile
       createParentDirs cFile
       try
-        proc {
+        let irArgs : IO.Process.SpawnArgs := {
           cmd := leanir.toString
-          args := #[setupPath.toString, irFile.toString, cFile.toString]
-          env := #[
-            ("LEAN_PATH", leanPath.toString)
-          ]
+          args := #[displayPath.toString, irFile.toString, cFile.toString]
+          env := #[("LEAN_PATH", leanPath.toString)]
         }
+        if setupPath == displayPath then
+          proc irArgs
+        else
+          logVerbose (mkCmdLog irArgs)
+          let out ← rawProc (quiet := true) { irArgs with args := irArgs.args.set! 0 setupPath.toString }
+          logOutput out logInfo
+          if out.exitCode != 0 then
+            error s!"external command '{irArgs.cmd}' exited with code {out.exitCode}"
       catch e =>
         if let some oleanFile := arts.olean? then
           removeFileIfExists oleanFile
         throw e
+
+@[noinline] public def compileLeanModule
+  (leanFile relLeanFile : FilePath)
+  (setup : ModuleSetup) (setupFile : FilePath)
+  (arts : ModuleArtifacts)
+  (leanArgs : Array String := #[])
+  (leanPath : SearchPath := [])
+  (lean : FilePath := "lean")
+  (leanir : FilePath := "leanir")
+: LogIO Unit :=
+  compileLeanModuleForBuild PaperLean.BuildEnv.leanEnv (pure none) leanFile relLeanFile setup setupFile arts
+    leanArgs leanPath lean leanir
 
 public def compileO
   (oFile srcFile : FilePath)
