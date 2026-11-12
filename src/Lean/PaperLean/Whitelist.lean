@@ -147,15 +147,22 @@ def codeHash (env : Environment) (declName : Name) : UInt64 := Id.run do
       todo := (callees {} b).toList ++ todo
   return h
 
-/-- Whether each entry's code is the code vetted, once found. -/
-private builtin_initialize vettedRef : IO.Ref (NameMap Bool) ← IO.mkRef {}
+/-- Whether each entry's code is the code vetted, with the header of the imports it was found for:
+another environment of the process may import other code under the same module name and index. The
+header is kept, so that its address, which identifies the imports, is not reused by another object. -/
+private builtin_initialize vettedRef : IO.Ref (NameMap (EnvironmentHeader × Bool)) ← IO.mkRef {}
 
-/-- Whether the code of `e`, imported in `env`, is the code vetted. -/
-private def isVetted (env : Environment) (e : Entry) : BaseIO Bool := do
-  if let some r := (← vettedRef.get).find? e.decl then
-    return r
-  let r := (env.getModuleIdxFor? e.decl).isSome && codeHash env e.decl == e.hash
-  vettedRef.modify (·.insert e.decl r)
+/-- Whether the code of `e`, imported in `env`, is the code vetted. An answer is used again only for
+the imports it was found for; a declaration of the current module is never the code vetted. -/
+private unsafe def isVetted (env : Environment) (e : Entry) : BaseIO Bool := do
+  if (env.getModuleIdxFor? e.decl).isNone then
+    return false
+  let header := env.header
+  if let some (header', r) := (← vettedRef.get).find? e.decl then
+    if ptrEq header' header then
+      return r
+  let r := codeHash env e.decl == e.hash
+  vettedRef.modify (·.insert e.decl (header, r))
   return r
 
 /-- Whether the entry `declName` of an attribute is Lean's own. The entries of imported modules are

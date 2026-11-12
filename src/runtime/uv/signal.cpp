@@ -244,26 +244,32 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_next(b_obj_arg obj) {
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_stop(b_obj_arg obj) {
     lean_uv_signal_object * signal = lean_to_uv_signal(obj);
 
+    /* The loop callback runs under this lock. Checking and changing the state outside it
+       races with a one-shot signal that fires between the check and the stop: both sides
+       then drop the loop's reference to `obj`, freeing the external while the caller still
+       owns it. */
+    event_loop_lock(&global_ev);
+
+    lean_object * dropped = NULL;
+    int result = 0;
+    bool was_running = false;
     if (signal->m_state == SIGNAL_STATE_RUNNING) {
-        event_loop_lock(&global_ev);
-        int result = uv_signal_stop(signal->m_uv_signal);
-        event_loop_unlock(&global_ev);
-
-        if  (signal->m_promise != NULL) {
-            lean_dec(signal->m_promise);
-            signal->m_promise = NULL;
-        }
-
+        result = uv_signal_stop(signal->m_uv_signal);
+        dropped = signal->m_promise;
+        signal->m_promise = NULL;
         signal->m_state = SIGNAL_STATE_FINISHED;
+        was_running = true;
+    }
 
-        // The loop does not need to keep the signal alive anymore.
-        lean_dec(obj);
+    event_loop_unlock(&global_ev);
 
-        if (result != 0) {
-            return lean_io_result_mk_error(lean_decode_uv_error(result, NULL));
-        } else {
-            return lean_io_result_mk_ok(lean_box(0));
-        }
+    // Dropping a promise can run continuations inline; do it outside the event-loop lock.
+    if (dropped != NULL) lean_dec(dropped);
+    // The loop does not need to keep the signal alive anymore.
+    if (was_running) lean_dec(obj);
+
+    if (result != 0) {
+        return lean_io_result_mk_error(lean_decode_uv_error(result, NULL));
     } else {
         return lean_io_result_mk_ok(lean_box(0));
     }

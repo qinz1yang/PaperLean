@@ -76,7 +76,12 @@ class phashmap_visitor_fn {
     }
 
     void visit_node(b_obj_arg n) {
-        if (lean_ptr_tag(n) == 0) {
+        if (is_scalar(n)) return;
+        if (!lean_is_ctor(n)) {
+            /* The current single-field Node.entries is represented by its
+               entries array directly. */
+            visit_entries(n);
+        } else if (lean_ptr_tag(n) == 0) {
             visit_entries(lean_ctor_get(n, 0));
         } else {
             visit_collision_node(lean_ctor_get(n, 0), lean_ctor_get(n, 1));
@@ -122,7 +127,26 @@ class hashmap_visitor_fn {
 public:
     hashmap_visitor_fn(std::function<void(b_obj_arg, b_obj_arg)> const & fn):m_fn(fn) {}
     void operator()(b_obj_arg m) {
-        visit_buckets(cnstr_get(m, 1));
+        unsigned objs = lean_ctor_num_objs(m);
+        if (objs == 1) {
+            /* A one-field HashMap wrapper; unwrap it to a DHashMap/Raw. */
+            b_obj_arg inner = cnstr_get(m, 0);
+            if (lean_is_ctor(inner) && !lean_is_scalar(cnstr_get(inner, 0))) {
+                /* DHashMap.inner : DHashMap.Raw */
+                b_obj_arg raw = cnstr_get(inner, 0);
+                visit_buckets(cnstr_get(raw, 1));
+            } else {
+                /* DHashMap.Raw (size, buckets) or a legacy wrapper. */
+                visit_buckets(cnstr_get(inner, 1));
+            }
+        } else if (objs >= 2 && !lean_is_scalar(cnstr_get(m, 0))) {
+            /* DHashMap.inner : DHashMap.Raw (the wf proof is field 1). */
+            b_obj_arg raw = cnstr_get(m, 0);
+            visit_buckets(cnstr_get(raw, 1));
+        } else {
+            /* HashMapImp / DHashMap.Raw: (size : Nat, buckets : Array). */
+            visit_buckets(cnstr_get(m, 1));
+        }
     }
 };
 

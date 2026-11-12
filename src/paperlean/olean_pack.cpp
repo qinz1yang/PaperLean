@@ -71,7 +71,7 @@ public:
 // instead of tens of thousands. Packs named in `LEAN_OLEAN_PACK` are consulted by
 // `lean_compacted_region_read`: a file below one of a pack's roots is served from the pack if no
 // file of its chain (the parts of a module that point into one another) has changed since packing,
-// judging by device, inode, size, mtime and ctime. A served region exposes the original file's
+// judging by inode, size, mtime and ctime (`file_identity`). A served region exposes the original file's
 // `base_addr`, exactly like a file that could not be mapped at its base address and was relocated,
 // so pointers into it from other regions are resolved and saved like those into the file's mapping.
 //
@@ -89,10 +89,18 @@ constexpr char g_pack_kind[] = "olean-pack";
 constexpr size_t g_pack_header_space = 4096;
 // A `ModuleData` object: five object fields and `isModule`.
 constexpr size_t g_module_data_size = sizeof(lean_ctor_object) + 5 * sizeof(void *) + sizeof(void *);
+// The bytes of a `ModuleData` object itself: five object fields and the `isModule` byte. The
+// allocator may round its size up to `g_module_data_size`; `lean_object_byte_size` need only hold
+// these bytes.
+constexpr size_t g_module_data_min_size = sizeof(lean_ctor_object) + 5 * sizeof(void *) + 1;
+// A `Name` object: `pre`, `str`/`num` and the hash.
+constexpr size_t g_name_object_size = sizeof(lean_object) + 3 * sizeof(void *);
+// The bytes of a dense copy of an array of `n` objects (`capacity = n`).
+constexpr uint64_t array_bytes(uint64_t n) { return sizeof(lean_array_object) + n * sizeof(void *); }
 
 // The index (entries, chains, roots, strings) follows the regions and extends to the end of the
 // file; the checksum covers the header and the index. The writer records the identity of the
-// finished file (device, inode, size, modification and change times) in a small file next to the
+// finished file (inode, size, modification and change times) in a small file next to the
 // pack (`pack_identity`), and readers ignore a pack that no longer has it (`load_pack_core`), so that
 // anything that writes to a pack, even restoring its modification time, stops its use. Readers check
 // the header's own checksum and the checksums of the blocks of the index (`side_file_blocks`) when
@@ -104,7 +112,7 @@ constexpr size_t g_module_data_size = sizeof(lean_ctor_object) + 5 * sizeof(void
 // status --verify`), which compares the checksums of the whole index and of the regions
 // (`pack_payload_checksum`).
 // The layout of the pack's index and tables; files of another layout are ignored.
-constexpr uint32_t g_pack_format = 8;
+constexpr uint32_t g_pack_format = 9;
 // `pack_header::validated` of a pack whose writer checked its index.
 constexpr uint32_t g_pack_validated = 0x564c4150;
 // `pack_header::flags`: the pack is read only through bindings, as its roots are a workspace's.
@@ -140,6 +148,10 @@ struct pack_header {
     uint64_t block_sums_off, block_sums_checksum;
     // `side_file_checksum` of the header with this field and `common.checksum` zero
     uint64_t header_checksum;
+    // `[dense_off, dense_off + dense_size)`, before the index: copies of the arrays and `Name`s that
+    // imports read (see `pack_part::dense_*`, `pack_edge::name_copy` and
+    // `pack_ext_name::name_copy`), so that import touches dense pages instead of the sparse regions.
+    uint64_t dense_off, dense_size;
 };
 
 // The seed of the checksum of a table of block checksums.
@@ -260,8 +272,11 @@ constexpr uint32_t pack_module_edges = 2;
 // An import of a module, as in `Import`.
 struct pack_edge {
     uint64_t module;        // the imported module's `Name` object in the `Import`, in the pack
+    uint64_t name_copy;     // a dense copy of the top `Name` object (0 if `module` is a scalar)
+    uint64_t name_hash;     // `lean_name_hash` of that `Name`
+    pack_string stem;       // its `module_stem` (`has_stem`: whether that is a path stem at all)
     int32_t target;         // the imported module, -1 if it is not in the pack
-    uint8_t import_all, is_exported, is_meta, unused;
+    uint8_t import_all, is_exported, is_meta, has_stem;
 };
 
 // What `finalizeImport` reads from the root `ModuleData` of a packed part, so that it need not read
@@ -276,6 +291,9 @@ struct pack_part {
     // occurrence of the hash, except in the same array of another part of the same module.
     uint64_t names;
     uint64_t names_checksum;   // `side_file_checksum` of the name table
+    // Dense copies of the arrays `constNames`, `constants`, `extraConstNames`, as `lean_array_object`s
+    // with `capacity = size`; imports read these instead of the region arrays.
+    uint64_t dense_const_names, dense_constants, dense_extra_const_names;
 };
 
 inline uint64_t part_names_size(pack_part const & pp) {
@@ -293,6 +311,8 @@ struct pack_ext_entry {
 // An extension name of the pack: one of its `Name` objects in the pack.
 struct pack_ext_name {
     uint64_t name;
+    uint64_t name_copy;     // dense copy of the top `Name` object (0 if scalar)
+    uint64_t name_hash;     // `lean_name_hash` of `name`
 };
 
 // Runtime layout of `ModuleData` (object fields, then the scalar `isModule`) and `Import`.
@@ -314,8 +334,9 @@ inline file_identity entry_identity(pack_entry const & e) {
 }
 
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+// (no device: see `file_identity`)
 file_identity identity_of(struct stat const & st) {
-    return file_identity { static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+    return file_identity { 0, static_cast<uint64_t>(st.st_ino),
         static_cast<uint64_t>(st.st_size), LEAN_STAT_MTIM(st).tv_sec, LEAN_STAT_MTIM(st).tv_nsec,
         LEAN_STAT_CTIM(st).tv_sec, LEAN_STAT_CTIM(st).tv_nsec };
 }
@@ -327,8 +348,10 @@ void set_file_id(pack_entry & e, struct stat const & st) {
     e.ctime_sec = id.ctime_sec; e.ctime_nsec = id.ctime_nsec;
 }
 
-// Whether `a` and `b` are the same file, unchanged.
-bool same_stat(struct stat const & a, struct stat const & b) { return identity_of(a) == identity_of(b); }
+// Whether `a` and `b`, both taken by this process, are the same file, unchanged.
+bool same_stat(struct stat const & a, struct stat const & b) {
+    return a.st_dev == b.st_dev && identity_of(a) == identity_of(b);
+}
 #endif
 
 #if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
@@ -473,6 +496,94 @@ uint32_t parser_density_hint(object * row, std::vector<parser_span> const & regi
 }
 
 
+
+// Whether the fields of a `ModuleData` that the pack writer reads are well formed within
+// `regions`. A chain whose data is not is left out, like a chain with an unreadable file:
+// a malformed `.olean` must not make pack creation crash on a field that is not an array.
+bool checked_array(object * a, std::vector<parser_span> const & regions, size_t & count) {
+    size_t avail = parser_available(a, regions);
+    if (avail < sizeof(lean_array_object) || !lean_is_array(a)) return false;
+    size_t n = lean_array_size(a);
+    size_t cap = lean_array_capacity(a);
+    if (n > cap || cap > (avail - sizeof(lean_array_object)) / sizeof(object *)) return false;
+    count = n;
+    return true;
+}
+
+bool checked_nat(object * c, std::vector<parser_span> const & regions) {
+    if (lean_is_scalar(c)) return true;
+    size_t avail = parser_available(c, regions);
+    if (avail < sizeof(mpz_object) || !lean_is_mpz(c)) return false;
+#ifdef LEAN_USE_GMP
+    size_t digits = region_reader::mpz_num_limbs(to_mpz(c));
+    return digits <= (avail - sizeof(mpz_object)) / sizeof(mp_limb_t);
+#else
+    size_t digits = region_reader::mpz_num_limbs(to_mpz(c));
+    return digits <= (avail - sizeof(mpz_object)) / sizeof(mpn_digit);
+#endif
+}
+
+bool checked_name(object * n, std::vector<parser_span> const & regions, unsigned depth = 0) {
+    if (depth > 4096) return false;
+    if (lean_is_scalar(n)) return n == lean_box(0);
+    size_t avail = parser_available(n, regions);
+    if (avail < sizeof(lean_ctor_object) + 2 * sizeof(object *)) return false;
+    unsigned tag = lean_ptr_tag(n);
+    if (tag != 1 && tag != 2) return false;
+    if (lean_ctor_num_objs(n) != 2) return false;
+    if (!checked_name(lean_ctor_get(n, 0), regions, depth + 1)) return false;
+    object * c = lean_ctor_get(n, 1);
+    if (tag == 1) {
+        size_t cavail = parser_available(c, regions);
+        if (cavail < sizeof(lean_string_object) || !lean_is_string(c)) return false;
+        size_t size = lean_string_size(c), cap = lean_string_capacity(c);
+        if (size == 0 || cap < size || cap > cavail - sizeof(lean_string_object)) return false;
+        return lean_string_cstr(c)[size - 1] == 0;
+    }
+    return checked_nat(c, regions);
+}
+
+bool checked_import(object * imp, std::vector<parser_span> const & regions) {
+    size_t avail = parser_available(imp, regions);
+    if (avail < sizeof(lean_ctor_object) + sizeof(object *) + 3 || lean_is_scalar(imp) ||
+        lean_ptr_tag(imp) != 0 || lean_ctor_num_objs(imp) != 1) return false;
+    return checked_name(lean_ctor_get(imp, 0), regions);
+}
+
+bool checked_entry(object * pair, std::vector<parser_span> const & regions) {
+    size_t avail = parser_available(pair, regions);
+    if (avail < sizeof(lean_ctor_object) + 2 * sizeof(object *) || lean_is_scalar(pair) ||
+        lean_ptr_tag(pair) != 0 || lean_ctor_num_objs(pair) != 2) return false;
+    if (!checked_name(lean_ctor_get(pair, 0), regions)) return false;
+    size_t n;
+    return checked_array(lean_ctor_get(pair, 1), regions, n);
+}
+
+bool checked_module_data(object * data, std::vector<parser_span> const & regions) {
+    size_t avail = parser_available(data, regions);
+    if (lean_is_scalar(data) || avail < g_module_data_min_size || lean_ptr_tag(data) != 0 ||
+        lean_ctor_num_objs(data) != g_module_data_num_objs ||
+        lean_object_byte_size(data) < g_module_data_min_size) return false;
+    if (lean_ctor_get_uint8(data, sizeof(void *) * g_module_data_num_objs) > 1) return false;
+    size_t n = 0;
+    object * imports = module_data_imports(data);
+    if (!checked_array(imports, regions, n)) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!checked_import(lean_array_get_core(imports, i), regions)) return false;
+    for (unsigned a = 1; a <= 4; a++) {
+        object * arr = module_data_field(data, a);
+        if (!checked_array(arr, regions, n)) return false;
+        if (a == 1 || a == 3) {
+            for (size_t i = 0; i < n; i++)
+                if (!checked_name(lean_array_get_core(arr, i), regions)) return false;
+        } else if (a == 4) {
+            for (size_t i = 0; i < n; i++)
+                if (!checked_entry(lean_array_get_core(arr, i), regions)) return false;
+        }
+    }
+    return true;
+}
+
 bool ends_with(std::string const & s, char const * suffix, std::string & prefix) {
     size_t n = strlen(suffix);
     if (s.size() < n || s.compare(s.size() - n, n, suffix) != 0) return false;
@@ -512,6 +623,8 @@ struct pack_tables {
         if (hdr.entries_off < g_pack_header_space || hdr.entries_off > hdr.size || hdr.entries_off % 64 != 0 ||
             hdr.roots_area_off < g_pack_header_space || hdr.roots_area_off % 64 != 0 ||
             hdr.names_off < hdr.roots_area_off || hdr.names_off % 64 != 0 || hdr.names_off > hdr.entries_off ||
+            hdr.dense_off < hdr.names_off || hdr.dense_off % 8 != 0 || hdr.dense_off > hdr.entries_off ||
+            hdr.dense_size > hdr.entries_off - hdr.dense_off ||
             hdr.base_addr % page != 0 || hdr.base_addr > UINTPTR_MAX - hdr.size ||
             hdr.block_sums_off % 8 != 0 || hdr.block_sums_off < hdr.entries_off || hdr.block_sums_off > hdr.size ||
             hdr.size - hdr.block_sums_off != 8 * side_file_num_blocks(hdr.block_sums_off - hdr.entries_off))
@@ -563,6 +676,11 @@ struct pack_tables {
     bool in_regions(uint64_t a) const {
         return a % sizeof(void *) == 0 && a >= hdr.base_addr + g_pack_header_space && a < hdr.base_addr + hdr.roots_area_off;
     }
+    // A dense copy of an import-visible object.
+    bool in_dense(uint64_t a, uint64_t len) const {
+        return a % 8 == 0 && in_range(a, len, hdr.base_addr + hdr.dense_off,
+                                      hdr.base_addr + hdr.dense_off + hdr.dense_size);
+    }
     // A copy of a root object in the roots area.
     bool in_roots_area(uint64_t a) const {
         return a % sizeof(void *) == 0 && a >= hdr.base_addr + hdr.roots_area_off &&
@@ -608,7 +726,10 @@ struct pack_tables {
     }
     bool edge_ok(uint64_t j) const {
         pack_edge const & e = edges[j];
-        return used(e) && e.target >= -1 && (e.target < 0 || static_cast<uint64_t>(e.target) < hdr.num_modules) && in_regions(e.module);
+        return used(e) && e.target >= -1 && (e.target < 0 || static_cast<uint64_t>(e.target) < hdr.num_modules) &&
+            in_regions(e.module) && e.has_stem <= 1 && valid_str(e.stem) &&
+            (e.name_copy == 0 ? lean_is_scalar(reinterpret_cast<object *>(e.module)) :
+                                in_dense(e.name_copy, g_name_object_size));
     }
     // Whether module `i`, its chains and its edges are consistent.
     bool module_ok(uint64_t i) const {
@@ -628,8 +749,12 @@ struct pack_tables {
     }
     bool ext_entry_ok(uint64_t j) const {
         pack_ext_entry const & ee = ext_entries[j];
-        return used(ee) && in_regions(ee.entries) && ee.name < hdr.num_ext_names && used(ext_names[ee.name]) &&
-            in_regions(ext_names[ee.name].name);
+        if (ee.name >= hdr.num_ext_names) return false;
+        pack_ext_name const & en = ext_names[ee.name];
+        return used(ee) && in_regions(ee.entries) && used(en) &&
+            in_regions(en.name) &&
+            (en.name_copy == 0 ? lean_is_scalar(reinterpret_cast<object *>(en.name)) :
+                                 in_dense(en.name_copy, g_name_object_size));
     }
     // Whether the part of entry `i`, its extension entries and their names are consistent.
     bool part_ok(uint64_t i) const {
@@ -638,6 +763,9 @@ struct pack_tables {
         if (!in_regions(pp.const_names) || !in_regions(pp.constants) || !in_regions(pp.extra_const_names) ||
             !in_regions(pp.entries) || pp.first_ext > hdr.num_ext_entries ||
             pp.num_entries > hdr.num_ext_entries - pp.first_ext || pp.is_module > 1 ||
+            !in_dense(pp.dense_const_names, array_bytes(pp.num_const_names)) ||
+            !in_dense(pp.dense_constants, array_bytes(pp.num_constants)) ||
+            !in_dense(pp.dense_extra_const_names, array_bytes(pp.num_extra_const_names)) ||
             pp.names % 8 != 0 || !in_range(pp.names, part_names_size(pp), hdr.names_off, hdr.entries_off))
             return false;
         for (uint64_t j = pp.first_ext; j < static_cast<uint64_t>(pp.first_ext) + pp.num_entries; j++)
@@ -710,7 +838,9 @@ struct pack_tables {
         for (uint64_t j = 0; j < hdr.num_ext_entries; j++)
             if (!ext_entry_ok(j)) return "corrupt (extension entries)";
         for (uint64_t k = 0; k < hdr.num_ext_names; k++)
-            if (!in_regions(ext_names[k].name)) return "corrupt (extension names)";
+            if (!in_regions(ext_names[k].name) ||
+                (ext_names[k].name_copy != 0 && !in_dense(ext_names[k].name_copy, g_name_object_size)))
+                return "corrupt (extension names)";
         // every slot is empty or holds its entry, and some slot is empty, which ends probes
         bool empty = false;
         for (uint64_t s = 0; s < hdr.roots_hash_size; s++) {
@@ -1167,6 +1297,30 @@ uint8_t module_status(std::vector<loaded_pack> & packs, size_t pi, uint32_t i) {
     return s;
 }
 
+// A module is identified by `pack index << 24 | module index`; `g_no_pack_module` means none.
+constexpr uint32_t g_no_pack_module = 0xffffffff;
+
+// The pack module with name hash `h` and path stem `stem`, as `lean_paperlean_pack_module_find`
+// finds it for a `Name` with those: the same table lookup and the same checks, without reading the
+// `Name` (an edge records its hash and stem).
+uint32_t find_module_by_hash_stem(std::vector<loaded_pack> & packs, uint64_t h, std::string_view stem) {
+    for (size_t pi = 0; pi < packs.size() && pi < 255; pi++) {
+        loaded_pack & p = packs[pi];
+        bool damaged = false;
+        for (uint64_t k = p.first_module_with_hash(h, damaged); k < p.hdr.num_modules; k++) {
+            if (!p.used(p.modules_by_hash[k])) { damaged = true; break; }
+            if (p.modules_by_hash[k].hash != h) break;
+            uint32_t i = p.modules_by_hash[k].module;
+            if (i >= p.hdr.num_modules) { damaged = true; continue; }
+            uint8_t s = module_status(packs, pi, i);
+            if (!(s & module_valid) || !(s & module_here) || !(p.modules[i].flags & pack_module_edges)) continue;
+            if (p.str(p.modules[i].stem) == stem) return static_cast<uint32_t>(pi << 24) | i;
+        }
+        if (damaged) p.damaged();
+    }
+    return g_no_pack_module;
+}
+
 // Whether no file of `chain` changed since packing and its entries are consistent: 1 if so, 2
 // otherwise.
 uint8_t check_chain_files(loaded_pack & p, uint32_t chain) {
@@ -1538,6 +1692,30 @@ std::vector<pack_range> loaded_pack_ranges() {
     return out;
 }
 
+pack_range range_of_loaded_pack(void const * pack) {
+    loaded_pack const & p = *static_cast<loaded_pack const *>(pack);
+    return pack_range { p.hdr.common.checksum, p.hdr.base_addr, p.hdr.size };
+}
+
+void for_each_pack_name_table(std::function<void(size_t, uint64_t const *, size_t)> const & f) {
+    std::call_once(g_packs_once, init_packs);
+    std::vector<loaded_pack> & packs = *g_packs.load(std::memory_order_acquire);
+    for (size_t pi = 0; pi < packs.size(); pi++) {
+        loaded_pack & p = packs[pi];
+        for (uint64_t i = 0; i < p.hdr.num_entries; i++) {
+            pack_part const & pp = p.parts[i];
+            size_t n = static_cast<size_t>(pp.num_const_names) + pp.num_extra_const_names;
+            if (n == 0) continue;
+            uint8_t state = p.names_state[i].load(std::memory_order_acquire);
+            if (state == 0) {
+                state = side_file_checksum(p.begin + pp.names, part_names_size(pp)) == pp.names_checksum ? 1 : 2;
+                p.names_state[i].store(state, std::memory_order_release);
+            }
+            if (state == 1) f(pi, reinterpret_cast<uint64_t const *>(p.begin + pp.names), n);
+        }
+    }
+}
+
 char const * packs_damaged() {
     std::call_once(g_packs_once, init_packs);
     static char const * why = [] {
@@ -1676,6 +1854,35 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
         // of its chain may point to it (some word of the later part's data equals its address).
         uint64_t roots_area_off = align_up(total, 64);
         std::string roots_area;
+        // Copies of the arrays and `Name`s that imports read, so that import touches dense pages
+        // instead of the first and last pages of every region. Offsets are relative until the area's
+        // place after the names is known.
+        std::string dense(8, '\0');   // (offset 0 means "no copy" for the `Name` copies)
+        auto copy_dense = [&](void const * p, size_t n) {
+            size_t off = align_up(dense.size(), 8);
+            dense.resize(off);
+            dense.append(static_cast<char const *>(p), n);
+            return static_cast<uint64_t>(off);
+        };
+        auto copy_dense_array = [&](object * a, uint64_t n) {
+            if (!lean_is_array(a) || lean_array_size(a) < n)
+                throw exception("a `ModuleData` array is not an array of its recorded size");
+            lean_array_object hdr;
+            memcpy(&hdr, a, sizeof(hdr));
+            hdr.m_size = n;
+            hdr.m_capacity = n;
+            size_t off = align_up(dense.size(), 8);
+            dense.resize(off);
+            dense.append(reinterpret_cast<char const *>(&hdr), sizeof(hdr));
+            dense.append(reinterpret_cast<char const *>(lean_array_cptr(a)), n * sizeof(void *));
+            return static_cast<uint64_t>(off);
+        };
+        auto copy_dense_name = [&](object * n) -> uint64_t {
+            if (lean_is_scalar(n)) return 0;
+            if (!lean_is_ctor(n) || lean_ctor_num_objs(n) != 2 || lean_object_byte_size(n) != g_name_object_size)
+                return 0;
+            return copy_dense(n, g_name_object_size);
+        };
         // Per part: the hashes of `constNames` and `extraConstNames`, and its chain.
         std::vector<std::vector<uint64_t>> part_hashes;
         std::vector<uint32_t> part_chain;
@@ -1697,6 +1904,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
             pp.num_extra_const_names = static_cast<uint32_t>(lean_array_size(arrays[2]));
             pp.num_entries = static_cast<uint32_t>(lean_array_size(arrays[3]));
             pp.is_module = module_data_is_module(data);
+            pp.dense_const_names = copy_dense_array(arrays[0], pp.num_const_names);
+            pp.dense_constants = copy_dense_array(arrays[1], pp.num_constants);
+            pp.dense_extra_const_names = copy_dense_array(arrays[2], pp.num_extra_const_names);
             pp.first_ext = static_cast<uint32_t>(ext_entry_table.size());
             for (size_t i = 0; i < pp.num_entries; i++) {
                 object * pair = lean_array_get_core(arrays[3], i);
@@ -1706,7 +1916,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 auto it = ext_name_index.find(key);
                 if (it == ext_name_index.end()) {
                     it = ext_name_index.emplace(key, static_cast<uint32_t>(ext_name_table.size())).first;
-                    ext_name_table.push_back({ reinterpret_cast<uint64_t>(n) });
+                    ext_name_table.push_back({ reinterpret_cast<uint64_t>(n), copy_dense_name(n), lean_name_hash(n) });
                 }
                 object * row = lean_ctor_get(pair, 1);
                 uint32_t hint = key == parser_extension_key() ? parser_density_hint(row, regions) : 0;
@@ -1743,6 +1953,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
             return r;
         };
         for (auto & chain : chains) {
+            if (chain.empty()) continue;
             // A chain with a file that changed since it was looked at is left out, like one with a
             // file that cannot be read: (the pack records the identity of the file as first opened)
             std::vector<std::unique_ptr<file_descriptor>> fds;
@@ -1753,31 +1964,57 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 unchanged = unchanged && *fds.back() && fstat(fds.back()->get(), &st) == 0 && same_stat(pt.st, st);
             }
             if (!unchanged) continue;
+            // Read and check every part before writing anything. A `.olean` that is not the module
+            // data that the tables assume is left out, as an unreadable file is, rather than failing
+            // the whole pack or crashing on a field that is not the object type it must be.
+            std::vector<object *> chain_roots;
+            std::vector<content_hash> contents;
             std::vector<region_view> deps;
             std::vector<parser_span> parser_regions;
-            pack_chain c { static_cast<uint32_t>(entries.size()), static_cast<uint32_t>(chain.size()) };
-            std::vector<object *> chain_roots;
+            bool valid = true;
+            try {
+                for (size_t j = 0; j < chain.size(); j++) {
+                    part & pt = chain[j];
+                    char * slot = mem + pt.offset;
+                    size_t size = pt.st.st_size;
+                    if (pread(fds[j]->get(), slot, size, 0) != static_cast<ssize_t>(size))
+                        throw exception((sstream() << "failed to read '" << pt.path << "'").str());
+                    content_hash content = hash_content_core(slot, size);
+                    region_reader reader(pt.data_size, slot + pt.data_off,
+                        reinterpret_cast<char *>(pt.orig_base) + pt.data_off,
+                        deps, {}, {});
+                    reader.check_bounds();
+                    object * root = reader.read();
+                    // the layout of `ModuleData` that the tables assume
+                    if (lean_is_scalar(root) || lean_ptr_tag(root) != 0 ||
+                        lean_ctor_num_objs(root) != g_module_data_num_objs)
+                        throw exception((sstream() << "'" << pt.path << "' does not hold module data").str());
+                    parser_regions.push_back({ reinterpret_cast<uintptr_t>(slot + pt.data_off + sizeof(void *)),
+                        pt.data_size - sizeof(void *) });
+                    if (!checked_module_data(root, parser_regions))
+                        throw exception((sstream() << "'" << pt.path << "' holds malformed module data").str());
+                    contents.push_back(content);
+                    chain_roots.push_back(root);
+                    deps.push_back({ slot, size, reinterpret_cast<void *>(pt.orig_base) });
+                }
+            } catch (exception &) {
+                valid = false;
+            }
+            if (!valid) continue;
             std::vector<bool> referenced;
+            pack_chain c { static_cast<uint32_t>(entries.size()), static_cast<uint32_t>(chain.size()) };
+            parser_regions.clear();
             for (size_t j = 0; j < chain.size(); j++) {
                 part & pt = chain[j];
                 char * slot = mem + pt.offset;
                 size_t size = pt.st.st_size;
-                if (pread(fds[j]->get(), slot, size, 0) != static_cast<ssize_t>(size))
-                    throw exception((sstream() << "failed to read '" << pt.path << "'").str());
-                content_hash content = hash_content_core(slot, size);
-                region_reader reader(pt.data_size, slot + pt.data_off,
-                                     reinterpret_cast<char *>(pt.orig_base) + pt.data_off,
-                                     deps, {}, {});
-                object * root = reader.read();
-                // the layout of `ModuleData` that the tables assume
-                if (lean_is_scalar(root) || lean_ptr_tag(root) != 0 || lean_ctor_num_objs(root) != g_module_data_num_objs)
-                    throw exception((sstream() << "'" << pt.path << "' does not hold module data").str());
+                object * root = chain_roots[j];
                 memcpy(slot + pt.data_off, &root, sizeof(root));
                 size_t new_base = reinterpret_cast<size_t>(slot);
                 memcpy(slot + olean_header_base_addr_offset(), &new_base, sizeof(new_base));
                 write_at(slot, size, pt.offset);
                 parser_regions.push_back({ reinterpret_cast<uintptr_t>(slot + pt.data_off + sizeof(void *)),
-                                           pt.data_size - sizeof(void *) });
+                    pt.data_size - sizeof(void *) });
                 part_table.push_back(describe_part(root, parser_regions));
                 std::vector<uint64_t> hashes;
                 for (unsigned a = 1; a <= 3; a += 2) {
@@ -1790,28 +2027,26 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                 // the root slot of the data holds this part's root, which may be an earlier one's
                 char const * words = slot + pt.data_off + sizeof(void *);
                 size_t num_words = (pt.data_size - sizeof(void *)) / sizeof(void *);
-                for (size_t r = 0; r < chain_roots.size(); r++) {
+                for (size_t r = 0; r < j; r++) {
                     for (size_t w = 0; w < num_words && !referenced[r]; w++) {
                         uint64_t v;
                         memcpy(&v, words + w * sizeof(void *), sizeof(v));
                         if (v == reinterpret_cast<uint64_t>(chain_roots[r])) referenced[r] = true;
                     }
                 }
-                chain_roots.push_back(root);
                 referenced.push_back(false);
                 pack_entry e = {};
                 e.offset = pt.offset;
                 e.orig_base = pt.orig_base;
                 e.root = e.region_root = reinterpret_cast<uint64_t>(root);
                 set_file_id(e, pt.st);
-                e.content = content;
+                e.content = contents[j];
                 e.path = add_string(pt.path.substr(roots[pt.root_idx].size() + 1));
                 e.root_idx = pt.root_idx;
                 e.chain = static_cast<uint32_t>(chain_table.size());
                 e.part = static_cast<uint32_t>(j);
                 if (olean_header_githash_matches(slot)) e.flags |= entry_githash_match;
                 entries.push_back(e);
-                deps.push_back({ slot, size, reinterpret_cast<void *>(pt.orig_base) });
             }
             chain_table.push_back(c);
             // Copy the roots no later part points to; a root shared by several parts is copied once.
@@ -1840,15 +2075,19 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
                     for (size_t j = 0; j < lean_array_size(imports); j++) {
                         object * imp = lean_array_get_core(imports, j);
                         pack_edge e = {};
-                        e.module = reinterpret_cast<uint64_t>(lean_ctor_get(imp, 0));
+                        object * imported = lean_ctor_get(imp, 0);
+                        e.module = reinterpret_cast<uint64_t>(imported);
+                        e.name_hash = lean_name_hash(imported);
+                        e.name_copy = copy_dense_name(imported);
                         e.target = -1;
                         e.import_all = import_flag(imp, 0);
                         e.is_exported = import_flag(imp, 1);
                         e.is_meta = import_flag(imp, 2);
                         std::string target;
-                        if (!module_stem(lean_ctor_get(imp, 0), target)) target.clear();
+                        e.has_stem = module_stem(imported, target) ? 1 : 0;
+                        e.stem = add_string(e.has_stem ? target : std::string());
                         wm.edges.push_back(e);
-                        wm.edge_stems.push_back(target);
+                        wm.edge_stems.push_back(e.has_stem ? target : std::string());
                     }
                 }
             } else if (ends_with(rel, ".ir.sig", stem)) {
@@ -1941,6 +2180,15 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
             names.append(reinterpret_cast<char const *>(table.data()), table.size() * sizeof(uint64_t));
         }
 
+        uint64_t dense_off = align_up(names_off + names.size(), 64);
+        uint64_t dense_base = base + dense_off;
+        for (pack_part & pp : part_table) {
+            pp.dense_const_names += dense_base;
+            pp.dense_constants += dense_base;
+            pp.dense_extra_const_names += dense_base;
+        }
+        for (pack_edge & e : edge_table) if (e.name_copy) e.name_copy += dense_base;
+        for (pack_ext_name & en : ext_name_table) if (en.name_copy) en.name_copy += dense_base;
         pack_header hdr = {};
         init_side_file_header(hdr.common, g_pack_kind, sizeof(pack_header));
         hdr.olean_flags = olean_header_flags();
@@ -1948,7 +2196,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
         hdr.base_addr = base;
         hdr.roots_area_off = roots_area_off;
         hdr.names_off = names_off;
-        uint64_t index_off = align_up(names_off + names.size(), 64);
+        hdr.dense_off = dense_off;
+        hdr.dense_size = dense.size();
+        uint64_t index_off = align_up(dense_off + dense.size(), 64);
         std::string index;
         auto append = [&](void const * data, size_t len) {
             size_t off = index_off + index.size();
@@ -2020,6 +2270,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
         if (bound) hdr.flags |= pack_flag_bound;
         write_at(roots_area.data(), roots_area.size(), roots_area_off);
         write_at(names.data(), names.size(), names_off);
+        write_at(dense.data(), dense.size(), dense_off);
         write_at(index.data(), index.size(), hdr.entries_off);
         if (ftruncate(ofd.fd(), hdr.size) != 0)
             throw exception((sstream() << "failed to write '" << tmp << "': " << strerror(errno)).str());
@@ -2071,8 +2322,6 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_olean_pack_write(b_obj_arg ochains
 // A module is identified by `pack index << 24 | module index`; `g_no_pack_module` means none.
 
 namespace {
-constexpr uint32_t g_no_pack_module = 0xffffffff;
-
 loaded_pack * pack_of(uint32_t id, uint32_t & idx) {
     std::call_once(g_packs_once, init_packs);
     std::vector<loaded_pack> & packs = *g_packs.load(std::memory_order_acquire);
@@ -2114,11 +2363,46 @@ obj_res pack_chain_parts(loaded_pack & p, uint32_t chain, size_t count, char con
 
 }
 
+namespace {
+/*
+Successful lookups of the pack tables, for this thread. The tables of a pack, and the objects of
+its regions, live in a mapping that is never unmapped, and a lookup that succeeded has checked
+every block of the index it read; the pack's block table records those checks for the process, and
+`module_state` and `part_state` only change from "not checked" to their final state. Repeating a
+lookup of the same `Name` or `ModuleData` object would read the same slots of these immutable
+tables and reach the same result, so it is answered from here. Entries whose object is not in a
+pack mapping are not stored: a pointer into a region that is later freed could be reused by
+another object.
+*/
+struct pack_find_cache_entry { object const * name; loaded_pack * pack; uint32_t id; uint32_t pad; };
+struct pack_part_cache_entry { object const * data; loaded_pack * pack; uint32_t index; uint32_t pad; };
+constexpr size_t g_pack_cache_size = 4096;
+thread_local pack_find_cache_entry g_pack_find_cache[g_pack_cache_size];
+thread_local pack_part_cache_entry g_pack_part_cache[g_pack_cache_size];
+// The path of the module being looked up, whose capacity is reused by the lookups of a thread.
+thread_local std::string g_pack_find_stem;
+
+inline size_t pack_cache_slot(void const * p) {
+    return static_cast<size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9e3779b97f4a7c15ull >> 52);
+}
+inline bool in_pack_mapping(void const * p, loaded_pack const & pack) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return a >= pack.hdr.base_addr && a < pack.hdr.base_addr + pack.hdr.entries_off;
+}
+}
+
 // The metadata of the packed part whose root `ModuleData` is `root`, if any.
 pack_part const * packed_part(b_obj_arg root, loaded_pack ** pack = nullptr) {
     std::vector<loaded_pack> * packs = g_packs.load(std::memory_order_acquire);
     if (!packs || lean_is_scalar(root)) return nullptr;
     uint64_t a = reinterpret_cast<uint64_t>(root);
+    pack_part_cache_entry & ce = g_pack_part_cache[pack_cache_slot(root)];
+    if (ce.data == root && ce.pack && in_pack_mapping(root, *ce.pack) &&
+        ce.pack->part_state[ce.index].load(std::memory_order_acquire) == 1) {
+        // (the entry was returned only after `part_ok` accepted it)
+        if (pack) *pack = ce.pack;
+        return &ce.pack->parts[ce.index];
+    }
     for (loaded_pack & p : *packs) {
         if (a < p.hdr.base_addr || a >= p.hdr.base_addr + p.hdr.entries_off) continue;
         int64_t i = p.find_root(a);
@@ -2131,6 +2415,7 @@ pack_part const * packed_part(b_obj_arg root, loaded_pack ** pack = nullptr) {
             p.part_state[i].store(state, std::memory_order_release);
         }
         if (state != 1) return nullptr;
+        if (i <= static_cast<int64_t>(UINT32_MAX)) ce = { root, &p, static_cast<uint32_t>(i), 0 };
         if (pack) *pack = &p;
         return &p.parts[i];
     }
@@ -2143,8 +2428,19 @@ extern "C" LEAN_EXPORT uint32_t lean_paperlean_pack_module_find(b_obj_arg n) {
     std::call_once(g_packs_once, init_packs);
     scoped_import_timer timer(counter_pack_find);
     std::vector<loaded_pack> & packs = *g_packs.load(std::memory_order_acquire);
+    pack_find_cache_entry & ce = g_pack_find_cache[pack_cache_slot(n)];
+    if (ce.name == n && ce.pack && in_pack_mapping(n, *ce.pack)) {
+        uint32_t pi = ce.id >> 24, i = ce.id & 0xffffff;
+        // The answer was valid when it was stored, and these states are final.
+        if (pi < packs.size() && i < packs[pi].hdr.num_modules &&
+            (packs[pi].module_state[i].load(std::memory_order_acquire) & (module_valid | module_here)) ==
+                (module_valid | module_here) &&
+            (packs[pi].modules[i].flags & pack_module_edges))
+            return ce.id;
+    }
     uint64_t h = lean_name_hash(n);
-    std::string stem;
+    std::string & stem = g_pack_find_stem;
+    stem.clear();
     bool have_stem = false;
     for (size_t pi = 0; pi < packs.size() && pi < 255; pi++) {
         loaded_pack & p = packs[pi];
@@ -2160,8 +2456,13 @@ extern "C" LEAN_EXPORT uint32_t lean_paperlean_pack_module_find(b_obj_arg n) {
                 if (!module_stem(n, stem)) return g_no_pack_module;
                 have_stem = true;
             }
-            if (p.str(p.modules[i].stem) == stem)
-                return static_cast<uint32_t>(pi << 24) | i;
+            if (p.str(p.modules[i].stem) == stem) {
+                uint32_t id = static_cast<uint32_t>(pi << 24) | i;
+                // Only names that live in a pack are stable enough to cache by address.
+                for (loaded_pack & q : packs)
+                    if (in_pack_mapping(n, q)) { ce = { n, &q, id, 0 }; break; }
+                return id;
+            }
         }
         if (damaged) p.damaged();
     }
@@ -2417,6 +2718,36 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_why_ignored(b_obj_arg opath) 
 #endif
 }
 
+// The range that a process loading the pack or binding `path` from `LEAN_OLEAN_PACK` records for it
+// (`loaded_pack_ranges`): that of the pack itself, as `load_pack` accepts it; false with `err` if Lean
+// ignores the file as a whole.
+bool pack_range_of_file(std::string const & path, pack_range & r, std::string & err) {
+#if defined(LEAN_MMAP) && !defined(LEAN_WINDOWS)
+    file_descriptor lfd(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+    if (!lfd) { err = strerror(errno); return false; }
+    binding b;
+    bool bound = is_binding(lfd.get());
+    if (bound && !read_binding(path, lfd.get(), b, err)) return false;
+    file_descriptor pfd(bound ? open(b.pack.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK) : -1);
+    struct stat st;
+    pack_header hdr;
+    if (!read_pack_header(bound ? b.pack : path, bound ? pfd.get() : lfd.get(), st, hdr, err)) {
+        if (bound) err = "its pack '" + b.pack + "': " + err;
+        return false;
+    }
+    if (bound && (hdr.common.checksum != b.pack_checksum || hdr.num_entries != b.ids.size() || hdr.num_roots != b.roots.size())) {
+        err = "it binds another pack than '" + b.pack + "'"; return false;
+    }
+    if (!bound && (hdr.flags & pack_flag_bound)) { err = "it is read through bindings only"; return false; }
+    r = pack_range { hdr.common.checksum, hdr.base_addr, hdr.size };
+    return true;
+#else
+    (void)path; (void)r;
+    err = "packs are not supported on this platform";
+    return false;
+#endif
+}
+
 /* OLeanPack.identityFile (pack : @& String) : String
    The file next to the pack `pack` that records its identity. */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_identity_file(b_obj_arg opath) {
@@ -2566,7 +2897,11 @@ extern "C" LEAN_EXPORT uint32_t lean_paperlean_pack_module_edge_target(uint32_t 
     if (e.target < 0) {
         uint32_t t = p->edge_targets[k].load(std::memory_order_acquire);
         if (t == g_target_unknown) {
-            t = lean_paperlean_pack_module_find(reinterpret_cast<object *>(e.module));
+            if (!e.has_stem || e.stem.off > p->hdr.strings_size || e.stem.len > p->hdr.strings_size - e.stem.off)
+                t = g_no_pack_module;
+            else
+                t = find_module_by_hash_stem(*g_packs.load(std::memory_order_acquire), e.name_hash,
+                    std::string_view(p->begin + p->hdr.strings_off + e.stem.off, e.stem.len));
             p->edge_targets[k].store(t, std::memory_order_release);
         }
         return t;
@@ -2595,7 +2930,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_pack_module_edge_import(uint32_t i
     lean_always_assert(p && j < p->modules[idx].num_edges);
     pack_edge const & e = p->edges[p->modules[idx].first_edge + j];
     object * imp = lean_alloc_ctor(0, 1, 3);
-    lean_ctor_set(imp, 0, reinterpret_cast<object *>(e.module));
+    lean_ctor_set(imp, 0, reinterpret_cast<object *>(e.name_copy ? e.name_copy : e.module));
     lean_ctor_set_uint8(imp, sizeof(void *), e.import_all);
     lean_ctor_set_uint8(imp, sizeof(void *) + 1, e.is_exported);
     lean_ctor_set_uint8(imp, sizeof(void *) + 2, e.is_meta);
@@ -2699,6 +3034,13 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_module_data_num_extra_const_names(
     return lean_usize_to_nat(lean_array_size(module_data_field(d, 3)));
 }
 
+bool packed_part_num_constants(b_obj_arg d, size_t & n) {
+    pack_part const * pp = packed_part(d);
+    if (!pp) return false;
+    n = std::min(pp->num_const_names, pp->num_constants);
+    return true;
+}
+
 bool packed_part_names(b_obj_arg d, part_names & out) {
     loaded_pack * p = nullptr;
     pack_part const * pp = packed_part(d, &p);
@@ -2715,6 +3057,8 @@ bool packed_part_names(b_obj_arg d, part_names & out) {
         out.single = out.hashes + pp->num_const_names + pp->num_extra_const_names;
         out.num_const_names = pp->num_const_names;
     }
+    out.num_constants = std::min(pp->num_const_names, pp->num_constants);
+    out.num_extra_const_names = pp->num_extra_const_names;
     return true;
 }
 
@@ -2769,12 +3113,27 @@ extern "C" LEAN_EXPORT uint8_t lean_paperlean_parser_row_density(b_obj_arg data,
     return 0;
 }
 
+/* Whether `o` lies in the dense area of a loaded pack, where the writer put byte copies of region
+   objects that import reads instead of the originals (`graph_diff.cpp` compares such a copy with its
+   original by contents). */
+extern "C" LEAN_EXPORT uint8_t lean_paperlean_in_pack_dense_area(b_obj_arg o) {
+    if (lean_is_scalar(o)) return 0;
+    std::vector<loaded_pack> * packs = g_packs.load(std::memory_order_acquire);
+    if (!packs) return 0;
+    uint64_t a = reinterpret_cast<uintptr_t>(o);
+    for (loaded_pack const & p : *packs) {
+        uint64_t from = p.hdr.base_addr + p.hdr.dense_off;
+        if (p.hdr.dense_size && a >= from && a < from + p.hdr.dense_size) return 1;
+    }
+    return 0;
+}
+
 // The arrays `constNames`, `constants`, `extraConstNames` of `d`.
 void module_data_arrays(b_obj_arg d, object ** names, object ** consts, object ** extra) {
     if (pack_part const * pp = packed_part(d)) {
-        *names = reinterpret_cast<object *>(pp->const_names);
-        *consts = reinterpret_cast<object *>(pp->constants);
-        *extra = reinterpret_cast<object *>(pp->extra_const_names);
+        *names = reinterpret_cast<object *>(pp->dense_const_names ? pp->dense_const_names : pp->const_names);
+        *consts = reinterpret_cast<object *>(pp->dense_constants ? pp->dense_constants : pp->constants);
+        *extra = reinterpret_cast<object *>(pp->dense_extra_const_names ? pp->dense_extra_const_names : pp->extra_const_names);
     } else {
         *names = module_data_field(d, 1);
         *consts = module_data_field(d, 2);
@@ -2794,8 +3153,8 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_imported_entries_arrays(b_obj_arg 
     // name hash -> extension indices with that hash
     std::unordered_multimap<uint64_t, uint32_t> by_hash;
     for (size_t e = 0; e < k; e++) by_hash.emplace(lean_name_hash(lean_array_get_core(ext_names, e)), static_cast<uint32_t>(e));
-    auto ext_of = [&](b_obj_arg name) -> int64_t {
-        auto r = by_hash.equal_range(lean_name_hash(name));
+    auto ext_of = [&](b_obj_arg name, uint64_t h) -> int64_t {
+        auto r = by_hash.equal_range(h);
         int64_t found = -1;
         for (auto it = r.first; it != r.second; ++it)
             if (lean_name_eq(lean_array_get_core(ext_names, it->second), name)) found = it->second;
@@ -2834,14 +3193,19 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_imported_entries_arrays(b_obj_arg 
             std::vector<int64_t> & ids = pack_map(p);
             for (uint32_t j = pp->first_ext; j < pp->first_ext + pp->num_entries; j++) {
                 pack_ext_entry const & ee = p->ext_entries[j];
-                if (ids[ee.name] == -2) ids[ee.name] = ext_of(reinterpret_cast<object *>(p->ext_names[ee.name].name));
+                if (ids[ee.name] == -2) {
+                    pack_ext_name const & en = p->ext_names[ee.name];
+                    object * n = reinterpret_cast<object *>(en.name_copy ? en.name_copy : en.name);
+                    ids[ee.name] = ext_of(n, en.name_copy ? en.name_hash : lean_name_hash(n));
+                }
                 set(ids[ee.name], m, reinterpret_cast<object *>(ee.entries), true);
             }
         } else {
             object * entries = module_data_field(d, 4);
             for (size_t j = 0; j < lean_array_size(entries); j++) {
                 object * pair = lean_array_get_core(entries, j);
-                set(ext_of(lean_ctor_get(pair, 0)), m, lean_ctor_get(pair, 1), false);
+                set(ext_of(lean_ctor_get(pair, 0), lean_name_hash(lean_ctor_get(pair, 0))), m,
+                    lean_ctor_get(pair, 1), false);
             }
         }
     }

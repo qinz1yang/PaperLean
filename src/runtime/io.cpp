@@ -83,12 +83,15 @@ extern "C" LEAN_EXPORT uint8_t lean_io_initializing() {
     return g_initializing;
 }
 
+#if defined(LEAN_WINDOWS)
+// (only `lean_io_realpath` on Windows; elsewhere it reports the failure of `realpath(3)` itself)
 static obj_res mk_file_not_found_error(b_obj_arg fname) {
     inc(fname);
     int errnum = ENOENT;
     object * details = mk_string("");
     return io_result_mk_error(lean_mk_io_error_no_file_or_directory(fname, errnum, details));
 }
+#endif
 
 static lean_external_class * g_io_handle_external_class = nullptr;
 
@@ -257,7 +260,11 @@ static obj_res decode_uv_error_impl(int errnum, int posix_errnum, b_lean_obj_arg
     object * details = mk_string(uv_strerror(errnum));
     switch (errnum) {
     case UV_EINTR:
-        lean_assert(fname != nullptr);
+        if (fname == nullptr) {
+            /* `interrupted` requires a file name; callers such as `Handle.lock` and the
+               stdio primitives have none. */
+            return lean_mk_io_error_interrupted(mk_string(""), posix_errnum, details);
+        }
         inc_ref(fname);
         return lean_mk_io_error_interrupted(fname, posix_errnum, details);
     /* LibUV does not map EDOM and ENOSTR as of version 1.52.1 */
@@ -274,7 +281,9 @@ static obj_res decode_uv_error_impl(int errnum, int posix_errnum, b_lean_obj_arg
             return lean_mk_io_error_invalid_argument_file(fname, posix_errnum, details);
         }
     case UV_ENOENT:
-        lean_assert(fname != nullptr);
+        if (fname == nullptr) {
+            return lean_mk_io_error_no_file_or_directory(mk_string(""), posix_errnum, details);
+        }
         inc_ref(fname);
         return lean_mk_io_error_no_file_or_directory(fname, posix_errnum, details);
     case UV_EACCES: case UV_EROFS: case UV_ECONNABORTED: case UV_EFBIG:
@@ -1059,7 +1068,9 @@ extern "C" LEAN_EXPORT obj_res lean_io_realpath(obj_arg filename) {
         dec_ref(filename);
         return io_result_mk_ok(s);
     } else {
-        obj_res res = mk_file_not_found_error(filename);
+        /* Preserve the realpath(3) failure: EACCES/ELOOP/ENAMETOOLONG etc. must not be
+           reported as ENOENT. */
+        obj_res res = io_result_mk_error(decode_io_error(errno, filename));
         dec_ref(filename);
         return res;
     }

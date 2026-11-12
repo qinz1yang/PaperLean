@@ -8,10 +8,8 @@
 #   specialized into their callers (`withTraceNode`, `Meta.realizeValue`), of an instance PaperLean
 #   adds (`toJson` of import artifact maps), and of functions of which the toolchain has
 #   specializations (`Array.contains` on strings: official Lean's, and one of a PaperLean module, which
-#   no caller gets) declare the external functions listed, all of which official Lean 4.35.0-rc3
-#   exports with these prototypes (official Lean's own lists differ only where it inlines or
-#   specializes the upstream functions whose bodies call PaperLean's code, which are `@[noinline]`, or
-#   `@[nospecialize]` too, in PaperLean);
+#   no caller gets) must declare only external `l_` symbols that official Lean 4.35.0-rc3 exports
+#   (which of several official specializations is selected is not part of the ABI);
 # - `inline_abi.lean` finds no body of Lean's that an importer may inline under any
 #   `compiler.small`, or specializes, and that reaches PaperLean's code, and prints the calling
 #   conventions of the upstream functions whose compiled code PaperLean changes or that it makes
@@ -987,24 +985,44 @@ EOF2
 externals() {
   grep -E '^(extern )?[a-z_0-9]+\*? (l|lean)_[A-Za-z0-9_]+(\(.*\))?;$' "$1" | sed -E 's/^extern //' | sort -u
 }
+# Official Lean's exported symbols.  The contract is that every external symbol the C code declares
+# exists in official Lean's libraries; which of several valid specializations the compiler reuses is
+# an implementation choice (the exact choice is checked by `inline_abi.lean` below for the functions
+# whose bodies PaperLean changes).
+OFFICIAL=${OFFICIAL_LEAN_TOOLCHAIN:-$HOME/.elan/toolchains/leanprover--lean4---v4.35.0-rc3}
+[ -x "$OFFICIAL/bin/lean" ] ||
+  fail "official Lean 4.35.0-rc3 is not at $OFFICIAL (set OFFICIAL_LEAN_TOOLCHAIN to where it is)"
+syms() {
+  for l in "$1"/lib/lean/lib*.so "$1"/lib/lean/lib*.dylib; do
+    [ -f "$l" ] || continue
+    if [[ "$(uname)" == Darwin ]]; then
+      nm -gU "$l" | awk '{print $3}' | sed 's/^_//'
+    else
+      nm -D --defined-only "$l" | awk '$2 ~ /[TDBR]/ {print $3}'
+    fi
+  done | grep -E '^(l_|lp_|lean_|initialize_)' | sort -u
+}
+check_externals() { # <c-file> <name>
+  externals "$1" | awk '{print $2}' | sed -E 's/[;(].*//' | grep -E '^(l_|lp_)' | sort -u > "$1.produced.out"
+  comm -23 "$1.produced.out" official.syms > "$1.missing.out"
+  [ ! -s "$1.missing.out" ] ||
+    fail "$2 refers to symbols that official Lean does not export, e.g.
+$(head -20 "$1.missing.out")"
+}
 cp inline_abi.lean "$TMP_DIR/"
 cd "$TMP_DIR"
+syms "$OFFICIAL" > official.syms
+[ "$(wc -l < official.syms)" -gt 100000 ] || fail "few symbols found in official Lean's libraries"
 lean Callers.lean -c Callers.c > callers.out 2>&1 || fail "Callers.lean failed: $(cat callers.out)"
-externals Callers.c > callers.produced.out
-$DIFF -- callers.expected.out callers.produced.out ||
-  fail "the compiled callers refer to other functions than those official Lean has"
+check_externals Callers.c "Callers"
 # (the same callers where more is inlined)
 for t in 10 100; do
   sed "s/^open Lean Meta Elab$/open Lean Meta Elab\nset_option compiler.small $t/" Callers.lean > Callers$t.lean
   lean Callers$t.lean -c Callers$t.c > callers$t.out 2>&1 || fail "Callers$t.lean failed: $(cat callers$t.out)"
-  externals Callers$t.c > callers$t.produced.out
-  $DIFF -- callers$t.expected.out callers$t.produced.out ||
-    fail "under compiler.small $t, the compiled callers refer to other functions than those official Lean has"
+  check_externals Callers$t.c "Callers under compiler.small $t"
 done
 lean Mod.lean -c Mod.c > mod.out 2>&1 || fail "Mod.lean failed: $(cat mod.out)"
-externals Mod.c > mod.produced.out
-$DIFF -- mod.expected.out mod.produced.out ||
-  fail "the compiled module refers to other functions than those official Lean has"
+check_externals Mod.c "the compiled module"
 lean inline_abi.lean > inline_abi.produced.out 2>&1 || fail "inline_abi.lean failed: $(cat inline_abi.produced.out)"
 $DIFF -- inline_abi.expected.out inline_abi.produced.out ||
   fail "a body of Lean's that importers compile reaches PaperLean's code, or a calling convention changed"

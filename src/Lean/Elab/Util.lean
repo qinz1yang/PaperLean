@@ -13,6 +13,7 @@ import Lean.BuiltinDocAttr
 public import Lean.ExtraModUses
 import all Init.Prelude  -- for `Lean.Macro.State.expandedMacroDecls` access
 import Lean.PaperLean.Base
+import Lean.PaperLean.QuotedSyntaxHook
 
 public section
 
@@ -106,6 +107,9 @@ def syntaxNodeKindOfAttrParam (defaultParserNamespace : Name) (stx : Syntax) : A
   throwError "invalid syntax node kind `{k}`"
 
 private unsafe def evalSyntaxConstantUnsafe (env : Environment) (opts : Options) (constName : Name) : ExceptT String Id Syntax :=
+  -- PaperLean: a quoted tactic of this module without waiting for its compiled code
+  -- (`Lean.PaperLean.QuotedSyntax`)
+  if let some stx := PaperLean.QuotedSyntax.ofConstant? env constName then pure stx else
   env.evalConstCheck Syntax opts `Lean.Syntax constName
 
 @[implemented_by evalSyntaxConstantUnsafe]

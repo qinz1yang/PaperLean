@@ -177,7 +177,7 @@ def addPreDefInfo (preDef : PreDefinition) : TermElabM Unit := do
     addTermInfo' preDef.ref (← mkConstWithLevelParams preDef.declName) (isBinder := true)
 
 
-private def addNonRecAux (docCtx : LocalContext × LocalInstances) (preDef : PreDefinition) (compile : Bool)
+@[noinline] private def addNonRecAux (docCtx : LocalContext × LocalInstances) (preDef : PreDefinition) (compile : Bool)
     (all : List Name) (applyAttrAfterCompilation := true) (cacheProofs := true) (cleanupValue := false)
     (isRecursive := false) : TermElabM Unit :=
   withRef preDef.ref do

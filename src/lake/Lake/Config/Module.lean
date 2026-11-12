@@ -48,8 +48,13 @@ For example, in a library with a source directory of `src`,
 `src/Foo/Bar.lean` and `src/Foo/Bar/` will both resolve to the module `Foo.Bar`.
 -/
 public def LeanLib.findModuleBySrc? (path : FilePath) (self : LeanLib) : Option Module := do
-  let modPath ← path.toString.dropPrefix? self.srcDir.toString
-  let modPath := (modPath.drop 1).toString -- remove leading `/`
+  let srcStr := self.srcDir.toString
+  -- Require a path-component boundary: `/a/lib` is not a prefix of
+  -- `/a/lib-extra/Foo.lean`. The separator itself is consumed here.
+  let srcPrefix :=
+    if srcStr.endsWith FilePath.pathSeparator.toString then srcStr
+    else srcStr ++ FilePath.pathSeparator.toString
+  let modPath ← path.toString.dropPrefix? srcPrefix
   let modPath ← modPath.dropSuffix? ".lean" <|> modPath.dropSuffix? FilePath.pathSeparator.toString
   let modName := FilePath.components modPath.toString |>.foldl .str .anonymous
   self.findModule? modName

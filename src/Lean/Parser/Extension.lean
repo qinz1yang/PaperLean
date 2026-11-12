@@ -88,17 +88,47 @@ end ParserExtension
 open ParserExtension in
 abbrev ParserExtension := ScopedEnvExtension OLeanEntry Entry State
 
-private def ParserExtension.mkInitial : IO ParserExtension.State := do
-  let tokens     ← builtinTokenTable.get
-  let kinds      ← builtinSyntaxNodeKindSetRef.get
-  let categories ← builtinParserCategoriesRef.get
-  pure { tokens := tokens, kinds := kinds, categories := categories }
+/-- PaperLean: the token lists of the builtin parsers registered while builtin registrations are
+deferred (`PaperLean.builtinRegistrationsDeferred`: only while the `lean` executable initializes Lean's
+own library), newest first; `flushBuiltinTokens` folds them into `builtinTokenTable`. -/
+private builtin_initialize builtinTokenLists : IO.Ref (List (Name × List Token)) ← IO.mkRef []
 
 private def addTokenConfig (tokens : TokenTable) (tk : Token) : Except String TokenTable := do
   if tk == "" then throw "invalid empty symbol"
   else match tokens.find? tk with
     | none   => pure $ tokens.insert tk tk
     | some _ => pure tokens
+
+/-- The token table of a base table and the pending lists, in registration order, with the former
+duplicate skipping: `addTokenConfig` leaves a token that is already present unchanged. -/
+private def buildBuiltinTokenTable (base : TokenTable) (lists : List (Name × List Token)) :
+    IO TokenTable := do
+  let mut tokens := base
+  for (declName, tks) in lists.reverse do
+    for tk in tks do
+      match addTokenConfig tokens tk with
+      | Except.ok table => tokens := table
+      | Except.error msg =>
+        throw (IO.userError s!"invalid builtin parser `{privateToUserName declName}`, {msg}")
+  return tokens
+
+/-- PaperLean: folds the deferred token lists into `builtinTokenTable` in registration order, as the
+`swap`/`addParserTokens`/`set` of `updateBuiltinTokens` would have (no list has an empty token:
+`updateBuiltinTokens` rejects it at registration). -/
+private def flushBuiltinTokens : IO Unit := do
+  let lists ← builtinTokenLists.swap []
+  unless lists.isEmpty do
+    let tokenTable ← builtinTokenTable.swap {}
+    builtinTokenTable.set (← buildBuiltinTokenTable tokenTable lists)
+
+builtin_initialize PaperLean.builtinRegistrationFlushes.modify (·.push flushBuiltinTokens)
+
+private def ParserExtension.mkInitial : IO ParserExtension.State := do
+  flushBuiltinTokens
+  let tokens     ← builtinTokenTable.get
+  let kinds      ← builtinSyntaxNodeKindSetRef.get
+  let categories ← builtinParserCategoriesRef.get
+  pure { tokens := tokens, kinds := kinds, categories := categories }
 
 def throwUnknownParserCategory {α} (catName : Name) : ExceptT String Id α :=
   throw s!"unknown parser category `{catName}`"
@@ -152,11 +182,23 @@ def addParserTokens (tokenTable : TokenTable) (info : ParserInfo) : Except Strin
   let newTokens := info.collectTokens []
   newTokens.foldlM addTokenConfig tokenTable
 
-private def updateBuiltinTokens (info : ParserInfo) (declName : Name) : IO Unit := do
-  let tokenTable ← builtinTokenTable.swap {}
-  match addParserTokens tokenTable info with
-  | Except.ok tokenTable => builtinTokenTable.set tokenTable
-  | Except.error msg     => throw (IO.userError s!"invalid builtin parser `{privateToUserName declName}`, {msg}")
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] private def updateBuiltinTokens (info : ParserInfo) (declName : Name) : IO Unit := do
+  -- PaperLean: while builtin registrations are deferred, keep the token list (`flushBuiltinTokens`)
+  if (← PaperLean.builtinRegistrationsDeferred) then
+    let tokens := info.collectTokens []
+    if tokens.any (· == "") then
+      -- the state and the message of the update below, which has swapped the table out when
+      -- `addTokenConfig` rejects the empty token
+      builtinTokenLists.set []
+      builtinTokenTable.set {}
+      throw (IO.userError s!"invalid builtin parser `{privateToUserName declName}`, invalid empty symbol")
+    builtinTokenLists.modify fun lists => (declName, tokens) :: lists
+  else
+    let tokenTable ← builtinTokenTable.swap {}
+    match addParserTokens tokenTable info with
+    | Except.ok tokenTable => builtinTokenTable.set tokenTable
+    | Except.error msg     => throw (IO.userError s!"invalid builtin parser `{privateToUserName declName}`, {msg}")
 
 def ParserExtension.addEntryImpl (s : State) (e : Entry) : State :=
   match e with

@@ -1053,7 +1053,7 @@ Put the given expression in `LCNF`.
 - Eta-expand applications of declarations that satisfy `shouldEtaExpand`.
 - Put computationally relevant expressions in A-normal form.
 -/
-def toLCNF (e eType : Expr) : CompilerM (Code .pure) := do
+@[noinline] def toLCNF (e eType : Expr) : CompilerM (Code .pure) := do
   -- Borrow the upcoming scope for this private key. Unlike mkFreshUserName, this does
   -- not advance the counter that determines hygienic names of subsequent declarations.
   let scopeKey := addMacroScope (← MonadQuotation.getContext) `_paperleanMacroBody

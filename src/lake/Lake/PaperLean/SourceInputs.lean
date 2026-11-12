@@ -20,7 +20,8 @@ namespace Lake.PaperLean.SourceInputs
 set_option genSizeOf false
 open System Lean
 
-/-- Device, inode, size, mtime and ctime of a stable, opened, readable regular file.
+/-- Inode, size, mtime and ctime (and a device field that is always 0) of a stable, opened, readable
+regular file.
 The bytes have the same representation as OLeanPack.readVerifiedOwnedBytes expects.
 Unsupported systems and final symlinks produce no identity. -/
 @[noinline] private def readableIdentity (path : @& String) : BaseIO (Option ByteArray) :=

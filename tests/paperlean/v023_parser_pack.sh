@@ -8,10 +8,11 @@ run leanc hint.c -o hint
 run ./hint make "$TMP_DIR/parts"
 run python3 "$TEST_DIR/paperlean/v023_parser_pack_fault.py" "$TMP_DIR/parts"
 capture ./hint pack "$TMP_DIR/parts" "$TMP_DIR/parser.paperlean"
-check_out_contains "packed 6"
+# 6 modules, of which `Malformed` and `Wrapped` are corrupt: the writer leaves them out (pack-1)
+check_out_contains "packed 4"
 capture env LEAN_PATH="$TMP_DIR/parts" LEAN_OLEAN_PACK="$TMP_DIR/parser.paperlean" \
   PAPERLEAN_IMPORT_TIMING=1 ./hint new "$TMP_DIR/parts"
-check_out_contains "new [2, 1, 0, 0, 0, 0, 0, 0, 0, 0]"
+check_out_contains "new [2, 1, 0, 0, 0, 0, 0, 0, 0]"
 check_out_contains "paperlean-counter parser.prepareHint=dense"
 check_out_contains "paperlean-counter parser.prepareHint=sparse"
 # A bad token size disqualifies the hint. Never inspect it before the earlier parser error.
@@ -23,6 +24,8 @@ for mode in default legacy check; do
 done
 # A dense hint can enable the fold for subsequent unpacked rows or for an
 # unsampled position of the hinted row itself. Both must reach the stock error.
+# (`Wrapped` is not packed any more: the writer refuses its corrupt string, so `Same.lean` reads it
+# from its `.olean` without a hint and only the stock error is required there.)
 printf 'prelude\nimport Dense\nimport LooseBad\n' > Cross.lean
 printf 'prelude\nimport Wrapped\n' > Same.lean
 for source in Cross.lean Same.lean; do
@@ -30,7 +33,7 @@ for source in Cross.lean Same.lean; do
     capture_exit 1 env LEAN_PATH="$TMP_DIR/parts:$TMP_DIR/loose" LEAN_OLEAN_PACK="$TMP_DIR/parser.paperlean" \
       PAPERLEAN_IMPORT="$mode" PAPERLEAN_IMPORT_TIMING=1 lean "$source"
     check_out_contains 'Unknown constant `MissingParser`'
-    if [ "$mode" != legacy ]; then
+    if [ "$mode" != legacy ] && [ "$source" = Cross.lean ]; then
       check_out_contains "paperlean-counter parser.deduplicateGlobalTokens"
     fi
   done

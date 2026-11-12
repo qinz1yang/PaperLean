@@ -4,7 +4,11 @@ cd "$TMP_DIR"
 cp "$TEST_DIR/paperlean/parser_tokens/"*.lean .
 run lean -o TokenScope.olean TokenScope.lean
 run lean -c Probe.c Probe.lean
-run leanc ${LEANC_OPTS-} -O2 -o probe Probe.c
+# The probe imports modules and interprets their code, like a `lean_exe` with `supportInterpreter := true`:
+# the interpreter must find the executable's own symbols, which on Linux needs `-rdynamic` (macOS exports
+# them by default)
+RDYNAMIC=; [ "$(uname -s)" = Linux ] && RDYNAMIC=-rdynamic
+run leanc ${LEANC_OPTS-} -O2 $RDYNAMIC -o probe Probe.c
 run ./probe make "$TMP_DIR/parts" "$TMP_DIR/parser.paperlean"
 export LEAN_PATH="$TMP_DIR/parts:$TMP_DIR"
 export LEAN_OLEAN_PACK="$TMP_DIR/parser.paperlean"

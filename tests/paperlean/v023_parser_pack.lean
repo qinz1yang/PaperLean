@@ -52,15 +52,18 @@ unsafe def main (args : List String) : IO Unit := do
     let (dense,dreg) ← readData `Dense
     let (sparse,sreg) ← readData `Sparse
     let (small,mreg) ← readData `Small
-    let (mal,mareg) ← readData `Malformed
     let (old,wreg) ← readData `OldWord
+    -- `Malformed` and `Wrapped` carry a corrupt string size (`v023_parser_pack_fault.py`): the pack
+    -- writer's bounds-checked walk leaves them out, so Lean reads their `.olean` files as official Lean does
+    for nm in [`Malformed, `Wrapped] do
+      if (← parts (findPack nm) false 1 none).isSome then throw <| IO.userError s!"packed {nm}"
     unless ← joinChecked true do throw <| IO.userError "changed pack"
     let a := extractRow dense; let b := extractRow sparse
     let values := [lookupHint dense a, lookupHint sparse b, lookupHint small (extractRow small),
       lookupHint sparse a, lookupHint dense b, lookupHint (md #[]) a,
       lookupHint dense (unsafeCast dense.entries[1]!.2), lookupHint dense (mkRow true),
-      lookupHint mal (extractRow mal), lookupHint old (extractRow old)]
+      lookupHint old (extractRow old)]
     IO.println s!"{mode} {values}"
-    unless values == (if mode=="new" then [2,1,0,0,0,0,0,0,0,0] else [0,0,0,0,0,0,0,0,0,0]) do
+    unless values == (if mode=="new" then [2,1,0,0,0,0,0,0,0] else [0,0,0,0,0,0,0,0,0]) do
       throw <| IO.userError "unexpected hint results"
-    unless dreg.size>0 && sreg.size>0 && mreg.size>0 && mareg.size>0 && wreg.size>0 do throw <| IO.userError "region missing"
+    unless dreg.size>0 && sreg.size>0 && mreg.size>0 && wreg.size>0 do throw <| IO.userError "region missing"

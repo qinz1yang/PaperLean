@@ -11,6 +11,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #if !defined(LEAN_WINDOWS)
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/acl.h>
@@ -24,6 +25,11 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #endif
 #if defined(__linux__)
 #include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <utility>
+#include <vector>
+#include <sched.h>
 #include <sys/resource.h>
 #endif
 #include "runtime/object.h"
@@ -74,10 +80,141 @@ extern "C" LEAN_EXPORT uint8 lean_paperlean_process_alive(uint32_t pid) {
 #endif
 }
 
-/* numCPUs : BaseIO Nat -- the number of hardware threads */
+#if defined(__linux__)
+// A small file's contents; empty if it cannot be read.
+static std::string read_small_file(std::string const & path) {
+    std::string text;
+    FILE * f = std::fopen(path.c_str(), "re");
+    if (!f) return text;
+    char buf[4096];
+    size_t n;
+    while (text.size() < 65536 && (n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    return text;
+}
+
+// The directories of this process's cgroup and of each of its ancestors, whose limits the kernel
+// all applies: in the cgroup v2 hierarchy (`second` true) and in the cgroup v1 hierarchy that has
+// the controller `v1_controller`. `PAPERLEAN_TEST_CGROUP=<dir>` reads `<dir>/self` and `<dir>/fs`
+// instead of `/proc/self/cgroup` and `/sys/fs/cgroup` (tests).
+static std::vector<std::pair<std::string, bool>> cgroup_dirs(char const * v1_controller) {
+    std::vector<std::pair<std::string, bool>> dirs;
+    char const * test = getenv("PAPERLEAN_TEST_CGROUP");
+    std::string self = read_small_file(test ? std::string(test) + "/self" : "/proc/self/cgroup");
+    std::string fs = test ? std::string(test) + "/fs" : "/sys/fs/cgroup";
+    size_t pos = 0;
+    while (pos < self.size()) {
+        size_t end = self.find('\n', pos);
+        if (end == std::string::npos) end = self.size();
+        std::string line = self.substr(pos, end - pos);
+        pos = end + 1;
+        // `<hierarchy id>:<controllers>:<path>`; v2 has no controllers
+        size_t c1 = line.find(':');
+        size_t c2 = c1 == std::string::npos ? c1 : line.find(':', c1 + 1);
+        if (c2 == std::string::npos) continue;
+        std::string controllers = line.substr(c1 + 1, c2 - c1 - 1);
+        std::string path = line.substr(c2 + 1);
+        if (path == "/") path.clear();
+        std::vector<std::string> mounts;
+        bool v2 = controllers.empty();
+        if (v2) {
+            mounts.push_back(fs);
+        } else {
+            bool has = false;
+            for (size_t s = 0; s <= controllers.size();) {
+                size_t e = controllers.find(',', s);
+                if (e == std::string::npos) e = controllers.size();
+                if (controllers.compare(s, e - s, v1_controller) == 0) has = true;
+                s = e + 1;
+            }
+            if (!has) continue;
+            // (mounted as the controller list, e.g. `cpu,cpuacct`, often with a link per controller)
+            mounts.push_back(fs + "/" + controllers);
+            mounts.push_back(fs + "/" + v1_controller);
+        }
+        while (true) {
+            for (std::string const & m : mounts) dirs.push_back({ m + path, v2 });
+            if (path.empty()) break;
+            size_t slash = path.rfind('/');
+            path.resize(slash == std::string::npos ? 0 : slash);
+        }
+    }
+    return dirs;
+}
+
+// The bytes that this process's cgroups let it use, `UINT64_MAX` if they set no limit.
+static uint64_t cgroup_memory_limit() {
+    uint64_t limit = UINT64_MAX;
+    for (auto const & d : cgroup_dirs("memory")) {
+        std::string text = read_small_file(d.first + (d.second ? "/memory.max" : "/memory.limit_in_bytes"));
+        char * end = nullptr;
+        errno = 0;
+        unsigned long long v = std::strtoull(text.c_str(), &end, 10);
+        // (`max`, v2's "no limit", does not parse; v1's is a huge number)
+        if (end != text.c_str() && errno == 0 && v > 0) limit = std::min<uint64_t>(limit, v);
+    }
+    return limit;
+}
+
+// The CPUs that this process's cgroups' CPU quotas let it keep busy (rounded up), `UINT_MAX` if
+// they set no quota.
+static unsigned cgroup_cpu_limit() {
+    unsigned limit = UINT_MAX;
+    for (auto const & d : cgroup_dirs("cpu")) {
+        long long quota = -1, period = 0;
+        if (d.second) {
+            // `<quota> <period>`, or `max <period>`
+            std::string text = read_small_file(d.first + "/cpu.max");
+            if (std::sscanf(text.c_str(), "%lld %lld", &quota, &period) != 2) continue;
+        } else {
+            std::string q = read_small_file(d.first + "/cpu.cfs_quota_us");
+            std::string p = read_small_file(d.first + "/cpu.cfs_period_us");
+            if (std::sscanf(q.c_str(), "%lld", &quota) != 1 || std::sscanf(p.c_str(), "%lld", &period) != 1) continue;
+        }
+        if (quota > 0 && period > 0) {
+            long long cpus = (quota + period - 1) / period;
+            limit = std::min<unsigned>(limit, static_cast<unsigned>(std::min<long long>(std::max(cpus, 1LL), UINT_MAX)));
+        }
+    }
+    return limit;
+}
+#endif
+
+/* numCPUs : BaseIO Nat -- the number of hardware threads that this process may use */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_num_cpus(obj_arg) {
     unsigned n = std::thread::hardware_concurrency();
+#if defined(__linux__)
+    // (a process restricted to some CPUs, e.g. by a batch scheduler, `taskset` or a container, would
+    // otherwise run a compiler process for each CPU of the machine on those)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0)
+        n = static_cast<unsigned>(CPU_COUNT(&set));
+    n = std::min(n ? n : 1u, cgroup_cpu_limit());
+#endif
     return lean_box(n ? n : 1);
+}
+
+/* addressRangeFree (base size : USize) : BaseIO Bool -- whether nothing of this process is mapped in the
+   `size` bytes at `base`, so that it could map them there now */
+extern "C" LEAN_EXPORT uint8 lean_paperlean_address_range_free(size_t base, size_t size) {
+#if defined(LEAN_WINDOWS)
+    (void)base; (void)size;
+    return true;
+#else
+    if (size == 0) return true;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+#ifdef MAP_FIXED_NOREPLACE
+        | MAP_FIXED_NOREPLACE
+#endif
+        ;
+    // (a probe, without memory and removed at once; without `MAP_FIXED_NOREPLACE` the address is a
+    // hint, which the kernel follows only if the range is free)
+    void * m = mmap(reinterpret_cast<void *>(base), size, PROT_NONE, flags, -1, 0);
+    if (m == MAP_FAILED) return false;
+    munmap(m, size);
+    return m == reinterpret_cast<void *>(base);
+#endif
 }
 
 /* wallSeconds : BaseIO Nat -- the seconds since the epoch */
@@ -85,13 +222,20 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_wall_seconds(obj_arg) {
     return lean_uint64_to_nat(static_cast<uint64_t>(time(nullptr)));
 }
 
-/* totalMemory : BaseIO Nat -- the bytes of physical memory, 0 if unknown */
+/* totalMemory : BaseIO Nat -- the bytes of memory that this process may use, 0 if unknown */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_total_memory(obj_arg) {
 #if defined(LEAN_WINDOWS)
     return lean_box(0);
 #else
     long pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGE_SIZE);
-    return lean_uint64_to_nat(pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * size : 0);
+    uint64_t bytes = pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * size : 0;
+#if defined(__linux__)
+    // (a batch job's or a container's memory limit, which compiler processes sized for the
+    // machine's memory would exceed)
+    uint64_t limit = cgroup_memory_limit();
+    if (limit != UINT64_MAX) bytes = bytes ? std::min(bytes, limit) : limit;
+#endif
+    return lean_uint64_to_nat(bytes);
 #endif
 }
 
@@ -279,8 +423,9 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_private_cache_root(b_obj_arg path)
 }
 
 /* fileIdentity (path : @& String) : BaseIO (Option ByteArray) -- the identity of the file at `path`
-   (`stat_identity`): device, inode, size, and seconds and nanoseconds of the modification and status
-   change times, as 7 64-bit integers in the machine's byte order; `none` if it has none */
+   (`stat_identity`): a device field that is always 0 (host-independent, see `file_identity`), inode, size,
+   and seconds and nanoseconds of the modification and status change times, as 7 64-bit integers in the
+   machine's byte order; `none` if it has none */
 extern "C" LEAN_EXPORT obj_res lean_paperlean_file_identity(b_obj_arg path) {
     file_identity id;
     if (!stat_identity(lean_string_cstr(path), id)) return lean_box(0);

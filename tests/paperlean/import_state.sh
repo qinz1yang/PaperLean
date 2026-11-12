@@ -185,7 +185,11 @@ for round in 1 2; do
           -I"$SRC_DIR" -I"$BUILD_DIR/include" -I"$BUILD_DIR" -I"$BUILD_DIR/paperlean/include" \
           "${gmp_args[@]}" -c "$fixture/counted.cpp" -o "$TMP_DIR/replay_counted.o"
         run lean --root="$fixture" -c "$TMP_DIR/replay_counted.c" "$fixture/Replay.lean"
-        run leanc ${LEANC_OPTS-} -o "$TMP_DIR/replay_counted" "$TMP_DIR/replay_counted.c" "$TMP_DIR/replay_counted.o"
+        # The probe imports modules and interprets their code, like a `lean_exe` with `supportInterpreter :=
+        # true`: the interpreter must find the executable's own symbols, which on Linux needs `-rdynamic`
+        # (macOS exports them by default)
+        RDYNAMIC=; [ "$(uname -s)" = Linux ] && RDYNAMIC=-rdynamic
+        run leanc ${LEANC_OPTS-} $RDYNAMIC -o "$TMP_DIR/replay_counted" "$TMP_DIR/replay_counted.c" "$TMP_DIR/replay_counted.o"
         run env LEAN_PATH="$LIB1:$LIB2" LEAN_OLEAN_PACK="$PACKS" LEAN_IMPORT_IMAGE="$TMP_DIR/p.image.paperlean" \
           PAPERLEAN_IMPORT_THREADS=4 "$TMP_DIR/replay_counted" "$(lean --print-prefix)" S6
         ;;

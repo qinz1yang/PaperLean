@@ -17,10 +17,23 @@ namespace Lake
 
 /-- Returns the portion of `path` relative to `root`. If none, returns `path` verbatim. -/
 public def relPathFrom (root path : FilePath) : FilePath :=
-  if let some relPath := path.toString.dropPrefix? root.toString then
-    FilePath.mk (relPath.drop 1).toString -- remove leading `/`
+  let rootStr := root.toString
+  let pathStr := path.toString
+  if pathStr == rootStr then
+    -- Preserve the historical result for a path equal to its root.
+    ""
   else
-    path
+    -- Require a complete path component, not just a string prefix: `/a/b` is
+    -- not a prefix of `/a/bc/d`, and a root with a trailing separator must not
+    -- consume the first character of the relative path.
+    let rootPrefix :=
+      if rootStr.endsWith FilePath.pathSeparator.toString then rootStr
+      else rootStr ++ FilePath.pathSeparator.toString
+    if let some relPath := pathStr.dropPrefix? rootPrefix then
+      FilePath.mk relPath.copy
+    else
+      -- No prefix: return the original path, not a normalized version.
+      path
 
 /--
 Convert a relative file path to a platform-independent string.

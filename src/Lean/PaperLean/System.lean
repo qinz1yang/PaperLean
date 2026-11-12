@@ -47,15 +47,22 @@ opaque setEnv (name : @& String) (value : @& Option String) : BaseIO Unit
 @[extern "lean_paperlean_process_alive"]
 opaque processAlive (pid : UInt32) : BaseIO Bool
 
-/-- The number of hardware threads. -/
+/-- The number of hardware threads that this process may use: on Linux, those of its CPU affinity, and
+at most what its cgroups' CPU quotas let it keep busy. -/
 @[extern "lean_paperlean_num_cpus"]
 opaque numCPUs : BaseIO Nat
+
+/-- Whether nothing of this process is mapped in the `size` bytes at `base`, so that it could map them
+there now. -/
+@[extern "lean_paperlean_address_range_free"]
+opaque addressRangeFree (base size : USize) : BaseIO Bool
 
 /-- The seconds since the epoch, as file times count them. -/
 @[extern "lean_paperlean_wall_seconds"]
 opaque wallSeconds : BaseIO Nat
 
-/-- The bytes of physical memory, `0` if unknown. -/
+/-- The bytes of memory that this process may use: physical memory, on Linux at most its cgroups'
+memory limit; `0` if unknown. -/
 @[extern "lean_paperlean_total_memory"]
 opaque totalMemory : BaseIO Nat
 
@@ -72,10 +79,12 @@ cache directories do not use this operation. -/
 @[extern "lean_paperlean_private_cache_root"]
 opaque privateCacheRoot (path : @& String) : IO Unit
 
-/-- The identity of the file at `path`, as olean packs record it: its device, inode, size, and the
-seconds and nanoseconds of its modification and status change times, as 7 64-bit integers in the
-machine's byte order (one `stat`); `none` if it cannot be read. Unlike a modification time, the
-status change time cannot be set (`touch`, `cp -p`, `tar`). -/
+/-- The identity of the file at `path`, as olean packs record it: a device field that is always 0, its
+inode, size, and the seconds and nanoseconds of its modification and status change times, as 7 64-bit
+integers in the machine's byte order (one `stat`); `none` if it cannot be read. Unlike a modification
+time, the status change time cannot be set (`touch`, `cp -p`, `tar`). The device number is left out
+because it belongs to the host's mount, not to the file: on a network filesystem the same file has a
+different one on each machine (`file_identity` in `src/paperlean/olean_pack.h`). -/
 @[extern "lean_paperlean_file_identity"]
 opaque fileIdentity (path : @& String) : BaseIO (Option ByteArray)
 

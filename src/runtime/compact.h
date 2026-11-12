@@ -126,6 +126,17 @@ class LEAN_EXPORT region_reader {
     // Saved root pointer, if the caller already read it from the file; lets the fast path in
     // `read` avoid faulting in the data's first page just for the root slot.
     object * m_root = nullptr;
+    // The pack writer reads arbitrary `.olean` files: it turns on a checked walk that rejects an
+    // object header or advertised size that does not fit its region before reading a field. The
+    // normal loader keeps `read`'s fast and slow paths unchanged.
+    bool m_check_bounds = false;
+    size_t remaining() const {
+        char * p = static_cast<char *>(m_next);
+        char * end = static_cast<char *>(m_end);
+        return p <= end ? static_cast<size_t>(end - p) : 0;
+    }
+    void require(size_t n) const;
+    object * read_checked();
     void sort_and_validate_dep_regions();
     void move(size_t d);
     void move(object * o);
@@ -139,6 +150,8 @@ class LEAN_EXPORT region_reader {
     void fix_mpz(object * o);
     void fix_closure(object * o);
 public:
+    // The number of limbs of a (possibly untrusted) `mpz` object, for bounds checks of its digits.
+    static size_t mpz_num_limbs(mpz_object const * o);
     /* Creates a read context over the given just-mapped buffer. Does not take ownership of the
        buffer; see the class comment. */
     region_reader(size_t sz, void * data, void * base_addr,
@@ -151,6 +164,9 @@ public:
     region_reader operator=(region_reader &&) = delete;
     /* Supplies the value of the region's root slot as stored in the file. */
     void set_saved_root(object * root) { m_root = root; }
+    /* Reject truncated or over-advertising object headers while walking, instead of reading past
+       the region. Used by the pack writer, which reads untrusted `.olean` files. */
+    void check_bounds(bool b = true) { m_check_bounds = b; }
     object * read();
 };
 }

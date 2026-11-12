@@ -111,12 +111,14 @@ public abbrev FetchM := FetchT LogIO
     return cast (by simp) job
 
 /-- Keep the actual store update and its provider observation in the same build. -/
-public def PaperLean.saveSetupJob (info : BuildInfo) (job : Job (BuildData info.key)) :
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def PaperLean.saveSetupJob (info : BuildInfo) (job : Job (BuildData info.key)) :
     FetchM (Job (BuildData info.key)) :=
   .mk fun _ _ _ store ctx => PaperLean.SetupProviders.storeJob ctx store info job
 
 /-- Observe the relevant facet before running its provider in the normal recursive engine. -/
-public def PaperLean.observeSetupProvider (info : BuildInfo) (facet : Lean.Name) : FetchM Unit :=
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def PaperLean.observeSetupProvider (info : BuildInfo) (facet : Lean.Name) : FetchM Unit :=
   .mk fun fetch _ _ store ctx => do
     if PaperLean.SetupProviders.facets.contains facet then
       PaperLean.SetupProviders.enterProvider ctx store info fetch (facet == Module.leanArtsFacet)

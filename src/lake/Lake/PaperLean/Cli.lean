@@ -19,6 +19,7 @@ import Lake.PaperLean.HashCache
 import Lake.PaperLean.ReuseSummary
 import Lean.PaperLean.System
 import Lean.PaperLean.OLeanPack
+import Lake.PaperLean.MidBuild
 
 /-!
 The `paperlean` command (`lake paperlean`, run by the toolchain's `bin/paperlean`, which the front end
@@ -124,7 +125,10 @@ def dataUse (ws : Workspace) : IO String := do
         let why ← Lean.PaperLean.OLeanPack.whyIgnored p.toString
         return if why.isEmpty then none else some s!"{p}: {why}"
       let native ← d.libs.filterM (nativeEntryUsable d.cache)
-      let image ← importImageUsable (dataDir ws.dir) d.image?
+      -- (an image of other packs, e.g. of a pack rebuilt under the same name, is ignored by `lean`)
+      let image ← do
+        if !(← importImageUsable (dataDir ws.dir) d.image?) then pure false
+        else imageMatchesPacks (dataDir ws.dir) d.image? (String.intercalate ":" (packs.map (·.toString)).toList)
       let damaged := native.size < d.native.size || (d.image?.isSome && !image)
       let some first := ignored[0]?
         | return s!"used: {packs.size} pack(s){if image then ", an import image" else ""}\
@@ -676,6 +680,9 @@ def spawnPlainLake (ws : Workspace) (args : Array String) : IO UInt32 := do
 can; its exit code. -/
 def runBuild (ws : Workspace) (args : List String) (buildIn : BuildIn) : IO UInt32 :=
   withWarnings ws fun warnings => withReuseSummary ws do
+    -- the mid-build preparation's entry points for the build in this process (`MidBuild.install`;
+    -- upstream Lake calls them through `MidBuildHook`, and plain `lake` never installs them)
+    MidBuild.install
     if let some code ← withLakeVars ws warnings (buildIn ws args) then
       return code
     spawnLake ws (#["build"] ++ args.toArray) #[] warnings

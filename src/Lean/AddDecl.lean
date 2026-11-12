@@ -99,7 +99,8 @@ def warnIfUsesSorry (decl : Declaration) : CoreM Unit := do
 builtin_initialize
   registerTraceClass `addDecl
 
-private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :=
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :=
   withTraceNode `addDecl (fun _ => return m!"adding declarations {decl.getNames}") do
   -- register namespaces for newly added constants; this used to be done by the kernel itself
   -- but that is incompatible with moving it to a separate task

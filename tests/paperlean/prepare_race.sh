@@ -118,6 +118,8 @@ import Dep.User
 #eval 1 + 1
 END
 # Pause the actual default C driver after verification, without replacing it or its flags.
+# (a glob, not `compgen -G`: bash built without programmable completion, as Nix's, has no `compgen`)
+has_blocked() { local f; for f in "$ROOT"/blocked-*; do [ -e "$f" ] && return 0; done; return 1; }
 paused() { # paused <log> <command>...: `prepare` runs in the background until the analysis is done
   rm -f "$ROOT"/blocked-* "$ROOT/release" "$ROOT/eval.events" "$1"
   # (the compiler runs, as no compiled object is in the cache)
@@ -129,7 +131,7 @@ paused() { # paused <log> <command>...: `prepare` runs in the background until t
   PREPARE=$!
   local n
   for ((n = 0; n < 2400; n++)); do
-    compgen -G "$ROOT/blocked-*" > /dev/null && grep -q '^done$' "$ROOT/eval.events" 2>/dev/null && return 0
+    has_blocked && grep -q '^done$' "$ROOT/eval.events" 2>/dev/null && return 0
     sleep 0.1
   done
   fail "prepare did not get to the point of the test"

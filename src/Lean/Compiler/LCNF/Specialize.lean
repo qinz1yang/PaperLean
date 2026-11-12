@@ -15,6 +15,7 @@ import Lean.Compiler.LCNF.Closure
 import Lean.Meta.Transform
 import Init.Omega
 import Lean.PaperLean.Base
+import Lean.PaperLean.SpecExclusions
 namespace Lean.Compiler.LCNF
 namespace Specialize
 
@@ -27,8 +28,12 @@ public structure CacheEntry where
 
 -- PaperLean: imported specializations exclude PaperLean's code; local ones must stay cached so
 -- recursive specialization terminates. `addImportedFn` switches the map to local insertion.
+-- Nor are the imported specializations taken that Lean's own modules have only as PaperLean builds
+-- them (`Lean.PaperLean.SpecExclusions`): code calling them could not be linked or interpreted by
+-- official Lean.
 -- (not inlined: its body calls PaperLean's code)
 @[noinline] public def addEntry (cache : Cache) (e : CacheEntry) : Cache :=
+  if cache.stage₁ && PaperLean.SpecExclusions.excluded e.declName then cache else
   (PaperLean.ownSpecPath e.declName).select
     (if cache.stage₁ then cache else cache.insert e.key e.declName) <|
   cache.insert e.key e.declName

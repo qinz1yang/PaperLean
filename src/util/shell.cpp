@@ -22,6 +22,7 @@ Author: Leonardo de Moura
 #include "runtime/array_ref.h"
 #include "runtime/object_ref.h"
 #include "runtime/option_ref.h"
+#include "paperlean/fast_import.h"
 #include "runtime/utf8.h"
 #include "util/timer.h"
 #include "util/macros.h"
@@ -263,6 +264,9 @@ unsigned get_shell_num_threads(object_ref const & shell_opts) {
 }
 
 extern "C" object * lean_enable_initializer_execution();
+// PaperLean: builtin registrations during `lean_initialize` (`Lean.PaperLean.builtinRegistrationsDeferred`)
+extern "C" void lean_paperlean_defer_builtin_registrations();
+extern "C" object * lean_paperlean_flush_builtin_registrations();
 
 namespace lean {
 extern void (*g_lean_report_task_get_blocked_time)(std::chrono::nanoseconds);
@@ -309,10 +313,15 @@ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
     auto init_start = std::chrono::steady_clock::now();
+    // PaperLean: Lean's own builtin attribute entries and parser tokens are collected while its
+    // library initializes and folded into their public tables, in registration order, right after,
+    // before any other code (plugins, the command line) runs; see `flushBuiltinRegistrations`.
+    lean_paperlean_defer_builtin_registrations();
     lean::initializer init;
     second_duration init_time = std::chrono::steady_clock::now() - init_start;
 
     try {
+        consume_io_result(lean_paperlean_flush_builtin_registrations());
         // Remark: This currently runs under `IO.initializing = true`.
         init_search_path();
     } catch (lean::throwable & ex) {
@@ -363,5 +372,6 @@ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
             std::cerr << "out of memory" << std::endl;
         }
     });
+    lean::timing_epoch_mark("main.end");
     return shell_rc;
 }

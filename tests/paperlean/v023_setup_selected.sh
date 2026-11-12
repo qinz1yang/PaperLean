@@ -37,7 +37,7 @@ printf 'module\n@[expose] public def leaf := 7\n' > Top/Leaf.lean
 printf 'module\npublic import Top.Leaf\nexample : leaf = 7 := rfl\n' > Top.lean
 run env PAPERLEAN_ACCELERATE=1 lake run warm
 for n in Top/Leaf Top; do
-  grep -q 'paperlean-setup' ".lake/build/ir/$n.setup.paperlean" || fail "$n missed the index fast path"
+  grep -q '\.lake/paperlean-setup/' ".lake/build/ir/$n.setup.paperlean" || fail "$n missed the index fast path"
 done
 grep -q "$LAKE_CACHE_DIR" .lake/build/ir/Top.setup.paperlean || fail "selected cache artifact missing from indexed root"
 cat > GetArts.lean <<'LEAN'

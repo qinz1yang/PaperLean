@@ -12,6 +12,7 @@ public import Lean.Meta.CoeAttr
 public import Lean.Meta.Structure
 public import Lean.PrettyPrinter.Formatter
 public import Lean.PrettyPrinter.Parenthesizer
+import Lean.PaperLean.QuotedSyntaxHook
 meta import Lean.Parser.Command
 meta import Lean.PrettyPrinter.Delaborator.DeclWithSig
 
@@ -1542,6 +1543,9 @@ def delabSorry : Delab := whenPPOption getPPNotation <| whenNotPPOption getPPExp
     withOverApp 2 `(sorry)
 
 private unsafe def evalSyntaxConstantUnsafe (env : Environment) (opts : Options) (constName : Name) : ExceptT String Id Syntax :=
+  -- PaperLean: a quoted tactic of this module without waiting for its compiled code
+  -- (`Lean.PaperLean.QuotedSyntax`)
+  if let some stx := PaperLean.QuotedSyntax.ofConstant? env constName then pure stx else
   env.evalConstCheck Syntax opts ``Syntax constName
 
 @[implemented_by evalSyntaxConstantUnsafe]

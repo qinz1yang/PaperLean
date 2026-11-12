@@ -250,8 +250,15 @@ def race [Inhabited α] (x : ContextAsync α) (y : ContextAsync α)
   let ctx1 ← CancellationContext.fork parent
   let ctx2 ← CancellationContext.fork parent
 
-  let task1 ← async (x ctx1) prio
-  let task2 ← async (y ctx2) prio
+  -- Do not use `ContextAsync.async` here: it forks an extra context from the
+  -- caller's context, not from `ctx1`/`ctx2`, and that extra context is only
+  -- cancelled by the wrapper's `finally` when the (possibly noncooperative)
+  -- losing computation ends.  Fork only the two explicit contexts and cancel
+  -- each one when its own computation ends.
+  let task1 : AsyncTask α ← liftM (m := Async) <|
+    EAsync.async (try x ctx1 finally ctx1.cancel .cancel) prio
+  let task2 : AsyncTask α ← liftM (m := Async) <|
+    EAsync.async (try y ctx2 finally ctx2.cancel .cancel) prio
 
   let promise ← IO.Promise.new
   BaseIO.chainTask task1 fun result => liftM (promise.resolve result) *> ctx2.cancel .cancel

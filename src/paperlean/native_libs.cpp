@@ -127,10 +127,10 @@ extern "C" obj_res lean_paperlean_env_imports_id(obj_arg env);
 extern "C" uint32 lean_paperlean_const_module_idx(obj_arg env, obj_arg n);
 extern "C" obj_res lean_paperlean_const_module_name(obj_arg env, obj_arg n);
 extern "C" uint8 lean_paperlean_is_meta_const(obj_arg env, obj_arg n);
+extern "C" uint8 lean_paperlean_imported_has_init(obj_arg env, obj_arg n, uint32 idx);
 extern "C" obj_res lean_paperlean_native_import_info(obj_arg env, obj_arg opts);
 extern "C" obj_res lean_paperlean_import_packages(obj_arg env);
 extern "C" obj_res lean_paperlean_module_init_symbol(obj_arg env, obj_arg idx);
-extern "C" obj_res lean_get_init_fn_name_for(obj_arg env, obj_arg fn);
 extern "C" LEAN_EXPORT obj_res lean_paperlean_load_native_libs(b_obj_arg env, b_obj_arg opts);
 
 namespace {
@@ -1016,11 +1016,11 @@ void * filter_native_symbol(b_obj_arg env, b_obj_arg fn, void * addr) {
     bool same = !im.files.empty() && idx != 0 && idx - 1 < array_size(datas) &&
         packed_module_files(mod.raw(), lean_array_get_core(datas, idx - 1), files) && files == im.files;
     if (!same) {
+        // its `[init]` attribute: in the exported attribute entries, or, for a non-`meta` `initialize`
+        // of a `module`, only in that module's `.ir` entries (the value the earlier native initializer
+        // stored is what a plain import keeps in `g_init_globals`)
         lean_inc(env); lean_inc(fn);
-        object * init_fn = lean_get_init_fn_name_for(env, fn);
-        bool has_init = !lean_is_scalar(init_fn);
-        lean_dec(init_fn);
-        if (!has_init) return nullptr;
+        if (!lean_paperlean_imported_has_init(env, fn, idx)) return nullptr;
     }
     if (im.meta_only) {
         lean_inc(env); lean_inc(fn);

@@ -24,6 +24,35 @@ difference of these from Lean's import does not show when comparing with it, onl
 
 namespace Lean.PaperLean
 
+/-- With `PAPERLEAN_IMPORT_TIMING`, reports on stderr the wall-clock time at which the process
+reached `phase`. -/
+@[extern "lean_paperlean_epoch_mark"]
+opaque epochMark (phase : @& String) : BaseIO Unit
+
+/--
+Whether builtin registrations (`KeyedDeclsAttribute.addBuiltin`, the tokens of builtin parsers) are
+deferred: only while the `lean` executable initializes Lean's own library (`src/util/shell.cpp` sets it
+before `lean_initialize`, `flushBuiltinRegistrations` clears it right after, before any other code
+runs). Then no code but Lean's own initializers runs, and none of them reads those tables; updating a
+table held in a persistent reference at every registration copies and marks the whole table.
+-/
+@[extern "lean_paperlean_builtin_registrations_deferred"]
+opaque builtinRegistrationsDeferred : BaseIO Bool
+
+@[extern "lean_paperlean_end_builtin_registration_deferral"]
+private opaque endBuiltinRegistrationDeferral : BaseIO Unit
+
+/-- The actions that fold the deferred builtin registrations into their public tables. -/
+builtin_initialize builtinRegistrationFlushes : IO.Ref (Array (IO Unit)) ← IO.mkRef #[]
+
+/-- Folds every deferred builtin registration into its public table (`KeyedDeclsAttribute.tableRef`,
+`Lean.Parser.builtinTokenTable`) in registration order and ends the deferral: from then on each
+registration updates its table, as upstream does. -/
+@[export lean_paperlean_flush_builtin_registrations]
+def flushBuiltinRegistrations : IO Unit := do
+  (← builtinRegistrationFlushes.get).forM id
+  endBuiltinRegistrationDeferral
+
 /-- `0`: the faster implementations, `1`: `legacy`, `2`: `check`. -/
 @[extern "lean_paperlean_import_mode"]
 opaque importMode : BaseIO UInt8
@@ -102,10 +131,14 @@ opaque moduleDataNumConstants {μ : Type} (d : @& μ) : Nat
 opaque moduleDataNumExtraConstNames {μ : Type} (d : @& μ) : Nat
 
 /-- The private constant map and `const2ModIdx` of `finalizeImport` built faster, with the module
-index and name for which its fold calls `throwAlreadyImported`, if any; `none`: built by the fold. -/
-@[extern "lean_paperlean_private_constant_maps"]
-opaque privateConstantMaps? {μ ρ : Type} (moduleData irData : μ) (privateCapacity c2mCapacity : Nat)
-    (persistent : Bool) : IO (Option ρ)
+index and name for which its fold calls `throwAlreadyImported`, if any (`none`: built by the fold),
+and, if `isModule`, the public constant map of the exported modules of `modules`
+(`publicConstantMap?`), built concurrently where possible; the public map is `none` if it was not
+built here. -/
+@[extern "lean_paperlean_constant_maps"]
+opaque constantMaps? {μ ι ρ π : Type} (moduleData irData : μ) (modules : ι)
+    (privateCapacity c2mCapacity publicCapacity : Nat) (persistent isModule : Bool) :
+    IO (Option ρ × Option π)
 
 /-- `PAPERLEAN_IMPORT=check`: fails if the private maps built faster differ from the fold's. -/
 @[extern "lean_paperlean_check_private_constant_maps"]

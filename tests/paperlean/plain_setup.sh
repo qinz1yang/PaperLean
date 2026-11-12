@@ -43,7 +43,8 @@ run env PAPERLEAN_ACCELERATE=1 lake build
 SIDE=.lake/build/ir/R.setup.paperlean
 [ "$(wc -l < $SIDE)" -eq 0 ] || fail "the Lake of paperlean commands did not write R.setup.paperlean compact"
 INDEX="$WS/\\.lake/paperlean-setup/[0-9]+-[0-9]+/setup-[0-9a-f]+\\.paperlean"
-show_json arts < $SIDE | grep -Eq "^\\{\"\\[anonymous\\]\":\\[\\[\"$INDEX\"\\],\\[\"[0-9]+\"\\]\\]\\}$" ||
+# (the third element of the anonymous entry is the marker that makes official Lean reject the file)
+show_json arts < $SIDE | grep -Eq "^\\{\"\\[anonymous\\]\":\\[\\[\"$INDEX\"\\],\\[\"[0-9]+\"\\],\\[\"paperlean-setup-index\",0\\]\\]\\}$" ||
   fail "the Lake of paperlean commands wrote importArts as: $(show_json arts < $SIDE)"
 [ "$(show_json arts < $SETUP)" = "$FULL" ] || fail "the Lake of paperlean commands changed R.setup.json: $(show_json arts < $SETUP)"
 echo '-- changed again' >> R.lean

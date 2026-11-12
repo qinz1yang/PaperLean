@@ -10,6 +10,7 @@ public import Lake.Config.FacetConfig
 public import Lake.Build.Job.Monad
 public import Lake.Build.Infos
 import Lake.Util.Git
+import Lake.Util.IO
 import Lake.Util.Url
 import Lake.Build.Common
 import Lake.Build.Targets
@@ -83,17 +84,90 @@ def Package.fetchOptBuildCacheCore (self : Package) : FetchM (Job Bool) := do
 public def Package.optBuildCacheFacetConfig : PackageFacetConfig optBuildCacheFacet :=
   mkFacetJobConfig (·.fetchOptBuildCacheCore)
 
+/- Best-effort cleanup: a failed removal of optional cache state must not abort
+the build. -/
+private def bestEffort (act : IO Unit) : IO Unit :=
+  try act catch _ => pure ()
+
+/- Marker written before a build archive is unpacked and removed only after the
+unpack completes.  It is outside the build directory so `lake pack` cannot
+capture it. -/
+private def Package.cacheUnpackPendingFile (self : Package) : FilePath :=
+  FilePath.join self.lakeDir (FilePath.mk "build-cache-unpack.pending")
+
+/- Staging directory used while unpacking, next to (not inside) the build
+directory so a partial extraction is never mistaken for a build. -/
+private def Package.cacheUnpackStagingDir (self : Package) : FilePath :=
+  self.buildDir.withFileName <|
+    (self.buildDir.fileName.getD "build") ++ ".unpack"
+
+/- Moves `dir` aside to the first unused `<dir>.partial-<n>` next to it; `false` if that fails. A
+directory whose contents cannot be removed (e.g. a subdirectory without write permission) can still be
+renamed within its parent. -/
+private def quarantineDir (dir : FilePath) : IO Bool := do
+  let base := dir.fileName.getD "build"
+  for n in [1:101] do
+    let dest := dir.withFileName s!"{base}.partial-{n}"
+    unless ← dest.pathExists do
+      try
+        IO.FS.rename dir dest
+        return true
+      catch _ =>
+        return false
+  return false
+
+/- Discards what a failed or interrupted build-cache unpack may have left before the package is built
+from source: its build and staging directories are removed or, if that fails, moved aside. Only once
+neither directory is left is the pending marker deleted. Otherwise the marker stays, so that no later
+build takes the partial tree for a complete one, and the error says what to remove; the build must not
+go on to read it. `none` if all went well. -/
+private def Package.discardPartialUnpack (self : Package) : IO (Option String) := do
+  let mut left : Array String := #[]
+  for dir in #[self.buildDir, self.cacheUnpackStagingDir] do
+    try
+      removeDirAllIfExists dir
+    catch e =>
+      unless ← quarantineDir dir do
+        left := left.push s!"'{dir}' ({e})"
+  unless left.isEmpty do
+    return some s!"the build cache of '{self.baseName}' was not unpacked completely, and its partial \
+      build files could not be removed or moved aside: {", ".intercalate left.toList}; remove them, \
+      then build again"
+  try
+    removeFileIfExists self.cacheUnpackPendingFile
+    return none
+  catch e =>
+    return some s!"could not remove '{self.cacheUnpackPendingFile}' after discarding the partial build \
+      cache of '{self.baseName}' ({e})"
+
 /-- Tries to download the package's build cache (if configured). -/
 def Package.maybeFetchBuildCache (self : Package) : FetchM (Job Bool) := do
+  let pendingFile := self.cacheUnpackPendingFile
+  let stagingDir := self.cacheUnpackStagingDir
+  let attemptPending ← pendingFile.pathExists
+  let buildDirExists ← self.buildDir.pathExists
   let shouldFetch :=
     (← getTryCache) &&
-    !(← self.buildDir.pathExists) && -- do not automatically clobber prebuilt artifacts
+    -- A pending marker asks for a retry even when the build directory exists:
+    -- the previous unpack did not complete.  An existing directory without a
+    -- marker is still never clobbered automatically.
+    (attemptPending || !buildDirExists) &&
     (self.preferReleaseBuild || -- GitHub release
       ((self.scope == "leanprover" || self.scope == "leanprover-community")
         && !(← getElanToolchain).isEmpty)) -- Reservoir
   if shouldFetch then
+    if attemptPending then
+      -- A previous attempt left a staging tree; the build tree itself may also
+      -- be partial.  `fetchBuildArchive` removes the stale archive/trace and
+      -- extracts only after a successful download.
+      bestEffort (removeDirAllIfExists stagingDir)
     self.optBuildCache.fetch
   else
+    if attemptPending then
+      -- No cache will be fetched (`--no-cache`, or the package is ineligible),
+      -- so the fallback source build must not trust a partially unpacked tree.
+      if let some msg ← self.discardPartialUnpack then
+        error msg
     return pure true
 
 @[inline]
@@ -111,6 +185,11 @@ def Package.maybeFetchBuildCacheWithWarning (self : Package) := do
   let job ← self.maybeFetchBuildCache
   job.mapM fun success => do
     unless success do
+      -- The retry (or the first attempt) failed after a marker was written.
+      -- Do not let the fallback source build trust the possibly partial tree.
+      if (← self.cacheUnpackPendingFile.pathExists) then
+        if let some msg ← self.discardPartialUnpack then
+          error msg
       if self.preferReleaseBuild then
         let details ← self.optFacetDetails optGitHubReleaseFacet
         logWarning s!"building from source; failed to fetch GitHub release{details}"
@@ -170,11 +249,47 @@ def Package.fetchBuildArchive
 : JobM PUnit := do
   let depTrace := Hash.ofString url
   let traceFile := archiveFile.addExtension "trace"
+  let pendingFile := self.cacheUnpackPendingFile
+  let stagingDir := self.cacheUnpackStagingDir
+  let pendingBefore ← pendingFile.pathExists
+  if pendingBefore then
+    -- A previous unpack did not complete.  Its staging tree and the archive it
+    -- may have failed on are not reusable.  Keep the old build tree: a
+    -- successful extraction overlays it, and a failed one is removed by the
+    -- caller before falling back to source.
+    bestEffort (removeDirAllIfExists stagingDir)
+    bestEffort (removeFileIfExists traceFile)
+    bestEffort (removeFileIfExists archiveFile)
   let upToDate ← buildUnlessUpToDate? (action := .fetch) archiveFile depTrace traceFile do
     download url archiveFile headers
-  unless upToDate && (← self.buildDir.pathExists) do
+  let buildDirExists ← self.buildDir.pathExists
+  -- A pending marker overrides `upToDate && buildDirExists`: that tree is not
+  -- proof of the new archive's complete unpack.
+  unless (upToDate && buildDirExists) && !pendingBefore do
     updateAction .unpack
-    untar archiveFile self.buildDir
+    createParentDirs pendingFile
+    IO.FS.writeFile pendingFile ""
+    try
+      if buildDirExists then
+        untar archiveFile self.buildDir
+      else
+        -- Extract next to the build directory, which it becomes only once
+        -- complete.  The existence of the build directory is what this
+        -- function and `maybeFetchBuildCache` take for a complete unpack.
+        -- (Not best-effort: extracting over files left by an earlier attempt
+        -- would publish them as part of the build.)
+        removeDirAllIfExists stagingDir
+        untar archiveFile stagingDir
+        IO.FS.rename stagingDir self.buildDir
+      bestEffort (removeFileIfExists pendingFile)
+    catch e =>
+      -- Keep the marker: the next cache attempt must retry.  Discard a partial
+      -- staging tree and the archive that failed to unpack so a retry downloads
+      -- again rather than reusing it.
+      bestEffort (removeDirAllIfExists stagingDir)
+      bestEffort (removeFileIfExists traceFile)
+      bestEffort (removeFileIfExists archiveFile)
+      throw e
 
 @[inline]
 def Package.mkOptBuildArchiveFacetConfig

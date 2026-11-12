@@ -618,6 +618,13 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
   string(APPEND LEAN_EXTRA_LINKER_FLAGS " -lm")
 endif()
 
+# PaperLean: linker flags for the link of `libleanshared` only (e.g. link-time optimization, or
+# relocations kept for a post-link optimizer), which are not part of the flags that `leanc` and
+# `Lean.Compiler.FFI` give the links of users' code, unlike `LEAN_EXTRA_LINKER_FLAGS` and
+# `TOOLCHAIN_SHARED_LINKER_FLAGS`.
+set(PAPERLEAN_TOOLCHAIN_LINKER_FLAGS "" CACHE STRING "Additional linker flags for libleanshared only")
+string(APPEND LEANSHARED_LINKER_FLAGS " ${PAPERLEAN_TOOLCHAIN_LINKER_FLAGS}")
+
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
   if(BSYMBOLIC)
     string(APPEND LEANC_SHARED_LINKER_FLAGS " -Wl,-Bsymbolic")

@@ -521,14 +521,29 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_try_wait(b_obj_arg, b_obj_a
     }
 }
 
-extern "C" LEAN_EXPORT obj_res lean_io_process_child_kill(b_obj_arg, b_obj_arg child) {
+// The child records `setsid` at fork time, but calls `setsid()` only after it has
+// redirected its standard streams.  Until then the child is still in the parent's
+// process group, so `killpg(pid, ...)` has no group to signal and fails with ESRCH.
+// Signal the child directly in that window, then signal the group in case `setsid()`
+// raced the first signal.  Both the public kill operation and the output owner's
+// cancellation path must use this policy.
+static obj_res kill_child(b_obj_arg child) {
     static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
     pid_t pid = cnstr_get_uint32(child, 3 * sizeof(object *));
     bool setsid = cnstr_get_uint8(child, 3 * sizeof(object *) + sizeof(pid_t));
-    if ((setsid ? killpg(pid, SIGKILL) : kill(pid, SIGKILL)) == -1) {
-        return io_result_mk_error(decode_io_error(errno, nullptr));
+    if (setsid) {
+        if (killpg(pid, SIGKILL) == 0) return lean_io_result_mk_ok(box(0));
+        if (errno != ESRCH) return io_result_mk_error(decode_io_error(errno, nullptr));
+        if (kill(pid, SIGKILL) == -1) return io_result_mk_error(decode_io_error(errno, nullptr));
+        (void)killpg(pid, SIGKILL);
+        return lean_io_result_mk_ok(box(0));
     }
+    if (kill(pid, SIGKILL) == -1) return io_result_mk_error(decode_io_error(errno, nullptr));
     return lean_io_result_mk_ok(box(0));
+}
+
+extern "C" LEAN_EXPORT obj_res lean_io_process_child_kill(b_obj_arg, b_obj_arg child) {
+    return kill_child(child);
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_output_observe(b_obj_arg, b_obj_arg child, uint8_t block) {
@@ -548,17 +563,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_output_observe(b_obj_arg, b_obj_a
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_output_kill(b_obj_arg, b_obj_arg child) {
-    pid_t pid = cnstr_get_uint32(child, 3 * sizeof(object *));
-    bool session = cnstr_get_uint8(child, 3 * sizeof(object *) + sizeof(pid_t));
-    if (session) {
-        if (killpg(pid, SIGKILL) == 0) return io_result_mk_ok(box(0));
-        if (errno != ESRCH) return io_result_mk_error(decode_io_error(errno, nullptr));
-    }
-    // The owner has not reaped this PID. If cancellation arrived before its setsid(),
-    // kill it directly, then catch the group if setsid raced the first signal.
-    if (kill(pid, SIGKILL) == -1) return io_result_mk_error(decode_io_error(errno, nullptr));
-    if (session) (void)killpg(pid, SIGKILL);
-    return io_result_mk_ok(box(0));
+    return kill_child(child);
 }
 
 extern "C" LEAN_EXPORT uint32_t lean_io_process_child_pid(b_obj_arg, b_obj_arg child) {

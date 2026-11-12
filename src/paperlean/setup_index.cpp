@@ -53,13 +53,14 @@ struct descriptor {
     int release() { int f = fd; fd = -1; return f; }
 };
 
+// (no device: see `file_identity` in `olean_pack.h`)
 file_identity identity(struct stat const & s) {
 #if defined(__APPLE__)
-    return {static_cast<uint64_t>(s.st_dev), static_cast<uint64_t>(s.st_ino),
+    return {0, static_cast<uint64_t>(s.st_ino),
         static_cast<uint64_t>(s.st_size), s.st_mtimespec.tv_sec, s.st_mtimespec.tv_nsec,
         s.st_ctimespec.tv_sec, s.st_ctimespec.tv_nsec};
 #else
-    return {static_cast<uint64_t>(s.st_dev), static_cast<uint64_t>(s.st_ino),
+    return {0, static_cast<uint64_t>(s.st_ino),
         static_cast<uint64_t>(s.st_size), s.st_mtim.tv_sec, s.st_mtim.tv_nsec,
         s.st_ctim.tv_sec, s.st_ctim.tv_nsec};
 #endif
@@ -72,7 +73,8 @@ bool regular(int fd, struct stat & st) {
 bool unchanged(int fd, std::string const & path, file_identity const & expected) {
     struct stat opened, named;
     return regular(fd, opened) && (opened.st_mode & 0222) == 0 && identity(opened) == expected &&
-        lstat(path.c_str(), &named) == 0 && S_ISREG(named.st_mode) && identity(named) == expected;
+        lstat(path.c_str(), &named) == 0 && S_ISREG(named.st_mode) && named.st_dev == opened.st_dev &&
+        identity(named) == expected;
 }
 
 int open_regular(std::string const & path) {
@@ -89,13 +91,14 @@ struct selected_regular {
         if (lstat(name, &named) != 0 || !S_ISREG(named.st_mode))
             throw std::runtime_error("not a regular file");
         file.fd = open_regular(path);
-        if (!regular(file.fd, opened) || !(identity(named) == identity(opened)))
+        if (!regular(file.fd, opened) || named.st_dev != opened.st_dev || !(identity(named) == identity(opened)))
             throw std::runtime_error("regular file changed before reading");
     }
     void check() const {
         struct stat after, named;
-        if (!regular(file.fd, after) || !(identity(opened) == identity(after)) ||
-            lstat(path.c_str(), &named) != 0 || !S_ISREG(named.st_mode) || !(identity(opened) == identity(named)))
+        if (!regular(file.fd, after) || after.st_dev != opened.st_dev || !(identity(opened) == identity(after)) ||
+            lstat(path.c_str(), &named) != 0 || !S_ISREG(named.st_mode) || named.st_dev != opened.st_dev ||
+            !(identity(opened) == identity(named)))
             throw std::runtime_error("regular file changed during reading");
     }
 };
@@ -261,7 +264,7 @@ bool read_receipt(std::string const & path, receipt & out) {
     struct stat before, after;
     if (!regular(fd.fd, before) || static_cast<uint64_t>(before.st_size) != sizeof(out) || (before.st_mode & 0222) != 0) return false;
     try { read_at(fd.fd, sizeof(out), 0, &out, sizeof(out)); } catch (...) { return false; }
-    if (!regular(fd.fd, after) || !(identity(before) == identity(after))) return false;
+    if (!regular(fd.fd, after) || after.st_dev != before.st_dev || !(identity(before) == identity(after))) return false;
     return check_side_file_header(out.common, receipt_kind, sizeof(out)) == nullptr &&
         out.common.checksum == checksum(out) && has_name(path, out.content_hash);
 }

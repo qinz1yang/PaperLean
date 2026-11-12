@@ -140,8 +140,16 @@ private unsafe def getInstancesUnifyImpl (type : Expr) : MetaM (Array InstanceEn
   -- (counting no heartbeats, as the root key is looked up again)
   let heartbeats ← IO.getNumHeartbeats
   let s := instancesUnrecorded (← getEnv)
-  let result ← s.discrTree.getUnify type
-  let key ← DiscrTree.getUnifyRootKey type
+  -- `getUnify`/`getUnifyRootKey` can throw `isDefEqStuck` (and `getUnify` may be interrupted): the
+  -- counter is reset before such an exception goes on, so the cache's work is not counted; on success
+  -- the reset comes last, as nothing after it may be counted either.
+  let (result, key) ← try
+      let result ← s.discrTree.getUnify type
+      let key ← DiscrTree.getUnifyRootKey type
+      pure (result, key)
+    catch ex =>
+      setHeartbeats heartbeats
+      throw ex
   let result := uncounted5 recordInstances s key result () ()
   setHeartbeats heartbeats
   return result

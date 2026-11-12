@@ -408,12 +408,10 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_wait_readable(b_obj_arg socket) 
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_cancel_recv(b_obj_arg socket) {
     lean_uv_udp_socket_object* udp_socket = lean_to_uv_udp_socket(socket);
 
-    lean_inc(socket);
     event_loop_lock(&global_ev);
 
     if (udp_socket->m_promise_read == nullptr) {
         event_loop_unlock(&global_ev);
-        lean_dec(socket);
         return lean_io_result_mk_ok(lean_box(0));
     }
 
@@ -431,6 +429,10 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_cancel_recv(b_obj_arg socket) {
     }
 
     event_loop_unlock(&global_ev);
+
+    /* `recv`/`waitReadable` took a reference that keeps the socket alive while the loop
+       owns the pending operation. `uv_udp_recv_stop` suppresses the callback, so that
+       reference must be released here; the caller's reference is not ours to consume. */
     lean_dec(socket);
 
     return lean_io_result_mk_ok(lean_box(0));

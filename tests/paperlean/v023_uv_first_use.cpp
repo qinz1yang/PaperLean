@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 #ifdef __APPLE__
@@ -23,11 +24,23 @@ static int thread_count() {
     vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_t));
     return count;
 #else
+    // Lean's own threads only: on Linux, libuv's default loop (created by the runtime's initialization,
+    // as in official Lean) may use io_uring with a kernel submission-queue polling thread, which is listed
+    // here as `iou-sqp-<pid>`; it is the kernel's, not a libuv worker of the runtime.
     DIR * dir = opendir("/proc/self/task");
     if (!dir) return -1;
     int count = 0;
-    while (auto * e = readdir(dir))
-        if (e->d_name[0] != '.') ++count;
+    while (auto * e = readdir(dir)) {
+        if (e->d_name[0] == '.') continue;
+        char path[64], comm[32] = {0};
+        std::snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+        if (FILE * f = std::fopen(path, "r")) {
+            if (!std::fgets(comm, sizeof(comm), f)) comm[0] = 0;
+            std::fclose(f);
+        }
+        if (std::strncmp(comm, "iou-sqp-", 8) == 0) continue;
+        ++count;
+    }
     closedir(dir);
     return count;
 #endif

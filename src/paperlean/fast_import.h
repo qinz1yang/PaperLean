@@ -23,12 +23,22 @@ struct part_names {
     uint64_t const * hashes = nullptr;    // `nullptr` if the table failed its checksum
     uint64_t const * single = nullptr;
     size_t num_const_names = 0;           // the hashes of `extraConstNames` follow
+    size_t num_constants = 0;             // min of `constNames.size` and `constants.size`
+    size_t num_extra_const_names = 0;
     // Whether no other module of the pack, and no other of the two arrays and no other element of
     // the same array of this module, has a name with the hash of name `k` of the table.
     bool is_single(size_t k) const { return (single[k / 64] >> (k % 64)) & 1; }
 };
 // Whether `d` is a packed part, all of whose objects are persistent; if so, its name table.
 bool packed_part_names(lean_object * d, part_names & names);
+// `min (constNames.size) (constants.size)` of the packed part `d`, from the pack's index.
+bool packed_part_num_constants(lean_object * d, size_t & n);
+// From `import_state.cpp`: whether the import image in use describes the pack `pack` (`part_names::pack`),
+// so that the names of all packs it describes can be trusted together; and whether the hash `h` occurs
+// in the name tables of more than one of those packs (only after `image_covers_pack` returned true).
+bool image_in_use();
+bool image_covers_pack(void const * pack);
+bool image_name_conflict(uint64_t h);
 
 // While it lives, allocations (of PaperLean's own bookkeeping) are not counted as heartbeats of the
 // thread: PaperLean never counts more heartbeats than Lean.
@@ -42,6 +52,8 @@ public:
 bool import_timing_enabled();
 // Reports the cost of the import step `phase` that just ended if import timing is enabled.
 void import_timing_mark(char const * phase);
+// With `PAPERLEAN_IMPORT_TIMING`, reports the wall-clock time at which this process reached `phase`.
+void timing_epoch_mark(char const * phase);
 // `PAPERLEAN_IMPORT=legacy`
 bool import_legacy_mode();
 // `PAPERLEAN_IMPORT=check`

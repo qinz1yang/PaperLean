@@ -17,7 +17,7 @@ import Std.Data.HashSet.Basic
 /-!
 The `.hash` files that builds under `paperlean` commands read (`Lake.fetchFileHash`): Lake reads those
 of every module that is up to date, seven per module, which take most of the time of a build that
-compiles little. A build records the contents of those it read with their identities (device, inode,
+compiles little. A build records the contents of those it read with their identities (inode,
 size, modification and status change times: `Lean.PaperLean.fileIdentity`) in
 `.lake/paperlean-hashes.paperlean`, and later builds take the contents from there instead of reading
 a file whose identity is still that recorded, which one `stat` costs. A file is only recorded if it

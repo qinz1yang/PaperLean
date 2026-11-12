@@ -849,7 +849,8 @@ lookups where it is available (`PaperLean.cachedLookup`). -/
 
 /-- Look up an already imported constant at the current visibility, without consulting
 any asynchronous declarations or realizations. -/
-def findImportedConst? (env : Environment) (n : Name) : Option ConstantInfo :=
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def findImportedConst? (env : Environment) (n : Name) : Option ConstantInfo :=
   findImported? (env.base.get env) n
 
 /--
@@ -2669,9 +2670,9 @@ private def PaperLean.finalizeImportFastImpl (s : ImportState) (imports : Array 
     if !mod.isExported then numPublicConsts else
       let some data := mod.publicModule? | numPublicConsts
       numPublicConsts + PaperLean.moduleDataNumConstants data
-  let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts); let fast? : Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name)) ← PaperLean.privateConstantMaps? moduleData irData numPrivateConsts (numPrivateConsts + numExtraConsts) leakEnv
+  let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts); let maps : Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name)) × Option (Std.HashMap Name ConstantInfo) ← PaperLean.constantMaps? moduleData irData modules numPrivateConsts (numPrivateConsts + numExtraConsts) numPublicConsts leakEnv isModule; let fast? := maps.1; let fastPublic₀? := maps.2
   let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts); let check := (← PaperLean.importMode) == 2; let fold := fast?.isNone || check
-  let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts); let fastPublic? : Option (Std.HashMap Name ConstantInfo) ← PaperLean.publicConstantMap? modules numPublicConsts isModule (leakEnv && !fast?.any (·.2.2.isSome))
+  let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts); let fastPublic? : Option (Std.HashMap Name ConstantInfo) ← if fastPublic₀?.isSome || fast?.isNone then pure fastPublic₀? else PaperLean.publicConstantMap? modules numPublicConsts isModule (leakEnv && !fast?.any (·.2.2.isSome))
   for h : modIdx in *...moduleData.size do
     let data := moduleData[modIdx]; if !fold then break
     for cname in data.constNames, cinfo in data.constants do

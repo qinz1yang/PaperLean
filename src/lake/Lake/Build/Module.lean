@@ -20,6 +20,7 @@ import Lake.PaperLean.Schedule
 import Lake.PaperLean.SourceInputs
 import Lake.PaperLean.SetupIndex
 import Lake.PaperLean.Env
+import Lake.PaperLean.MidBuildHook
 
 /-! # Module Build Definitions -/
 
@@ -1058,12 +1059,19 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   -- PaperLean: packs modules compiled by this build for later ones (`Lake.PaperLean.BuildData`)
   let ctx ← getBuildContext
   PaperLean.BuildData.compileStartingFor ctx mod (← getWorkspace).dir (← getLeanInstall).leanLibDir
+  -- PaperLean: the build's mid-build preparation counts running compiles and can pause them
+  -- (`Lake.PaperLean.MidBuild`); a compile that ends with an error releases its count here
+  PaperLean.MidBuildHook.compileStarting ctx mod
   let start ← IO.monoMsNow
-  compileLeanModuleForBuild (PaperLean.BuildData.leanEnvFor ctx) (PaperLean.SetupIndex.launchDirFor ctx)
-    presetup.srcFile relSrcFile setup mod.setupFile arts args (← getLeanPath) (← getLean) (← getLeanir)
-  scheduler.compiled mod ((← IO.monoMsNow) - start)
-  mod.clearOutputHashes
-  mod.computeArtifacts setup.isModule
+  try
+    compileLeanModuleForBuild (PaperLean.BuildData.leanEnvFor ctx) (PaperLean.SetupIndex.launchDirFor ctx)
+      presetup.srcFile relSrcFile setup mod.setupFile arts args (← getLeanPath) (← getLean) (← getLeanir)
+    scheduler.compiled mod ((← IO.monoMsNow) - start)
+    mod.clearOutputHashes
+    mod.computeArtifacts setup.isModule
+  catch e =>
+    PaperLean.MidBuildHook.compileAborted ctx mod
+    throw e
 
 /--
 Recursively build a Lean module.
@@ -1239,6 +1247,7 @@ where
     let arts ← Module.recBuildLean.trackOutputsIfEnabled mod arts
     let arts ← Module.recBuildLean.adjustMTime mod arts
     PaperLean.BuildData.moduleDoneFor (← getBuildContext) mod
+    PaperLean.MidBuildHook.moduleDone (← getBuildContext) mod
     return arts
 
 /-- The `ModuleFacetConfig` for the builtin `leanArtsFacet`. -/

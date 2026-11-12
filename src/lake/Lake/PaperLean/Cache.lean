@@ -272,17 +272,30 @@ def slotUsed (dir : FilePath) (entry : String) : IO Bool := do
   return (← kind? p).any fun k => k == .dir || k == .file
 
 /-- Reserves an address range of at least `size` bytes, disjoint from those of the other packs of `dir`,
-for the pack that is written in the temporary directory `entry`; its base. -/
+for the pack that is written in the temporary directory `entry`; its base. The range is also one in
+which nothing of this process is mapped: the pack is written here, mapped at its address, and this
+process has mapped files where they ask to be, among them the `.olean` files of the modules that it
+imported (those of the configuration files that it elaborated), at addresses that Lean derives from
+the modules' names, anywhere below `0x7f0000000000`. -/
 public def reserveSlot (dir : FilePath) (entry : String) (size : Nat) : IO USize := do
   let size := (size + slotAlign - 1) / slotAlign * slotAlign
   withFileLock (dir / "slots.lock") true do
     let slots ← (← readSlots dir).filterM (slotUsed dir ·.entry)
     let sorted := slots.qsort (·.base < ·.base)
     let mut base := slotsStart
-    for s in sorted do
-      if base + size ≤ s.base then break
-      base := max base (s.base + s.size)
-    if base + size > slotsEnd then
+    let mut found := false
+    -- (every step passes a slot or `slotAlign` bytes mapped in this process, so `base` grows by at
+    -- least `slotAlign` each time)
+    for _ in [0:(slotsEnd - slotsStart) / slotAlign + 2] do
+      if base + size > slotsEnd then break
+      match sorted.find? fun s => s.base < base + size && base < s.base + s.size with
+      | some s => base := s.base + s.size
+      | none =>
+        if ← Lean.PaperLean.addressRangeFree base.toUSize size.toUSize then
+          found := true
+          break
+        base := base + slotAlign
+    if !found || base + size > slotsEnd then
       throw <| IO.userError s!"no address range of {size} bytes is free for a pack in {dir}; \
         `paperlean clean --cache` frees those of unused entries"
     writeSlots dir (slots.push { base, size, entry })

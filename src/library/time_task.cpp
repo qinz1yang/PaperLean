@@ -28,11 +28,18 @@ void exclude_profiling_time_from_current_task(second_duration time) {
 }
 
 void display_cumulative_profiling_times(std::ostream & out) {
-    if (g_cum_times->empty())
+    /* `report_profiling_time` may run on worker threads while the main thread
+       displays; take the same lock and read a stable copy. */
+    std::map<std::string, second_duration> times;
+    {
+        lock_guard<mutex> _(*g_cum_times_mutex);
+        times = *g_cum_times;
+    }
+    if (times.empty())
         return;
     sstream ss;
     ss << "cumulative profiling times:\n";
-    for (auto const & p : *g_cum_times)
+    for (auto const & p : times)
         ss << "\t" << p.first << " " << display_profiling_time{p.second} << "\n";
     // output atomically, like IO.print
     out << ss.str();

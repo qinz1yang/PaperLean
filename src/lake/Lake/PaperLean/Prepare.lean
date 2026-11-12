@@ -166,6 +166,17 @@ public structure PrepareOptions where
   prepared yet, keeping the data of the other prepared packages; `none`: all dependency packages, in
   full. -/
   packages : Option (Array Package) := none
+  /-- The run is a build's own preparation (`Lake.PaperLean.MidBuild`): the build already holds the
+  workspace's data in use, so this run must not take the data lock, and the data may change under it
+  only through this run. -/
+  duringBuild : Bool := false
+  /-- Write the data of the modules that are built now though not all modules that the root package
+  imports are built: the others are read from disk until they are. A build's mid-build preparation
+  of a prefix needs this; an explicit `prepare` refuses such data. -/
+  allowPartial : Bool := false
+  /-- Do not delete what the previous `env.json` named: another command or build may have it in use
+  while this one replaces the data (a build's mid-build preparation; the next `prepare` cleans). -/
+  keepOld : Bool := false
 
 /-- The name by which `env.json` records the package `pkg`. -/
 public def pkgKey (pkg : Package) : String := pkg.baseName.toString (escape := false)
@@ -208,7 +219,9 @@ def main (args : List String) : IO UInt32 := do
   return 0
 "
 
-/-- The compiler processes to run at once: at most one per hardware thread and per 2 GB of memory. -/
+/-- The compiler processes to run at once: at most one per hardware thread and per 2 GB of the memory
+that this process may use (`Lean.PaperLean.numCPUs`, `totalMemory`: a batch job's or a container's
+limits, not the machine's). -/
 def autoJobs : BaseIO Nat := do
   let cpus ← Lean.PaperLean.numCPUs
   let mem ← Lean.PaperLean.totalMemory
@@ -521,6 +534,14 @@ def checkImportImage (dir : FilePath) (image : Option String) : IO Bool := do
     return true
   catch _ => return false
 
+/-- Whether `lean`, reading the packs `packs` (a `LEAN_OLEAN_PACK` list), would use the import image
+`image` of the data directory `dir` rather than ignore it as belonging to other packs: the image records
+the checksum and address range of each pack it describes, which change when a pack is written again
+under the same name (e.g. an entry of the cache rebuilt after it was found unusable). -/
+public def imageMatchesPacks (dir : FilePath) (image : Option String) (packs : String) : BaseIO Bool := do
+  let some image := image | return false
+  return (← Lean.PaperLean.OLeanPack.importImagePackMismatch (dir / image).toString packs).isEmpty
+
 /-- Replaces an invalid native entry with a complete private directory while its key lock is held.
 The old directory is quarantined until the rename succeeds; a failed publication restores it. -/
 def publishNativeEntry (cdir tmp : FilePath) (entry : String) : IO Unit := do
@@ -576,6 +597,30 @@ def imageModules (ws : Workspace) (deps : Array Package) (headers : ImportHeader
   let candidates ← if imported.isEmpty then (deps.flatMapM defaultModules : IO (Array Module)) else pure imported
   return (imported, candidates)
 
+/-- Of the candidates of `imageModules`, the modules that the import image describes, which are built,
+and the unbuilt modules that the root package imports. Without root modules the candidates are the
+packages' roots, which import all of their modules; of a package built in part (e.g. prepared during
+its own build), whose roots are not built, its built library modules stand for them. -/
+def builtImageModules (imported candidates : Array Module) : IO (Array Module × Array Module) := do
+  let mut mods : Array Module := #[]
+  let mut seen : NameSet := {}
+  let mut unbuilt : Array Module := #[]
+  let mut partialPkgs : NameSet := {}
+  for mod in candidates do
+    if ← mod.oleanFile.pathExists then
+      unless seen.contains mod.name do
+        mods := mods.push mod
+        seen := seen.insert mod.name
+    else if !imported.isEmpty then
+      unbuilt := unbuilt.push mod
+    else if !partialPkgs.contains mod.pkg.baseName then
+      partialPkgs := partialPkgs.insert mod.pkg.baseName
+      for m in ← libraryModules mod.pkg do
+        unless seen.contains m.name do
+          mods := mods.push m
+          seen := seen.insert m.name
+  return (mods, unbuilt)
+
 /-- Whether `need` bytes fit into the free space of `dir`; says why not if not. -/
 def enoughSpace (dir : FilePath) (need : Nat) (what : String) : IO Bool := do
   IO.FS.createDirAll dir
@@ -625,7 +670,7 @@ def removeUnused (dir : FilePath) (data : PreparedData) : IO Unit := do
     let ours := isDataDirName e.fileName || ["tmp", "tmp-eval", "tmp-kept"].contains e.fileName
     if e.fileName != "bind" && ours && !used.any (·.startsWith (e.fileName ++ "/")) then
       removePath e.path
-  if ← (dir / "bind").isDir then
+  if ← isRealDirectory (dir / "bind") then
     for e in ← (dir / "bind").readDir do
       unless used.contains s!"bind/{e.fileName}" do removePath e.path
 
@@ -744,7 +789,9 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
         if built.contains l.pkg then return none
         let some pkg := deps.find? (pkgKey · == l.pkg) | return none
         let some p := old?.bind (·.deps.find? (·.pkg == l.pkg)) | return some l
-        IO.FS.createDirAll keptDir
+        -- (a package that had no built modules has no pack to bind: `packFile ""` would name `/pack.paperlean`)
+        if p.pack.isEmpty then return some l
+        ensureRealDirectory keptDir
         let binding := keptDir / s!"{Cache.fileNamePart l.pkg}.paperlean"
         removePath binding
         -- (a pack that is gone from the cache binds nothing)
@@ -765,7 +812,7 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
       let pack : IO Unit := do
         for (pkg, i) in missing do
           writePackEntry cdir entries[i]! pkg packed[i]! (sizeOf packed[i]!) record
-        IO.FS.createDirAll (dir / "bind")
+        ensureRealDirectory (dir / "bind")
         for pkg in deps, p in prepared', e in entries do
           if p.binding.isEmpty then continue
           let (bound, total) ← Lean.PaperLean.OLeanPack.bind (cdir / packFile e).toString
@@ -1030,7 +1077,8 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
       -- The import image of the packs, written again if they changed.
       imagePacks := toolchain?.toArray ++ (prepared.map (·.pack)).filter (!·.isEmpty)
       if old?.any (fun old => old.imagePacks == imagePacks) &&
-          (← checkImportImage dir (old?.bind (·.image?))) then
+          (← checkImportImage dir (old?.bind (·.image?))) &&
+          (← imageMatchesPacks dir (old?.bind (·.image?)) (depPacks dir cacheRoot prepared toolchain?)) then
         image? := old?.bind (·.image?)
       else
         image? ← writeImage ws dir stamp depMods (depPacks dir cacheRoot prepared toolchain?)
@@ -1065,7 +1113,7 @@ def prepareIn (ws : Workspace) (opts : PrepareOptions) (dir : FilePath) (stamp :
     Cache.addUser cdir ws.dir
     Cache.touch cdir <| (prepared.map (·.pack) ++ usable.map (·.entry)).filterMap fun e =>
       (e.dropPrefix? (Cache.entryPath "")).map (·.toString)
-    removeUnused dir data
+    unless opts.keepOld do removeUnused dir data
     BuildData.removeEnded ws.dir
     IO.println s!"Prepared {dir}."
     unless failed.isEmpty do
@@ -1130,10 +1178,34 @@ public def prepare (ws : Workspace) (opts : PrepareOptions) : LoggerIO UInt32 :=
     let some old := old? | return false
     let some n ← readPreparedNativeEntry old.cache l.entry l.pkg | return false
     return n.lib.lib == l.lib && n.lib.manifest == l.manifest && n.lib.modules == l.modules
-  let (deps, built) := plan allDeps before oldLibs opts.packages opts.root
-  let oldImageUsable ← importImageUsable dir (old?.bind (·.image?))
+  -- The old data's entries are relative to the cache it names: when `PAPERLEAN_CACHE_DIR` changed,
+  -- they are not kept while the new env.json names the other cache; and entries that are kept must
+  -- still be there (one may have been removed or damaged since).
+  let cacheRoot? := (← (cacheRootOf ws).toBaseIO).toOption
+  let cacheCurrent := match old?, cacheRoot? with
+    | some old, some cacheRoot => old.cache == cacheRoot.toString
+    | some _, none => false
+    | none, _ => true
+  let retainedOk ← match old? with
+    | some old => do
+      let packsOk ← old.deps.allM fun p => do
+        if p.pack.isEmpty then pure true
+        else pure (← Lean.PaperLean.OLeanPack.whyIgnored ((old.cache : FilePath) / packFile p.pack).toString).isEmpty
+      let toolchainOk ← match old.toolchain? with
+        | some t => pure (← Lean.PaperLean.OLeanPack.whyIgnored ((old.cache : FilePath) / t).toString).isEmpty
+        | none => pure true
+      pure (packsOk && toolchainOk)
+    | none => pure false
+  let (deps, built₀) := plan allDeps before oldLibs opts.packages opts.root
+  -- (with another cache, the dependencies are prepared again, from it if it has them)
+  let built := if cacheCurrent then built₀ else deps.map pkgKey
+  let oldImageUsable ← match old? with
+    | some old => do
+      let packs := String.intercalate ":" ((old.packFiles dir).map (·.toString)).toList
+      pure ((← importImageUsable dir old.image?) && (← imageMatchesPacks dir old.image? packs))
+    | none => pure false
   -- the dependency data stays as it is if it holds these packages and no library is built again
-  let keepDeps := old?.isSome && opts.packages.isSome && built.isEmpty &&
+  let keepDeps := old?.isSome && opts.packages.isSome && built.isEmpty && cacheCurrent && retainedOk &&
     deps.size == before.size && deps.all (before.contains <| pkgKey ·) && oldImageUsable
   if keepDeps && !opts.root then
     IO.println s!"{", ".intercalate ((opts.packages.getD #[]).map (·.prettyName)).toList} and the \
@@ -1143,16 +1215,10 @@ public def prepare (ws : Workspace) (opts : PrepareOptions) : LoggerIO UInt32 :=
   -- what imports read. (Without root modules, the built modules of the dependencies.)
   let headers ← readImportHeaders ws (write := true)
   let (imported, candidates) ← imageModules ws deps headers
-  let mut missing := 0
-  let mut missingEx := #[]
-  let mut depMods : Array Module := #[]
-  for mod in candidates do
-    if ← mod.oleanFile.pathExists then
-      depMods := depMods.push mod
-    else if !imported.isEmpty then
-      missing := missing + 1
-      if missingEx.size < 3 then missingEx := missingEx.push mod.name
-  if missing > 0 && !keepDeps then
+  let (depMods, unbuilt) ← builtImageModules imported candidates
+  let missing := unbuilt.size
+  let missingEx := (unbuilt.toSubarray 0 3).toArray.map (·.name)
+  if missing > 0 && !keepDeps && !opts.allowPartial then
     IO.eprintln s!"paperlean: {missing} modules of the dependencies that {ws.root.prettyName} imports are not built, e.g. \
       {", ".intercalate (missingEx.map toString).toList}.\n\
       Download them with `paperlean cache get` or build them with `lake build`, then run \
@@ -1175,13 +1241,14 @@ public def prepare (ws : Workspace) (opts : PrepareOptions) : LoggerIO UInt32 :=
       else."
   let native := opts.native && available
   IO.FS.createDirAll dir
-  withUnchangedData ws text? do
+  let run : LoggerIO UInt32 := do
     let stamp ← freshStamp dir
     try
       let code ← prepareIn ws opts dir stamp deps built keepDeps depMods rootMods rootUnbuilt native old? headers
       if code == 0 then headers.save
       return code
     catch e => removeFailedRun ws dir stamp; throw e
+  if opts.duringBuild then run else withUnchangedData ws text? run
 
 /-- What `paperlean clean` of named packages says if it found `env.json` damaged (`why`) and reset it
 (`PreparedData.empty`): none of its paths is trusted, so the files of the data stay. -/
@@ -1219,8 +1286,8 @@ public def cleanPackages (ws : Workspace) (pkgs : Array Package) : LoggerIO UInt
   let gone (key : String) := removed.any (pkgKey · == key)
   let deps := old.deps.filter (!gone ·.pkg)
   let headers ← readImportHeaders ws
-  let (_, candidates) ← imageModules ws (allDeps.filter fun p => deps.any (·.pkg == pkgKey p)) headers
-  let depMods ← candidates.filterM (·.oleanFile.pathExists)
+  let (imported, candidates) ← imageModules ws (allDeps.filter fun p => deps.any (·.pkg == pkgKey p)) headers
+  let (depMods, _) ← builtImageModules imported candidates
   let others := removed.filter fun p => !pkgs.any (·.baseName == p.baseName)
   let code ← withUnchangedData ws text? do
     let stamp ← freshStamp dir
@@ -1286,6 +1353,7 @@ def isDeltaPath (p : String) : Bool :=
 does not list, which interrupted runs of `refresh` left, and their temporary files. -/
 def removeLeftDeltas (dir : FilePath) (base : String) (packs : Array String) : IO Unit := do
   let d := (base.splitOn "/").headD ""
+  unless ← isRealDirectory (dir / d) do return
   let .ok entries ← (dir / d).readDir.toBaseIO | return
   for e in entries do
     let p := s!"{d}/{e.fileName}"
@@ -1321,6 +1389,13 @@ public def refresh (ws : Workspace) : LoggerIO UInt32 := do
   unless ← root.isDir do
     IO.println s!"{ws.root.prettyName} has no built modules yet; nothing to pack."
     return 0
+  -- (a directory of a damaged data dir (a symbolic link, say) must not be read or written as
+  -- the root package's pack directory)
+  let packs ← d.packs.filterM (fun (p : String) => do
+    match (p : FilePath).parent with
+    | some parent => pure (← isRealDirectory (dir / parent))
+    | none => pure false)
+  let d := { d with packs }
   let (base?, delta?) := rootPacks d
   -- the files to pack: all of the root package's current modules if it has no pack yet, otherwise
   -- those that its pack does not serve

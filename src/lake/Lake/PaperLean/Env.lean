@@ -243,15 +243,33 @@ public def removePath (p : FilePath) : IO Unit := do
   let .ok md ← p.symlinkMetadata.toBaseIO | return
   if md.type == .dir then IO.FS.removeDirAll p else IO.FS.removeFile p
 
+/-- Whether `p` itself is a directory, rather than a symbolic link to one. -/
+public def isRealDirectory (p : FilePath) : BaseIO Bool := do
+  match ← p.symlinkMetadata.toBaseIO with
+  | .ok md => return md.type == .dir
+  | .error _ => return false
+
+/-- Creates `p` as a directory, removing a file or symbolic link at its name, but not
+following a symbolic link. -/
+public def ensureRealDirectory (p : FilePath) : IO Unit := do
+  match ← p.symlinkMetadata.toBaseIO with
+  | .ok md => unless md.type == .dir do removePath p
+  | .error _ => pure ()
+  IO.FS.createDirAll p
+
 /-- Makes `d` the `env.json` of the data directory `dir`, replacing the one there whatever it is:
 written to a temporary file and renamed into place, so that readers see either. -/
 public def PreparedData.install (d : PreparedData) (dir : FilePath) : IO Unit := do
   let tmp := dir / "env.json.tmp"
+  let target := dir / "env.json"
   removePath tmp
   d.write tmp
-  -- (a file cannot be renamed over a directory, which a damaged `env.json` may be)
-  if ← (dir / "env.json").isDir then IO.FS.removeDirAll (dir / "env.json")
-  IO.FS.rename tmp (dir / "env.json")
+  -- (a file cannot be renamed over a real directory, which a damaged `env.json` may be; a
+  -- symbolic link is replaced itself, and its target must be left alone)
+  if let .ok md ← target.symlinkMetadata.toBaseIO then
+    if md.type == .dir then IO.FS.removeDirAll target
+    else if md.type == .symlink && (← target.isDir) then IO.FS.removeFile target
+  IO.FS.rename tmp target
 
 /-- The free disk space of `dir` in bytes; `PAPERLEAN_FREE_SPACE`, if set, replaces it, for tests. -/
 public def availableSpace (dir : FilePath) : IO Nat := do
@@ -349,17 +367,32 @@ build: sets them in this process, which the processes Lake starts inherit (prepa
 workspace that they were set to is replaced). Says nothing; `paperlean status` and `paperlean build`
 report.
 -/
-public def useWorkspaceData (wsDir : FilePath) : BaseIO Unit := do
-  unless ← accelerated do return
-  if ← explicitDataVars then return
+public def applyWorkspaceData (wsDir : FilePath) : BaseIO Unit := do
   let dir := dataDir wsDir
-  if (← IO.getEnv dataMarker) == some dir.toString then return
   let vars := match ← readPreparedData wsDir with
     | some (.ok d) => if d.mismatch?.isNone then d.vars dir else #[]
     | _ => #[]
   for name in dataVars do
     Lean.PaperLean.setEnv name ((vars.find? (·.1 == name)).map (·.2))
   Lean.PaperLean.setEnv dataMarker (if vars.isEmpty then none else some dir.toString)
+
+/-- `applyWorkspaceData`, unless a later command must not replace variables that the user set. -/
+public def useWorkspaceData (wsDir : FilePath) : BaseIO Unit := do
+  unless ← accelerated do return
+  if ← explicitDataVars then return
+  if (← IO.getEnv dataMarker) == some (dataDir wsDir).toString then return
+  applyWorkspaceData wsDir
+
+/--
+Replaces the prepared data that this process and its later children use with the workspace's current
+data (`applyWorkspaceData`), as a build does after it prepared part of a package (`paperlean build`
+only; `Lake.PaperLean.MidBuild`). Children already started keep the variables that they were started
+with; later ones inherit the new data. Does nothing where `useWorkspaceData` may not set them.
+-/
+public def reloadWorkspaceData (wsDir : FilePath) : BaseIO Unit := do
+  unless ← accelerated do return
+  if ← explicitDataVars then return
+  applyWorkspaceData wsDir
 
 /--
 Has this process read its own imports (those of the configuration files that loading the workspace in

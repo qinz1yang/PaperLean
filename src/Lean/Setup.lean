@@ -312,16 +312,48 @@ def artifactsFromJson? : Json → Except String (NameMap ImportArtifacts)
       return m.insert mod (← decodeArts roots k mod v)
   | j => throw s!"expected a `NameMap`, got '{j}'"
 
+-- An indexed setup is not a valid official `ModuleSetup`: its anonymous entry holds the
+-- index reference, which official Lean would silently ignore (and then fall back to the
+-- search path). A third, non-path marker makes official Lean's `fromJson?` reject the file.
+private def indexMarker : String := "paperlean-setup-index"
+
+private def markIndexRef (arts : Json) : Json :=
+  match arts.getObjVal? "[anonymous]" with
+  | .ok (.arr a) =>
+    if a.size == 2 then
+      arts.setObjVal! "[anonymous]" (.arr (a.push (.arr #[.str indexMarker, toJson 0])))
+    else arts
+  | _ => arts
+
+private def stripIndexMarker (json : Json) : Json :=
+  match json.getObjVal? "importArts" with
+  | .ok arts@(.obj _) =>
+    match arts.getObjVal? "[anonymous]" with
+    | .ok (.arr a) =>
+      if a.size == 3 then
+        match a[2]! with
+        | .arr m =>
+          if m.size == 2 && m[0]! == .str indexMarker && m[1]! matches .num _ then
+            json.setObjVal! "importArts" (arts.setObjVal! "[anonymous]" (.arr (a.extract 0 2)))
+          else json
+        | _ => json
+      else json
+    | _ => json
+  | _ => json
+
 /--
 The JSON of a module's setup with {lit}`importArts` encoded compactly (as described for
 {lit}`artifactsToJson`), which {lit}`ModuleSetup.load` reads and official Lean does not. A build writes
 it to a side file ({lit}`<module>.setup.paperlean`).
 -/
 def setupToJsonCompact (x : ModuleSetup) : Json :=
-  (toJson { x with importArts := {} }).setObjVal! "importArts" (artifactsToJson x.importArts)
+  let arts := artifactsToJson x.importArts
+  let arts := if x.importArts.contains .anonymous then markIndexRef arts else arts
+  (toJson { x with importArts := {} }).setObjVal! "importArts" arts
 
 /-- Like {lit}`fromJson?`, also reading the compact encoding of {lit}`setupToJsonCompact`. -/
 def setupFromJsonCompact? (json : Json) : Except String ModuleSetup :=
+  let json := stripIndexMarker json
   match json.getObjVal? "importArts" with
   | .ok arts@(.obj o) =>
     if o.contains "" then do

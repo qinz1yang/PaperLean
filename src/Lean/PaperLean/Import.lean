@@ -91,11 +91,45 @@ private opaque dropPrefetchedReplays (env : @& Environment) : BaseIO Unit
 /--
 The extensions whose `addImportedFn` is a pure function of their entries and of the environment's
 header, so that it can run before the extensions registered before them are finalized.
+
+The folds are started in this order: the workers that run them are shared with the import's replays
+(`importWorker.admitted`), and a fold that finds none runs later on the importing thread, so the
+folds that are worth most come first. The three extensions that the list had first are kept first:
+their folds are started as before, whether or not the ones below are there.
+
+Each extension added below is a `SimplePersistentEnvExtension` or a `SimpleScopedEnvExtension`
+(`Lean.Environment`, `Lean.ScopedEnvExtension`), whose `addImportedFn` folds a pure `σ → α → σ`
+and a pure `σ → σ` over the extension's own entries and reads nothing else:
+
+* `registerSimplePersistentEnvExtension` registers `addImportedFn := fun as => pure ([], descr.addImportedFn as)`
+  with `descr.addImportedFn : Array (Array α) → σ` a pure function of `as`;
+* `registerSimpleScopedEnvExtension` registers `PaperLean.addImportedFnFast` with
+  `ofOLeanEntry := fun _ a => return a`, `mkInitial := return descr.initial` and the pure
+  `descr.addEntry`/`descr.finalizeImport`, so its fold is `mkInitial` and `addEntry` over `as`.
+
+Neither reads the environment (`ctx.env`), the options, or another extension's state, and neither
+has an effect, so computing the state on another thread before the extensions registered before it
+are finalized gives the same objects, has nothing observable, and cannot fail where the fold on the
+importing thread would not (`patches/1.md` names each extension with its evidence).
 -/
 private def pureImportedFolds : Array String := #[
   "_private.Lean.Compiler.LCNF.Specialize.0.Lean.Compiler.LCNF.Specialize.specCacheExt",
   "_private.Lean.Namespace.0.Lean.namespacesExt",
-  "Lean.Meta.Match.Extension.extension"]
+  "Lean.Meta.Match.Extension.extension",
+  -- (mean wall per module of the 128 small modules of `dev10` with `PAPERLEAN_IMPORT_TIMING=1`,
+  -- in the order in which their folds are started: 7.0, 5.8, 0.8 ms, then at most 0.4 ms)
+  "Lean.Meta.Grind.grindExt",
+  "Lean.errorExplanationExt",
+  "cbvEvalExt",
+  "Lean.aliasExtension",
+  "Lean.classExtension",
+  "Lean.Meta.Ext.extExtension",
+  "specMap",
+  "Lean.indirectModUseExt",
+  "Lean.Compiler.CSimp.ext",
+  "Lean.Meta.congrExtension",
+  "Lean.Meta.Monotonicity.monotoneExt",
+  "internalSpecMap"]
 
 /-- The results of `addImportedFn` that `prefetchImportedStates` computes in the background. -/
 private builtin_initialize importedFoldsRef :
@@ -194,6 +228,16 @@ private def constModuleName (env : Environment) (n : Name) : Name :=
   | some idx => env.header.modules[idx]?.map (·.module) |>.getD .anonymous
   | none => .anonymous
 
+/-- Whether the imported declaration `n` of the module `idx - 1` of `env` is an `[init]` declaration:
+by `getInitFnNameFor?` (the exported attribute entries), or by that module's `.ir` entries of
+`regularInitAttr`, which alone have the attribute of a non-`meta` `initialize` of a `module`
+(`registerInitAttrUnsafe.filterExport`). Only that module's entries are searched. -/
+@[export lean_paperlean_imported_has_init]
+private def importedHasInit (env : Environment) (n : Name) (idx : UInt32) : Bool :=
+  (getInitFnNameFor? env n).isSome ||
+    (idx != 0 && idx.toNat - 1 < env.header.modules.size &&
+      (regularInitAttr.ext.getModuleIREntries env (idx.toNat - 1)).any fun (d, f) => d == n && !f.isAnonymous)
+
 /-- The module index of the imported constant `n` of `env` plus one, `0` if `n` is not imported. -/
 @[export lean_paperlean_const_module_idx]
 private def constModuleIdx (env : Environment) (n : Name) : UInt32 :=
@@ -219,9 +263,14 @@ private def prefetchImportedStatesImpl (env : Environment) (opts : Options) (sta
   if (← importMode) == 1 then return
   let states := env.base.private.extensions
   let descrs := (← persistentEnvExtensionsRef.get)[startingAt...*].toArray
-  for descr in descrs do
-    -- only in an environment marked persistent, which the task does not need to mark
-    if persistent && pureImportedFolds.contains descr.name.toString then
+  -- only in an environment marked persistent, which the task does not need to mark
+  if persistent then
+    -- the folds to start, in the order of `pureImportedFolds` (which has the ones worth most
+    -- first: the workers are shared, and a fold that finds none is computed by the loop below)
+    let folds : Array (Nat × PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) :=
+      descrs.filterMap fun descr =>
+        (pureImportedFolds.idxOf? descr.name.toString).map fun prio => (prio, descr)
+    for (_, descr) in folds.qsort (fun a b => a.1 < b.1) do
       let as := (unsafe descr.toEnvExtension.getStateImpl states).importedEntries
       let fold : IO EnvExtensionState := do
         try descr.addImportedFn as { env, opts }
@@ -252,11 +301,34 @@ interpreter's symbol cache, which depends only on the environment (unless `PAPER
 private opaque withImportInterpreter {α : Type} [Nonempty α] (env : @& Environment) (opts : @& Options)
     (act : BaseIO α) : BaseIO α
 
+/--
+Checks, under `PAPERLEAN_IMPORT_CHECK_FOLDS=1`, that the state `prefetchImportedStates` computed for
+`extName` is the one `addImportedFn` computes on this thread: a fold that is not a pure function of
+its entries (which reads the environment, or has an effect) gives other objects, or fails on one of
+the two paths. `PAPERLEAN_IMPORT_CHECK_FAULT=fold` corrupts the state of the background fold, for
+the test to see that the comparison runs.
+-/
+private def checkImportedFold (extName : Name) (env : Environment) (opts : Options)
+    (fold : Unit → IO EnvExtensionState) (background : Except IO.Error EnvExtensionState) : IO Unit := do
+  if (← IO.getEnv "PAPERLEAN_IMPORT_CHECK_FOLDS") != some "1" then return
+  let background : Except IO.Error EnvExtensionState :=
+    match background, (← IO.getEnv "PAPERLEAN_IMPORT_CHECK_FAULT") with
+    | .ok state, some "fold" => .ok (unsafe unsafeCast #[state])
+    | result, _ => result
+  let here : Except IO.Error EnvExtensionState ←
+    (withImportInterpreter env opts (fold ()).toBaseIO : BaseIO _)
+  match background, here with
+  | .ok background, .ok here =>
+    checkSameAsLegacy s!"the state of `addImportedFn` of {extName}" here background
+  | .ok _, .error e | .error e, .ok _ =>
+    throw <| IO.userError s!"PAPERLEAN_IMPORT_CHECK_FOLDS: `addImportedFn` of {extName} fails on one path only: {e}"
+  | .error _, .error _ => pure ()
+
 @[export lean_paperlean_imported_extension_state]
 private def importedExtensionStateImpl (extName : Name) (as : Array (Array EnvExtensionEntry))
     (env : Environment) (opts : Options) (fold : Unit → IO EnvExtensionState) : IO EnvExtensionState := do
   let result ← match ← takeImportedFold extName as with
-    | some result => pure result
+    | some result => do checkImportedFold extName env opts fold result; pure result
     | none => (withImportInterpreter env opts (fold ()).toBaseIO : BaseIO _)
   if ← importTimingEnabled then importTimingMark s!"ext {extName}"
   match result with
@@ -303,18 +375,35 @@ private opaque buildPrivateConstantMaps (moduleData irData : @& Array ModuleData
 private opaque buildPublicConstantMap (datas : @& Array ModuleData) (capacity : @& Nat)
     (persistent : Bool) : Option (Std.HashMap Name ConstantInfo)
 
+/-- `buildPrivateConstantMaps` and, with `buildPublic`, `buildPublicConstantMap publicDatas`, built
+concurrently where possible: the public map is `none` if it was not built here, and both are `none`
+if the private fold fails on the concurrent path (the caller folds then). -/
+@[extern "lean_paperlean_build_constant_maps"]
+private opaque buildConstantMaps (moduleData irData publicDatas : @& Array ModuleData)
+    (privateCapacity c2mCapacity publicCapacity : @& Nat) (persistent buildPublic : Bool) :
+    Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name)) ×
+      Option (Std.HashMap Name ConstantInfo)
 
 /--
 The private constant map and `const2ModIdx` of `finalizeImport` built faster, with the module index
-and name for which its fold calls `throwAlreadyImported`, if any; `none` if `finalizeImport` builds
-them by its fold (`PAPERLEAN_IMPORT=legacy`, or capacities out of range).
+and name for which its fold calls `throwAlreadyImported`, if any (`none` if `finalizeImport` builds
+them by its fold: `PAPERLEAN_IMPORT=legacy`, capacities out of range, or a failing fold on the
+concurrent path), and, for a module, the public constant map of `publicConstantMapImpl`, built
+concurrently where possible; the public map is `none` if it was not built here.
 -/
-@[export lean_paperlean_private_constant_maps]
-private def privateConstantMapsImpl (moduleData irData : Array ModuleData)
-    (privateCapacity c2mCapacity : Nat) (persistent : Bool) :
-    IO (Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name))) := do
-  let r := if (← importMode) == 1 then none else
-    buildPrivateConstantMaps moduleData irData privateCapacity c2mCapacity persistent
+@[export lean_paperlean_constant_maps]
+private def constantMapsImpl (moduleData irData : Array ModuleData) (modules : Array ImportedModule)
+    (privateCapacity c2mCapacity publicCapacity : Nat) (persistent isModule : Bool) :
+    IO (Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name)) ×
+      Option (Std.HashMap Name ConstantInfo)) := do
+  if (← importMode) == 1 then
+    importTimingMark "constants.private"
+    return (none, none)
+  let publicDatas := if isModule then
+    modules.filterMap fun mod => if mod.isExported then mod.publicModule? else none
+  else #[]
+  let r := buildConstantMaps moduleData irData publicDatas privateCapacity c2mCapacity publicCapacity
+    persistent isModule
   importTimingMark "constants.private"
   return r
 

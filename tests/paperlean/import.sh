@@ -80,6 +80,51 @@ check_out_contains "paperlean-timing constants.fast.build"
 capture env PAPERLEAN_IMPORT=check PAPERLEAN_IMPORT_TIMING=1 lean UseLean.lean
 check_out_contains "paperlean-timing constants.fast.build"
 
+# For large imports the private constant map, `const2ModIdx` and the public map are built on several
+# threads (`constants.fast.join`), unless `PAPERLEAN_IMPORT_THREADS=0`. Results and errors are those
+# of one thread and of the fold: a clash after `import Lean` makes the threaded build fall back to the
+# fold, which reports it.
+capture env PAPERLEAN_IMPORT_TIMING=1 lean UseLean.lean
+check_out_contains "paperlean-timing constants.fast.join"
+capture env PAPERLEAN_IMPORT_THREADS=0 PAPERLEAN_IMPORT_TIMING=1 lean UseLean.lean
+check_out_contains "paperlean-timing constants.fast.build"
+if grep -q "constants.fast.join" "$CAPTURED.out.produced"; then
+  fail "PAPERLEAN_IMPORT_THREADS=0 built the constant maps on several threads"
+fi
+cat > "$SRC/UseLeanAB.lean" <<'EOF2'
+import Lean
+import A
+import B
+open Lean in
+#eval show CoreM Unit from do
+  let env ← getEnv
+  IO.println s!"module of t: {(env.getModuleIdxFor? `t).map (env.header.moduleNames[·]!)}"
+  IO.println s!"module of a: {(env.getModuleIdxFor? `a).map (env.header.moduleNames[·]!)}"
+#print t
+EOF2
+cat > "$SRC/UseLeanAC.lean" <<'EOF2'
+import Lean
+import A
+import C
+EOF2
+for threads in "" 0; do
+  for mode in "" legacy check; do
+    capture env LEAN_PATH="$LIB" PAPERLEAN_IMPORT="$mode" PAPERLEAN_IMPORT_THREADS="$threads" lean UseLeanAB.lean
+    check_out_contains "module of t: (some A)"
+    check_out_contains "module of a: (some A)"
+    check_out_contains "Eq.refl 1"
+    cp "$CAPTURED.out.produced" "$TMP_DIR/lab.t${threads:-on}.m${mode:-fast}.out"
+    capture_fail env LEAN_PATH="$LIB" PAPERLEAN_IMPORT="$mode" PAPERLEAN_IMPORT_THREADS="$threads" lean UseLeanAC.lean
+    check_out_contains "import C failed, environment already contains 't' from A"
+    cp "$CAPTURED.out.produced" "$TMP_DIR/lac.t${threads:-on}.m${mode:-fast}.out"
+  done
+done
+for f in lab lac; do
+  for v in ton.mlegacy ton.mcheck t0.mfast t0.mlegacy t0.mcheck; do
+    $DIFF -- "$TMP_DIR/$f.ton.mfast.out" "$TMP_DIR/$f.$v.out" || fail "output of $f differs between thread settings and modes ($v)"
+  done
+done
+
 # With an olean pack, the constant maps take the names' hashes from the pack's name tables and skip
 # the search for an equal key where the tables rule one out. `A` and `B` are packed, `C` is read from
 # disk; imported before `A`, its `t` must still be found to clash with `A`'s.

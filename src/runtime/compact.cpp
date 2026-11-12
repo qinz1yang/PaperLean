@@ -558,6 +558,18 @@ void region_reader::sort_and_validate_dep_regions() {
 }
 
 
+size_t region_reader::mpz_num_limbs(mpz_object const * o) {
+#ifdef LEAN_USE_GMP
+    return mpz_size(o->m_value.m_val);
+#else
+    return o->m_value.m_size;
+#endif
+}
+
+void region_reader::require(size_t n) const {
+    if (remaining() < n) throw exception("region_reader: object exceeds its region");
+}
+
 inline object * region_reader::fix_object_ptr(object * o) {
     if (lean_is_scalar(o)) return o;
     size_t addr = reinterpret_cast<size_t>(o);
@@ -579,6 +591,7 @@ inline object * region_reader::fix_object_ptr(object * o) {
             return reinterpret_cast<object*>(static_cast<char*>(dep.begin) + (addr - dep_base));
         }
     }
+    if (m_check_bounds) throw exception("region_reader: pointer outside its region");
     lean_unreachable();
 }
 
@@ -587,6 +600,8 @@ inline void region_reader::move(size_t d) {
     size_t rem = d % sizeof(void*);
     if (rem != 0)
         d = d + sizeof(void*) - rem;
+    if (m_check_bounds && d > remaining())
+        throw exception("region_reader: object exceeds its region");
     m_next = static_cast<char*>(m_next) + d;
 }
 
@@ -655,6 +670,127 @@ void region_reader::fix_closure(object * o) {
     move(o);
 }
 
+// Bounds-checked walk for the pack writer: every object header and every advertised size is
+// required to fit its region before a field is read. It runs only when `check_bounds` is set, so
+// the normal loader keeps the fast path (and the slow path's behaviour) unchanged.
+object * region_reader::read_checked() {
+    sort_and_validate_dep_regions();
+    require(sizeof(object_offset));
+    object * root = fix_object_ptr(*static_cast<object_offset *>(m_next));
+    move(sizeof(object_offset));
+    while (m_next < m_end) {
+        require(sizeof(lean_object));
+        object * curr = reinterpret_cast<object*>(m_next);
+        uint8 tag = lean_ptr_tag(curr);
+        if (tag <= LeanMaxCtorTag) {
+            require(sizeof(lean_ctor_object));
+            unsigned n = lean_ctor_num_objs(curr);
+            size_t rem = remaining(), hdr = sizeof(lean_ctor_object), sz = curr->m_cs_sz;
+            if (sz == 0 || sz < hdr || sz > rem ||
+                n > (sz - hdr) / sizeof(object *) || n > (rem - hdr) / sizeof(object *))
+                throw exception("region_reader: constructor exceeds its region");
+            object ** it = lean_ctor_obj_cptr(curr);
+            for (unsigned i = 0; i < n; i++) it[i] = fix_object_ptr(it[i]);
+            move(sz);
+            continue;
+        }
+        switch (tag) {
+        case LeanClosure: {
+            require(sizeof(lean_closure_object));
+            size_t n = lean_closure_num_fixed(curr), rem = remaining(), hdr = sizeof(lean_closure_object);
+            if (n > (rem - hdr) / sizeof(object *))
+                throw exception("region_reader: closure exceeds its region");
+            object ** it = lean_closure_arg_cptr(curr);
+            for (size_t i = 0; i < n; i++) it[i] = fix_object_ptr(it[i]);
+            move(hdr + n * sizeof(object *));
+            break;
+        }
+        case LeanArray: {
+            require(sizeof(lean_array_object));
+            size_t n = lean_array_size(curr), cap = lean_array_capacity(curr);
+            size_t rem = remaining(), hdr = sizeof(lean_array_object);
+            if (n > cap || cap > (rem - hdr) / sizeof(object *))
+                throw exception("region_reader: array exceeds its region");
+            object ** it = lean_array_cptr(curr);
+            for (size_t i = 0; i < n; i++) it[i] = fix_object_ptr(it[i]);
+            move(hdr + cap * sizeof(object *));
+            break;
+        }
+        case LeanScalarArray: {
+            require(sizeof(lean_sarray_object));
+            unsigned elem = lean_ptr_other(curr) & ~LEAN_LINEAR_MARK_MASK;
+            size_t n = lean_sarray_size(curr), cap = lean_sarray_capacity(curr);
+            size_t rem = remaining(), hdr = sizeof(lean_sarray_object);
+            if (n > cap) throw exception("region_reader: scalar array exceeds its region");
+            if (elem == 0) {
+                if (n != 0 || cap != 0) throw exception("region_reader: scalar array exceeds its region");
+                move(hdr);
+            } else {
+                if (cap > (rem - hdr) / elem) throw exception("region_reader: scalar array exceeds its region");
+                move(hdr + cap * elem);
+            }
+            break;
+        }
+        case LeanString: {
+            require(sizeof(lean_string_object));
+            size_t n = lean_string_size(curr), cap = lean_string_capacity(curr), len = lean_string_len(curr);
+            size_t rem = remaining(), hdr = sizeof(lean_string_object);
+            if (n > cap || len > n || cap > rem - hdr)
+                throw exception("region_reader: string exceeds its region");
+            move(hdr + cap);
+            break;
+        }
+        case LeanMPZ: {
+            require(sizeof(mpz_object));
+            size_t rem = remaining(), hdr = sizeof(mpz_object);
+#ifdef LEAN_USE_GMP
+            size_t digits = mpz_size(to_mpz(curr)->m_value.m_val);
+            size_t limb = sizeof(mp_limb_t);
+            if (digits > (rem - hdr) / limb) throw exception("region_reader: bignum exceeds its region");
+            __mpz_struct & m = to_mpz(curr)->m_value.m_val[0];
+            size_t base = reinterpret_cast<size_t>(m_base_addr);
+            size_t addr = reinterpret_cast<size_t>(m._mp_d);
+            if (addr < base || addr - base > m_size || digits * limb > m_size - (addr - base))
+                throw exception("region_reader: bignum digits outside its region");
+            m._mp_d = reinterpret_cast<mp_limb_t *>(static_cast<char *>(m_begin) + (addr - base));
+            move(hdr + digits * limb);
+#else
+            size_t digits = to_mpz(curr)->m_value.m_size;
+            size_t limb = sizeof(mpn_digit);
+            if (digits > (rem - hdr) / limb) throw exception("region_reader: bignum exceeds its region");
+            to_mpz(curr)->m_value.m_digits = reinterpret_cast<mpn_digit*>(reinterpret_cast<char*>(curr) + hdr);
+            move(hdr + digits * limb);
+#endif
+            break;
+        }
+        case LeanThunk:
+            require(sizeof(lean_thunk_object));
+            lean_to_thunk(curr)->m_value = fix_object_ptr(lean_to_thunk(curr)->m_value);
+            move(sizeof(lean_thunk_object));
+            break;
+        case LeanRef:
+            require(sizeof(lean_ref_object));
+            lean_to_ref(curr)->m_value = fix_object_ptr(lean_to_ref(curr)->m_value);
+            move(sizeof(lean_ref_object));
+            break;
+        case LeanTask:
+            require(sizeof(lean_task_object));
+            lean_to_task(curr)->m_value = fix_object_ptr(lean_to_task(curr)->m_value);
+            move(sizeof(lean_task_object));
+            break;
+        case LeanPromise:
+            require(sizeof(lean_promise_object));
+            lean_to_promise(curr)->m_result = (lean_task_object *)fix_object_ptr((lean_object *)lean_to_promise(curr)->m_result);
+            move(sizeof(lean_promise_object));
+            break;
+        default:
+            throw exception("region_reader: unsupported object tag");
+        }
+    }
+    if (m_next != m_end) throw exception("region_reader: region has trailing bytes");
+    return root;
+}
+
 object * region_reader::read() {
     if (m_next == m_end)
         return nullptr; /* all objects have been read */
@@ -683,6 +819,8 @@ object * region_reader::read() {
         }
     }
 
+    if (m_check_bounds) return read_checked();
+
     if (m_begin == m_base_addr) {
         bool needs_dep_reloc = false;
         for (region_view const & dep : m_dep_regions) {
@@ -706,7 +844,7 @@ object * region_reader::read() {
 
     while (m_next < m_end) {
         object * curr = reinterpret_cast<object*>(m_next);
-        uint8 tag = lean_ptr_tag(curr);
+        uint8_t tag = lean_ptr_tag(curr);
         if (tag <= LeanMaxCtorTag) {
             fix_constructor(curr);
         } else {

@@ -417,6 +417,7 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps
+  PaperLean.epochMark "frontend.end"
   return some env
 
 end Lean.Elab

@@ -27,8 +27,16 @@ bool find_in_packs(std::string const & fname, std::vector<region_view> const & d
 // Whether `addr` lies in a pack.
 bool in_packs(void const * addr);
 
-// The identity of a file, as packs and bindings record it: device, inode, size, modification and
-// change times.
+// The identity of a file, as packs, bindings, native library manifests and PaperLean's other prepared
+// data record it: inode, size, modification and change times (seconds and nanoseconds). `dev` is always 0:
+// a device number is not a property of the file but of the host's mount (on a network filesystem such as
+// CephFS or NFS the same file has a different `st_dev` on each machine, and local device numbers can
+// change across reboots), so it would make prepared data look changed on every other host. Without it a
+// different file at the same path has the same identity only if it has the same inode, size and both times
+// to the nanosecond; the change time is set by the kernel on every write, rename or `chmod` and cannot be
+// set by users, so that takes a block-level clone of the filesystem, which has the same contents until a
+// change (which sets a new change time). In-process comparisons of two live `stat` results also compare
+// `st_dev` (`same_stat`).
 struct file_identity {
     uint64_t dev, ino, size;
     int64_t mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
@@ -63,6 +71,14 @@ bool packed_module_files(b_obj_arg n, b_obj_arg data, std::vector<std::pair<uint
 struct pack_range { uint64_t checksum, base, size; };
 void for_each_pack_ext_entries(b_obj_arg ext_name, std::function<void(object *)> const & f);
 std::vector<pack_range> loaded_pack_ranges();
+// The range of a loaded pack (`part_names::pack`), as `loaded_pack_ranges` gives it.
+pack_range range_of_loaded_pack(void const * pack);
+// For writing an import image: calls `f(pack index, hashes, count)` with the name table (the hashes
+// of `constNames` and then of `extraConstNames`) of each part of each loaded pack whose table is valid.
+void for_each_pack_name_table(std::function<void(size_t, uint64_t const *, size_t)> const & f);
+// The range that `loaded_pack_ranges` would give for the pack or binding `path` of `LEAN_OLEAN_PACK`;
+// false with `err` if Lean ignores the file as a whole.
+bool pack_range_of_file(std::string const & path, pack_range & r, std::string & err);
 // The import image that this process reads its own imports with, along with the packs that it
 // reads them from where `LEAN_OLEAN_PACK` is not set (`OLeanPack.useForProcess`), if it does so.
 char const * process_import_image();

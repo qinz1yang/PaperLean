@@ -84,9 +84,9 @@ for mode in plain indexed fallback; do
   for n in $(seq 300); do [ -e "$gate.ready" ] && break; sleep .1; done
   [ -e "$gate.ready" ] || { cat "$TMP_DIR/first-$mode.log"; fail "wrapper did not intercept Use"; }
   if [ "$mode" = indexed ]; then
-    grep -q 'paperlean-setup' "$gate.initial" || fail "first invocation did not index"
+    grep -q '\.lake/paperlean-setup/' "$gate.initial" || fail "first invocation did not index"
   else
-    ! grep -q 'paperlean-setup' "$gate.initial" || fail "$mode did not use a complete setup"
+    ! grep -q '\.lake/paperlean-setup/' "$gate.initial" || fail "$mode did not use a complete setup"
   fi
   run env PAPERLEAN_ACCELERATE="$acc" lake run buildUse indexed
   : > "$gate.go"

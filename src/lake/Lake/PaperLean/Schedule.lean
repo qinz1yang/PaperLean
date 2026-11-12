@@ -85,6 +85,9 @@ structure State where
   /-- Per module: its bottom level plus one, or zero if not computed for `memoVersion`. -/
   memo : Array Nat := #[]
   memoVersion : Nat := 0
+  /-- Set while a build prepares part of a package (`Lake.PaperLean.MidBuild`): no slot is given,
+  and the modules that already hold one finish their jobs. -/
+  paused : Bool := false
   /-- The modules waiting for a slot. -/
   waiting : Array (Nat × IO.Promise Unit) := #[]
   /-- The modules about to ask for a slot (`checkComing`). -/
@@ -309,18 +312,21 @@ private def assign (s : State) : Assigned × State := Id.run do
 /-- Assigns `n` slots that became free: the promises of the modules that got one, and the modules for
 which one is kept. -/
 private def assignFreed (n : Nat) (s : State) : (Array (IO.Promise Unit) × Array Nat) × State :=
-  Id.run do
-  let mut s := s
-  let mut ps := #[]
-  let mut kept := #[]
-  for _ in [0:n] do
-    let (a, s') := assign s
-    s := s'
-    match a with
-    | .granted p => ps := ps.push p
-    | .kept i => kept := kept.push i
-    | .free => pure ()
-  return ((ps, kept), s)
+  if s.paused then
+    ((#[], #[]), { s with free := s.free + n })
+  else
+    Id.run do
+      let mut s := s
+      let mut ps := #[]
+      let mut kept := #[]
+      for _ in [0:n] do
+        let (a, s') := assign s
+        s := s'
+        match a with
+        | .granted p => ps := ps.push p
+        | .kept i => kept := kept.push i
+        | .free => pure ()
+      return ((ps, kept), s)
 
 mutual
 /-- Resolves the promises of `assignFreed` and ends the keeping of slots after `keepFor`. -/
@@ -348,9 +354,33 @@ public def Session.request (session : Session) (mod : Module) : BaseIO (Task Uni
     let (i, s) := nodeOf (keyOf mod) (drain s)
     let s := { s with coming := s.coming.erase i, requested := s.requested.set! i true }
     if s.kept.contains i then (true, { s with kept := s.kept.erase i, holding := s.holding.insert i })
-    else if s.free > 0 then (true, { s with free := s.free - 1, holding := s.holding.insert i })
+    else if !s.paused && s.free > 0 then
+      (true, { s with free := s.free - 1, holding := s.holding.insert i })
     else (false, { s with waiting := s.waiting.push (i, p) })
   return if granted then .pure () else p.result!
+
+/-- Stops giving slots: the modules that already hold one finish their jobs, and no new compile
+starts. `Session.idle` says when those are done. Slots kept for other modules go back to `free`. -/
+public def Session.pause (session : Session) : BaseIO Unit :=
+  session.update (dflt := ()) fun s =>
+    ((), { s with paused := true, free := s.free + s.kept.size, kept := {} })
+
+/-- Whether no compile job holds a slot: no `lean` of the build is compiling one of its modules, so
+the files of every module it finished are final (its job ends after `moduleDone`). -/
+public def Session.idle (session : Session) : BaseIO Bool := do
+  let some m := session.state? | return true
+  let s ← m.get
+  return s.holding.isEmpty
+
+/-- Gives slots again after `Session.pause`, to the modules that waited. -/
+public def Session.resume (session : Session) : BaseIO Unit := do
+  let some m := session.state? | return
+  let r ← m.modifyGet fun s =>
+    if s.closed || !s.paused then ((#[], #[]), s)
+    else
+      let (r, s') := assignFreed s.free { s with paused := false, free := 0 }
+      (r, s')
+  wake m r
 
 /-- Settles the module `k` whose job ended, successfully if `ok`: gives back its slot and one kept for
 it to other modules. -/

@@ -16,6 +16,7 @@ import Lake.PaperLean.Schedule
 import Lake.PaperLean.HashCache
 import Lake.PaperLean.SetupIndex
 import Lake.PaperLean.SourceInputScope
+import Lake.PaperLean.MidBuildHook
 
 /-! # Build Runner
 
@@ -400,7 +401,8 @@ def mkBuildContext
     return some (dir, trace)
 }
 
-def Workspace.startBuild
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] def Workspace.startBuild
   (bctx : BuildContext) (build : FetchM α) (caption := "job computation")
 : BaseIO (Job α) := do
   let compute := Job.async build (caption := caption)
@@ -429,10 +431,12 @@ private def withPaperLeanBuildState (ws : Workspace) (ctx : BuildContext) (enabl
   let compile := enable && !ctx.noBuild
   let scheduler ← PaperLean.Schedule.startFor ctx ws.dir compile
   PaperLean.BuildData.startFor ctx ws.dir compile
+  PaperLean.MidBuildHook.start ctx ws scheduler compile
   PaperLean.HashCache.startFor ctx ws.dir enable
   PaperLean.SetupIndex.beginRun ctx ws enable
   try PaperLean.SourceInputScope.withRun ctx enable act finally
     PaperLean.SetupIndex.endRun ctx
+    PaperLean.MidBuildHook.finish ctx
     PaperLean.BuildData.finishFor ctx
     PaperLean.HashCache.finishFor ctx
     PaperLean.Schedule.finishFor ctx scheduler
@@ -442,7 +446,8 @@ Run a build function in the Workspace's context using the provided configuration
 Reports incremental build progress and build logs. In quiet mode, only reports
 failing build jobs (e.g., when using `-q` or non-verbose `--no-build`).
 -/
-public def Workspace.runFetchM
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def Workspace.runFetchM
   (ws : Workspace) (build : FetchM α) (cfg : BuildConfig := {}) (caption := "job computation")
 : IO α := do
   let jobs ← mkJobQueue
@@ -486,7 +491,8 @@ Returns whether a build is needed to validate `build`. Does not report on the at
 
 This is equivalent to checking whether `lake build --no-build` exits with code 0.
 -/
-public def Workspace.checkNoBuild
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] public def Workspace.checkNoBuild
   (ws : Workspace) (build : FetchM (Job α))
 : BaseIO Bool := do
   let jobs ← mkJobQueue

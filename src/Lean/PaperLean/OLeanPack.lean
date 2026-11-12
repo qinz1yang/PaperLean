@@ -38,7 +38,7 @@ Setting `LEAN_OLEAN_PACK` to the pack (or to a `:`-separated list of packs) make
 per process and read these files from it, except for those that changed since packing: those, and
 the other parts of the same module, are read from disk. A pack written by a different version or
 build, whose header is damaged, or that changed since it was written (the small file
-`identityFile out` next to it records the file's device, inode, size and times, compared with one
+`identityFile out` next to it records the file's inode, size and times, compared with one
 `stat`, so a copy of a pack is not used either), is ignored with a warning, and so are the damaged
 entries of its index, which Lean finds by checksums of the parts of the index that it uses. As for
 `.olean` files under official Lean, damage to its regions that leaves the file's metadata alone is
@@ -142,6 +142,12 @@ pack in use). Lean compares the image's modification time with the one its write
 checks the parts of the tables that it uses by their checksums. -/
 @[extern "lean_paperlean_import_image_verify"]
 public opaque verifyImportImage (image : @& String) : IO String
+
+/-- Why `lean` would ignore the import image `image` as belonging to other packs than those of the
+`LEAN_OLEAN_PACK` list `packs` (a pack rebuilt under the same name has another checksum or address
+range), or "" if it would not. -/
+@[extern "lean_paperlean_import_image_pack_mismatch"]
+public opaque importImagePackMismatch (image packs : @& String) : BaseIO String
 
 /-- The pack content hash of these exact bytes, or the empty string on unsupported platforms. -/
 @[extern "lean_paperlean_hash_bytes"]

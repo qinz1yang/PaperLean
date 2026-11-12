@@ -25,8 +25,8 @@ A proof that exhausts Lean’s heartbeat budget may pass in PaperLean. The guara
 ## How to use
 
 ```bash
-elan toolchain install qinz1yang/PaperLean:v0.2.3-lean4.35.0-rc3
-elan run qinz1yang/PaperLean:v0.2.3-lean4.35.0-rc3 paperlean install
+elan toolchain install qinz1yang/PaperLean:v0.2.4-lean4.35.0-rc3
+elan run qinz1yang/PaperLean:v0.2.4-lean4.35.0-rc3 paperlean install
 ```
 
 In a project on Lean `v4.35.0-rc3`:

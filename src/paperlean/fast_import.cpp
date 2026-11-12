@@ -4,6 +4,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 */
 #include <algorithm>
 #include <vector>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include "runtime/object.h"
 #include "runtime/apply.h"
 #include "runtime/io.h"
+#include "runtime/thread.h"
 #include "paperlean/fast_import.h"
 
 /*
@@ -60,6 +62,28 @@ timing_point timing_now() {
 }
 bool g_import_timing = getenv("PAPERLEAN_IMPORT_TIMING") != nullptr;
 timing_point g_last_timing = timing_now();
+}
+
+namespace {
+// `Lean.PaperLean.builtinRegistrationsDeferred`: set only by the `lean` executable around
+// `lean_initialize` (`src/util/shell.cpp`), cleared by `flushBuiltinRegistrations`.
+std::atomic<bool> g_defer_builtin_registrations{false};
+}
+
+/* builtinRegistrationsDeferred : BaseIO Bool */
+extern "C" LEAN_EXPORT uint8 lean_paperlean_builtin_registrations_deferred() {
+    return g_defer_builtin_registrations.load(std::memory_order_acquire);
+}
+
+/* endBuiltinRegistrationDeferral : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_end_builtin_registration_deferral() {
+    g_defer_builtin_registrations.store(false, std::memory_order_release);
+    return lean_box(0);
+}
+
+// Called by the `lean` executable before it initializes Lean's library.
+extern "C" LEAN_EXPORT void lean_paperlean_defer_builtin_registrations() {
+    g_defer_builtin_registrations.store(true, std::memory_order_release);
 }
 
 /* importMode : BaseIO UInt8 -- 0: fast, 1: legacy, 2: check */
@@ -127,6 +151,23 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_uncounted(obj_arg f, obj_arg a, ob
                                                         obj_arg c) {
     uncounted_heartbeats uncounted;
     return apply_3(f, a, b, c);
+}
+
+/* With `PAPERLEAN_IMPORT_TIMING`, the wall-clock time (seconds since the epoch) at which this process
+   reached `phase`, to compare with the time a caller saw it end (e.g. the time after its outputs are
+   written). */
+void timing_epoch_mark(char const * phase) {
+    if (!g_import_timing) return;
+    timespec r;
+    clock_gettime(CLOCK_REALTIME, &r);
+    fprintf(stderr, "paperlean-epoch %s realtime=%.6f\n", phase, r.tv_sec + r.tv_nsec / 1e9);
+    fflush(stderr);
+}
+
+/* epochMark (phase : @& String) : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_paperlean_epoch_mark(b_obj_arg phase) {
+    timing_epoch_mark(lean_string_cstr(phase));
+    return lean_box(0);
 }
 
 /* importTimingMark (phase : @& String) : BaseIO Unit
@@ -248,6 +289,9 @@ public:
                     n->m_rc = 1;
         m_persistent = false;
     }
+    size_t count() const { return m_size; }
+    void set_count(size_t n) { m_size = n; }
+    size_t num_buckets() const { return m_nbuckets; }
     // Makes the map a valid map of the entries so far.
     object * sync() {
         lean_object * old = lean_ctor_get(m_raw, 0);
@@ -287,30 +331,41 @@ public:
     }
 };
 
+// The value of `trusted_pack` with which name sources trust the packs of the import image in use.
+char const g_image_packs_trusted_tag = 0;
+void const * const g_image_packs_trusted = &g_image_packs_trusted_tag;
+
 // The names one module data contributes: their hashes come from its pack's name table if the table
-// is trusted, which holds for the parts of a single pack, the first one met. A name of a trusted
-// table that `is_single` in it can only have an equal key in the map if some untrusted name has its
-// hash; the hashes of all untrusted names are collected beforehand.
+// is trusted. Without an import image, that holds for the parts of a single pack, the first one met.
+// With an import image, it holds for the parts of all packs that the image describes (and only for
+// them): the image records the hashes that occur in more than one of these packs. A name of a trusted
+// table that `is_single` in it (and, with the image, whose hash is in no other of its packs) can only
+// have an equal key in the map if some untrusted name has its hash; the hashes of all untrusted names
+// are collected beforehand.
 struct name_source {
     object * m_names;
     part_names m_table;
     bool m_trusted = false;
     bool m_packed = false;
+    bool m_image = false;   // trusted as a pack of the import image
     size_t m_offset = 0;    // index of `m_names[0]` in the table
     name_source(object * data, object * names, bool extra, void const *& trusted_pack) : m_names(names) {
         m_packed = packed_part_names(data, m_table);
-        if (m_packed && m_table.hashes && (!trusted_pack || trusted_pack == m_table.pack)) {
+        if (!m_packed || !m_table.hashes) return;
+        if (trusted_pack == g_image_packs_trusted) {
+            m_image = m_trusted = image_covers_pack(m_table.pack);
+        } else if (!trusted_pack || trusted_pack == m_table.pack) {
             trusted_pack = m_table.pack;
             m_trusted = true;
-            m_offset = extra ? m_table.num_const_names : 0;
         }
+        if (m_trusted) m_offset = extra ? m_table.num_const_names : 0;
     }
     uint64_t hash(size_t k) const {
         return m_trusted ? m_table.hashes[m_offset + k] : lean_name_hash(lean_array_get_core(m_names, k));
     }
     // Whether name `k`, of hash `h`, cannot have an equal key in the map.
     bool fresh(size_t k, uint64_t h, hash_set const & untrusted) const {
-        return m_trusted && m_table.is_single(m_offset + k) && !untrusted.contains(h);
+        return m_trusted && m_table.is_single(m_offset + k) && !untrusted.contains(h) && !(m_image && image_name_conflict(h));
     }
     void add_untrusted(size_t count, hash_set & untrusted) const {
         if (!m_trusted)
@@ -329,6 +384,8 @@ object * module_constant_names(object * data) { object * n, * c, * e; module_dat
 object * module_constants(object * data) { object * n, * c, * e; module_data_arrays(data, &n, &c, &e); return c; }
 object * module_extra_const_names(object * data) { object * n, * c, * e; module_data_arrays(data, &n, &c, &e); return e; }
 size_t num_constants(object * data) {
+    size_t n = 0;
+    if (packed_part_num_constants(data, n)) return n;
     return std::min(lean_array_size(module_constant_names(data)), lean_array_size(module_constants(data)));
 }
 
@@ -362,7 +419,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_build_private_constant_maps(b_obj_
     size_t nmods = lean_array_size(module_data);
     size_t nconsts = 0, nextra = 0;
     bool all_persistent = true;
-    void const * trusted_pack = nullptr;
+    void const * trusted_pack = image_in_use() ? g_image_packs_trusted : nullptr;
     std::vector<name_source> sources, extra_sources;
     hash_set untrusted;
     for (size_t m = 0; m < nmods; m++) {
@@ -466,10 +523,13 @@ buildPublicConstantMap (datas : @& Array ModuleData) (capacity : @& Nat) (persis
 
 The fold over the public module data of the exported modules, in order.
 */
-extern "C" LEAN_EXPORT obj_res lean_paperlean_build_public_constant_map(b_obj_arg datas, b_obj_arg ocap, uint8 persistent) {
+namespace {
+// The public constant map for `buildPublicConstantMap`, or `nullptr` if the capacity is out of range.
+// Its nodes are persistent only after `finish` (if `persistent`): until then `discard_map` frees it.
+object * build_public_map(b_obj_arg datas, b_obj_arg ocap, bool persistent, bool finish) {
     size_t n = 0;
     bool all_persistent = true;
-    void const * trusted_pack = nullptr;
+    void const * trusted_pack = image_in_use() ? g_image_packs_trusted : nullptr;
     std::vector<name_source> sources;
     hash_set untrusted;
     for (size_t m = 0; m < lean_array_size(datas); m++) {
@@ -481,7 +541,7 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_build_public_constant_map(b_obj_ar
         sources.back().add_untrusted(num_constants(data), untrusted);
     }
     if (!lean_is_scalar(ocap) || !map_builder::fits(lean_unbox(ocap), n))
-        return lean_box(0);
+        return nullptr;
     object * pub = mk_empty_map(lean_unbox(ocap));
     map_builder pm(pub, persistent && all_persistent, !all_persistent);
     size_t pb[g_batch];
@@ -516,7 +576,272 @@ extern "C" LEAN_EXPORT obj_res lean_paperlean_build_public_constant_map(b_obj_ar
             }
         }
     }
-    pm.finish();
-    return mk_some(pm.sync());
+    if (finish) pm.finish();
+    return pm.sync();
+}
+}
+
+extern "C" LEAN_EXPORT obj_res lean_paperlean_build_public_constant_map(b_obj_arg datas, b_obj_arg ocap, uint8 persistent) {
+    object * pub = build_public_map(datas, ocap, persistent, true);
+    return pub ? mk_some(pub) : lean_box(0);
+}
+
+// =======================================
+// Constant maps on several threads
+//
+// The private constant map, `const2ModIdx` and the public constant map are independent folds over
+// the same module data (`const2ModIdx` takes a name if it has no equal key yet, whatever the private
+// map does with its constant). When all keys and values are persistent and module indices are
+// scalars, building them touches no reference counts of shared objects, so `const2ModIdx` and the
+// public map are built on their own threads while the calling thread builds the private map. Each
+// map is then exactly what its fold builds. If the private fold fails (`throwAlreadyImported`), the
+// maps are dropped and `finalizeImport`'s folds run instead, so that the error and its maps are
+// those of the fold.
+
+namespace {
+// Whether this process builds the maps on several threads (`PAPERLEAN_IMPORT_THREADS=0`: no).
+bool const g_import_threads = [] {
+    char const * v = getenv("PAPERLEAN_IMPORT_THREADS");
+    return !(v && strcmp(v, "0") == 0);
+}();
+// Below this many constants, starting threads costs more than it saves.
+constexpr size_t g_min_parallel_constants = 16384;
+
+// Frees a map built by `map_builder` before `finish`: each node is referenced once.
+void discard_map(object * raw) {
+    object * buckets = lean_ctor_get(raw, 1);
+    object ** slots = lean_array_cptr(buckets);
+    for (size_t i = 0; i < lean_array_size(buckets); i++)
+        for (object * n = slots[i]; !lean_is_scalar(n); n = lean_ctor_get(n, 2))
+            n->m_rc = 1;
+    lean_dec(raw);
+}
+
+// A thread that is joined when it goes out of scope.
+class joined_thread {
+    std::unique_ptr<lthread> m_thread;
+public:
+    explicit joined_thread(std::function<void()> const & f) : m_thread(new lthread(f)) {}
+    void join() { if (m_thread) { m_thread->join(); m_thread.reset(); } }
+    ~joined_thread() { try { join(); } catch (...) {} }
+};
+
+// `const2ModIdx` alone (persistent nodes, scalar module indices), for the buckets in `[lo, hi)`: the
+// names are visited in the order of the fold and each bucket gets its insertions in that order, so
+// that threads building disjoint bucket ranges of one map build exactly the fold's map.
+void build_c2m_alone(map_builder & cm, b_obj_arg module_data, b_obj_arg ir_data,
+                     std::vector<name_source> const & sources, std::vector<name_source> const & extra_sources,
+                     hash_set const & untrusted, size_t lo, size_t hi) {
+    size_t nmods = lean_array_size(module_data);
+    size_t cb[g_batch], idx[g_batch];
+    bool fresh[g_batch];
+    for (size_t m = 0; m < nmods; m++) {
+        object * data = lean_array_get_core(module_data, m);
+        object * names = module_constant_names(data);
+        name_source const & src = sources[m];
+        size_t k = num_constants(data);
+        object * midx = lean_box(m);
+        for (size_t j0 = 0; j0 < k; j0 += g_batch) {
+            size_t n = std::min(g_batch, k - j0);
+            size_t c = 0;   // the batch's names in range
+            for (size_t t = 0; t < n; t++) {
+                uint64_t h = src.hash(j0 + t);
+                size_t b = cm.bucket(h);
+                if (b < lo || b >= hi) continue;
+                idx[c] = j0 + t; cb[c] = b;
+                fresh[c] = src.fresh(j0 + t, h, untrusted);
+                cm.prefetch(b);
+                c++;
+            }
+            for (size_t t = 0; t < c; t++) if (!fresh[t]) cm.prefetch_head(cb[t]);
+            for (size_t t = 0; t < c; t++) if (!fresh[t]) cm.prefetch_key(cb[t]);
+            for (size_t t = 0; t < c; t++) {
+                object * name = lean_array_get_core(names, idx[t]);
+                if (fresh[t] || !cm.find(cb[t], name))
+                    cm.cons(cb[t], name, midx);
+            }
+        }
+        if (m < lean_array_size(ir_data)) {
+            object * extra = module_extra_const_names(lean_array_get_core(ir_data, m));
+            name_source const & esrc = extra_sources[m];
+            for (size_t j = 0; j < lean_array_size(extra); j++) {
+                uint64_t h = esrc.hash(j);
+                size_t i = cm.bucket(h);
+                if (i < lo || i >= hi) continue;
+                object * name = lean_array_get_core(extra, j);
+                if (esrc.fresh(j, h, untrusted) || !cm.find(i, name))
+                    cm.cons(i, name, midx);
+            }
+        }
+    }
+}
+
+// The private constant map alone; false if the fold fails.
+bool build_private_alone(map_builder & pm, b_obj_arg module_data, std::vector<name_source> const & sources,
+                         hash_set const & untrusted) {
+    size_t nmods = lean_array_size(module_data);
+    size_t pb[g_batch];
+    bool fresh[g_batch];
+    for (size_t m = 0; m < nmods; m++) {
+        object * data = lean_array_get_core(module_data, m);
+        object * names = module_constant_names(data);
+        object * consts = module_constants(data);
+        name_source const & src = sources[m];
+        size_t k = num_constants(data);
+        for (size_t j0 = 0; j0 < k; j0 += g_batch) {
+            size_t n = std::min(g_batch, k - j0);
+            for (size_t t = 0; t < n; t++) {
+                uint64_t h = src.hash(j0 + t);
+                fresh[t] = src.fresh(j0 + t, h, untrusted);
+                pb[t] = pm.bucket(h); pm.prefetch(pb[t]);
+            }
+            for (size_t t = 0; t < n; t++) if (!fresh[t]) pm.prefetch_head(pb[t]);
+            for (size_t t = 0; t < n; t++) if (!fresh[t]) pm.prefetch_key(pb[t]);
+            for (size_t t = 0; t < n; t++) {
+                object * name = lean_array_get_core(names, j0 + t);
+                object * cinfo = lean_array_get_core(consts, j0 + t);
+                if (fresh[t]) {
+                    pm.cons(pb[t], name, cinfo);
+                } else if (object * prev_node = pm.find(pb[t], name)) {
+                    uint8 r = resolve_duplicate(pm, cinfo, lean_ctor_get(prev_node, 1), true);
+                    if (r == 1)
+                        pm.replace(prev_node, name, cinfo);
+                    else if (r == 2)
+                        return false;
+                } else {
+                    pm.cons(pb[t], name, cinfo);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool arrays_persistent(b_obj_arg datas) {
+    for (size_t m = 0; m < lean_array_size(datas); m++) {
+        object * data = lean_array_get_core(datas, m);
+        if (!lean_is_persistent(module_constant_names(data)) || !lean_is_persistent(module_constants(data)))
+            return false;
+    }
+    return true;
+}
+}
+
+/*
+buildConstantMaps (moduleData irData publicDatas : @& Array ModuleData)
+  (privateCapacity c2mCapacity publicCapacity : @& Nat) (persistent buildPublic : Bool) :
+  Option (Std.HashMap Name ConstantInfo × Std.HashMap Name ModuleIdx × Option (Nat × Name)) ×
+    Option (Std.HashMap Name ConstantInfo)
+
+`buildPrivateConstantMaps` and, with `buildPublic`, `buildPublicConstantMap` of `publicDatas`, built
+concurrently where that is possible. The public map is `none` if it was not built here (the caller
+builds it then). Both are `none` if the private fold fails on the concurrent path (the caller folds).
+*/
+extern "C" LEAN_EXPORT obj_res lean_paperlean_build_constant_maps(b_obj_arg module_data, b_obj_arg ir_data,
+                                                                 b_obj_arg public_datas, b_obj_arg opriv_cap,
+                                                                 b_obj_arg oc2m_cap, b_obj_arg opub_cap,
+                                                                 uint8 persistent, uint8 build_public) {
+    size_t nmods = lean_array_size(module_data);
+    size_t nconsts = 0, nextra = 0;
+    for (size_t m = 0; m < nmods; m++) {
+        nconsts += num_constants(lean_array_get_core(module_data, m));
+        if (m < lean_array_size(ir_data))
+            nextra += lean_array_size(module_extra_const_names(lean_array_get_core(ir_data, m)));
+    }
+    bool parallel = g_import_threads && persistent && nmods <= LEAN_MAX_SMALL_NAT &&
+        nconsts >= g_min_parallel_constants && lean_is_scalar(opriv_cap) && lean_is_scalar(oc2m_cap) &&
+        map_builder::fits(lean_unbox(opriv_cap), nconsts) && map_builder::fits(lean_unbox(oc2m_cap), nconsts + nextra) &&
+        arrays_persistent(module_data);
+    for (size_t m = 0; parallel && m < std::min(nmods, lean_array_size(ir_data)); m++)
+        parallel = lean_is_persistent(module_extra_const_names(lean_array_get_core(ir_data, m)));
+#if !defined(LEAN_MULTI_THREAD)
+    parallel = false;
+#endif
+    if (!parallel) {
+        object * priv = lean_paperlean_build_private_constant_maps(module_data, ir_data, opriv_cap, oc2m_cap, persistent);
+        return mk_pair(priv, lean_box(0));
+    }
+    // Every key and value is persistent, so new nodes are persistent and nothing is counted.
+    void const * trusted_pack = image_in_use() ? g_image_packs_trusted : nullptr;
+    std::vector<name_source> sources, extra_sources;
+    hash_set untrusted;
+    for (size_t m = 0; m < nmods; m++) {
+        object * data = lean_array_get_core(module_data, m);
+        sources.emplace_back(data, module_constant_names(data), false, trusted_pack);
+        sources.back().add_untrusted(num_constants(data), untrusted);
+        if (m < lean_array_size(ir_data)) {
+            object * ir = lean_array_get_core(ir_data, m);
+            extra_sources.emplace_back(ir, module_extra_const_names(ir), true, trusted_pack);
+            extra_sources.back().add_untrusted(lean_array_size(module_extra_const_names(ir)), untrusted);
+        }
+    }
+    timing_mark("constants.fast.sources");
+    bool public_here = build_public && arrays_persistent(public_datas);
+    object * pub = nullptr;
+    object * c2m = nullptr;
+    size_t c2m_cap = lean_unbox(oc2m_cap);
+    // (with `PAPERLEAN_IMPORT_TIMING`, the helpers' own durations in ms: c2m halves, public)
+    double t_c2m[2] = { 0, 0 }, t_pub = 0;
+    size_t c2m_count[2] = { 0, 0 };
+    auto ms_since = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    // `const2ModIdx` is built by two threads, each for half of its buckets
+    c2m = mk_empty_map(c2m_cap);
+    size_t c2m_buckets = map_builder(c2m, true, false).num_buckets();
+    std::unique_ptr<joined_thread> pub_thread, c2m_thread[2];
+    try {
+        if (public_here)
+            pub_thread.reset(new joined_thread([&] {
+                auto t0 = std::chrono::steady_clock::now();
+                pub = build_public_map(public_datas, opub_cap, true, false);
+                t_pub = ms_since(t0);
+            }));
+        for (int half = 0; half < 2; half++)
+            c2m_thread[half].reset(new joined_thread([&, half] {
+                auto t0 = std::chrono::steady_clock::now();
+                map_builder cm(c2m, true, false);
+                size_t mid = c2m_buckets / 2;
+                build_c2m_alone(cm, module_data, ir_data, sources, extra_sources, untrusted,
+                                half == 0 ? 0 : mid, half == 0 ? mid : c2m_buckets);
+                c2m_count[half] = cm.count();
+                t_c2m[half] = ms_since(t0);
+            }));
+    } catch (...) {
+        // no threads: build them one after the other
+        for (auto & t : c2m_thread) if (t) t->join();
+        if (pub_thread) pub_thread->join();
+        if (pub) discard_map(pub);
+        discard_map(c2m);
+        object * priv = lean_paperlean_build_private_constant_maps(module_data, ir_data, opriv_cap, oc2m_cap, persistent);
+        return mk_pair(priv, lean_box(0));
+    }
+    object * priv = mk_empty_map(lean_unbox(opriv_cap));
+    timing_mark("constants.fast.count");
+    map_builder pm(priv, true, false);
+    bool ok = build_private_alone(pm, module_data, sources, untrusted);
+    pm.sync();
+    timing_mark("constants.fast.build");
+    for (auto & t : c2m_thread) t->join();
+    if (pub_thread) pub_thread->join();
+    timing_mark("constants.fast.join");
+    {
+        map_builder cm(c2m, true, false);
+        cm.set_count(c2m_count[0] + c2m_count[1]);
+        cm.sync();
+    }
+    if (import_timing_enabled())
+        fprintf(stderr, "paperlean-counter constants.threads c2m_lo=%.3f c2m_hi=%.3f public=%.3f\n",
+                t_c2m[0], t_c2m[1], t_pub);
+    if (!ok) {
+        discard_map(priv);
+        discard_map(c2m);
+        if (pub) discard_map(pub);
+        return mk_pair(lean_box(0), lean_box(0));
+    }
+    map_builder(priv, true, false).finish();
+    map_builder(c2m, true, false).finish();
+    if (pub) map_builder(pub, true, false).finish();
+    return mk_pair(mk_some(mk_pair(priv, mk_pair(c2m, lean_box(0)))), pub ? mk_some(pub) : lean_box(0));
 }
 }

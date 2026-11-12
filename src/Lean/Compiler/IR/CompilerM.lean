@@ -182,6 +182,18 @@ private def findInterpDecl (env : Environment) (declName : Name) : Option Decl :
     if PaperLean.envRecording declName then findLocalRecorded env declName else
     declMapExt.getState env |>.find? declName
 
+/-- The declaration of an imported constant, from the tables that `findEnvDecl` and the
+interpreter's `findInterpDecl` search first; `none` if `declName` is not one of an imported module. -/
+@[export lean_ir_find_imported_env_decl]
+private def findImportedInterpDecl (env : Environment) (declName : Name) : Option Decl :=
+  match env.getModuleIdxFor? declName with
+  | some modIdx =>
+    if modIdx.toNat < env.header.modules.size then
+      findAtSorted? (declMapExt.getModuleIREntries env modIdx) declName <|>
+      findAtSorted? (declMapExt.getModuleEntries env modIdx) declName
+    else none
+  | none => none
+
 /-- Like ``findInterpDecl env (declName ++ `_boxed)`` but with optimized negative lookup. -/
 @[export lean_ir_find_env_decl_boxed]
 private def findInterpDeclBoxed (env : Environment) (declName : Name) : Option Decl :=
@@ -250,6 +262,12 @@ def containsDecl' (n : Name) (decls : Array Decl) : CompilerM Bool := do
 def getDecl' (n : Name) (decls : Array Decl) : CompilerM Decl := do
   let (some decl) ← findDecl' n decls | throwError s!"unknown declaration `{n}`"
   return decl
+
+/-- The `sorryDep?` of a declaration, as `getSorryDep` reads it from the declaration it finds. -/
+@[export lean_ir_decl_sorry_dep]
+private def declSorryDep? : Decl → Option Name
+  | .fdecl (info := { sorryDep? := dep?, .. }) .. => dep?
+  | _ => none
 
 @[export lean_decl_get_sorry_dep]
 def getSorryDep (env : Environment) (declName : Name) : Option Name :=

@@ -91,6 +91,11 @@ structure KeyedDeclsAttribute (γ : Type) where
 
 namespace KeyedDeclsAttribute
 
+/-- PaperLean: the pending builtin entries of each `KeyedDeclsAttribute`, keyed by the index of the
+attribute's environment extension.  They are kept in this global registry rather than in the
+structure so that the layout of `KeyedDeclsAttribute` stays exactly upstream's. -/
+private builtin_initialize builtinEntriesRegistry : IO.Ref (SMap Nat NonScalar) ← IO.mkRef {}
+
 private def Table.insert (table : Table γ) (v : AttributeEntry γ) : Table γ :=
   match table.find? v.key with
   | some vs => SMap.insert table v.key (v::vs)
@@ -103,10 +108,37 @@ def ExtensionState.insert (s : ExtensionState γ) (v : AttributeEntry γ) :  Ext
   erased     := s.erased.erase v.declName
 }
 
+/-- PaperLean: the environment-extension index under which `init` stores an attribute's pending
+list. -/
+private def extensionIdx (attr : KeyedDeclsAttribute γ) : Nat :=
+  attr.ext.ext.toEnvExtension.idx
+
+/-- PaperLean: record the pending list of an attribute whose extension has just been registered. -/
+private unsafe def registerBuiltinEntries (idx : Nat)
+    (entriesRef : IO.Ref (List (AttributeEntry γ))) : IO Unit :=
+  builtinEntriesRegistry.modify fun registry => registry.insert idx (unsafeCast entriesRef)
+
+/-- PaperLean: while builtin registrations are deferred (`PaperLean.builtinRegistrationsDeferred`:
+only while the `lean` executable initializes Lean's own library), cons a builtin entry onto its
+attribute's pending list, which `PaperLean.flushBuiltinRegistrations` folds into `tableRef` in
+registration order before any other code runs. A `modify` of `tableRef`, a persistent reference,
+marks and copies the whole table, which made registering Lean's builtin entries quadratic. An
+attribute without a pending list (not created by `init`) is updated directly. -/
+private unsafe def addPendingBuiltin (attr : KeyedDeclsAttribute γ) (entry : AttributeEntry γ) : IO Unit := do
+  match (← builtinEntriesRegistry.get).find? (extensionIdx attr) with
+  | some entriesRef =>
+    let entriesRef : IO.Ref (List (AttributeEntry γ)) := unsafeCast entriesRef
+    entriesRef.modify fun entries => entry :: entries
+  | none => attr.tableRef.modify fun m => m.insert entry
+
 -- PaperLean: (not inlined: its body calls PaperLean's code)
 @[noinline] def addBuiltin (attr : KeyedDeclsAttribute γ) (key : Key) (declName : Name) (value : γ) : IO Unit := do
   PaperLean.Speculation.checkBuiltinRegistration declName (← initializing)
-  attr.tableRef.modify fun m => m.insert { key, declName, value, isBuiltin := true }
+  let entry : AttributeEntry γ := { key, declName, value, isBuiltin := true }
+  if (← PaperLean.builtinRegistrationsDeferred) then
+    unsafe addPendingBuiltin attr entry
+  else
+    attr.tableRef.modify fun m => m.insert entry
 
 def mkStateOfTable (table : Table γ) : ExtensionState γ := {
   table
@@ -119,11 +151,21 @@ def ExtensionState.erase (s : ExtensionState γ) (attrName : Name) (declName : N
   return { s with erased := s.erased.insert declName, declNames := s.declNames.erase declName }
 
 /-- safety: requires that `mkConst df.valueTypeName _` and `γ` are definitionally equal. -/
-protected unsafe def init {γ} (df : Def γ) (attrDeclName : Name := by exact decl_name%) : IO (KeyedDeclsAttribute γ) := do
+-- PaperLean: (not inlined: its body calls PaperLean's code)
+@[noinline] protected unsafe def init {γ} (df : Def γ) (attrDeclName : Name := by exact decl_name%) : IO (KeyedDeclsAttribute γ) := do
   let tableRef ← IO.mkRef ({} : Table γ)
+  -- PaperLean: the builtin entries registered while registrations are deferred (`addBuiltin`), and
+  -- their fold into `tableRef` in registration order (the inserts `addBuiltin` would have done)
+  let builtinEntriesRef ← IO.mkRef ([] : List (AttributeEntry γ))
+  let flushBuiltinEntries : IO Unit := do
+    let entries ← builtinEntriesRef.swap []
+    unless entries.isEmpty do
+      tableRef.modify fun table => entries.reverse.foldl (init := table) Table.insert
   let ext : Extension γ ← registerScopedEnvExtension {
     name         := attrDeclName
-    mkInitial    := return mkStateOfTable (← tableRef.get)
+    mkInitial    := do
+      flushBuiltinEntries
+      return mkStateOfTable (← tableRef.get)
     ofOLeanEntry := fun _ entry => do
       let ctx ← read
       match ctx.env.evalConstCheck γ ctx.opts df.valueTypeName entry.declName with
@@ -132,6 +174,8 @@ protected unsafe def init {γ} (df : Def γ) (attrDeclName : Name := by exact de
     addEntry     := fun s e => s.insert e
     toOLeanEntry := (·.toOLeanEntry)
   }
+  registerBuiltinEntries ext.ext.toEnvExtension.idx builtinEntriesRef
+  PaperLean.builtinRegistrationFlushes.modify (·.push flushBuiltinEntries)
   unless df.builtinName.isAnonymous do
     registerBuiltinAttribute {
       ref   := attrDeclName

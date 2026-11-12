@@ -191,6 +191,13 @@ fn_body const & decl_fun_body(decl const & b) {
     return cnstr_get_ref_t<fn_body>(b, 3);
 }
 
+// `IR.getSorryDep` of this declaration: the `sorryDep?` of its `DeclInfo`, which only an `fdecl` has
+// (read by Lean, which knows the declaration's object layout).
+extern "C" object * lean_ir_decl_sorry_dep(object * d);
+optional<name> decl_sorry_dep(decl const & d) {
+    return option_ref<name>(lean_ir_decl_sorry_dep(d.to_obj_arg())).get();
+}
+
 extern "C" object * lean_ir_find_env_decl(object * env, object * n);
 option_ref<decl> find_ir_decl(elab_environment const & env, name const & n) {
     return option_ref<decl>(lean_ir_find_env_decl(env.to_obj_arg(), n.to_obj_arg()));
@@ -199,6 +206,13 @@ option_ref<decl> find_ir_decl(elab_environment const & env, name const & n) {
 extern "C" object * lean_ir_find_env_decl_boxed(object * env, object * n);
 option_ref<decl> find_ir_decl_boxed(elab_environment const & env, name const & n) {
     return option_ref<decl>(lean_ir_find_env_decl_boxed(env.to_obj_arg(), n.to_obj_arg()));
+}
+
+// The declaration of an imported module constant, from the module tables that `get_sorry_dep` and
+// `get_decl` both search; `none` for a constant of the current module, which keeps the old paths.
+extern "C" object * lean_ir_find_imported_env_decl(object * env, object * n);
+option_ref<decl> find_imported_ir_decl(elab_environment const & env, name const & n) {
+    return option_ref<decl>(lean_ir_find_imported_env_decl(env.to_obj_arg(), n.to_obj_arg()));
 }
 
 extern "C" double lean_float_of_nat(lean_obj_arg a);
@@ -885,7 +899,9 @@ private:
         return m_shared_key;
     }
 
-    symbol_cache_entry lookup_symbol(name const & fn) {
+    // `hint`, if given, is the declaration of `fn` (an imported module constant), which the caller
+    // found with the same module tables; it saves the second lookup.
+    symbol_cache_entry lookup_symbol(name const & fn, decl const * hint = nullptr) {
         auto e = m_symbol_cache.find(fn);
         if (e != m_symbol_cache.end()) {
             return e->second;
@@ -899,7 +915,7 @@ private:
             m_symbol_cache.insert({ fn, e_new });
             return e_new;
         }
-        decl d = get_decl(fn);
+        decl d = hint ? *hint : get_decl(fn);
         auto found = [&](native_symbol_cache_entry n) {
             symbol_cache_entry e_new { d, filter(fn, n) };
             m_symbol_cache.insert({ fn, e_new });
@@ -1153,8 +1169,8 @@ public:
      *  * takes (owned) `object *`s instead of `arg`s.
      *  * supports under- and over-application.
      *  * supports "calling" (evaluating) nullary constants. */
-    object * call_boxed(name const & fn, unsigned n, object ** args) {
-        symbol_cache_entry e = lookup_symbol(fn);
+    object * call_boxed(name const & fn, unsigned n, object ** args, decl const * hint = nullptr) {
+        symbol_cache_entry e = lookup_symbol(fn, hint);
         unsigned arity = decl_params(e.m_decl).size();
         object * r;
         if (arity == 0) {
@@ -1246,6 +1262,20 @@ optional<name> get_sorry_dep(elab_environment const & env, name const & n) {
 }
 
 object * run_boxed(elab_environment const & env, options const & opts, name const & fn, unsigned n, object **args) {
+    // An imported constant: the declaration that `getSorryDep` inspects is the one the interpreter
+    // would find, so one lookup serves both.
+    option_ref<decl> imported = find_imported_ir_decl(env, fn);
+    if (imported) {
+        decl imported_decl = imported.get_val();
+        optional<name> decl_with_sorry = decl_sorry_dep(imported_decl);
+        if (decl_with_sorry) {
+            throw exception(sstream() << "cannot evaluate code because '" << *decl_with_sorry
+                << "' uses 'sorry' and/or contains errors");
+        }
+        return interpreter::with_interpreter<object *>(env, opts, fn, [&](interpreter & interp) {
+            return interp.call_boxed(fn, n, args, &imported_decl);
+        });
+    }
     if (optional<name> decl_with_sorry = get_sorry_dep(env, fn)) {
         throw exception(sstream() << "cannot evaluate code because '" << *decl_with_sorry
             << "' uses 'sorry' and/or contains errors");

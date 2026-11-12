@@ -49,6 +49,8 @@ static inline uint64_t mix64(uint64_t x) {
 // key test used throughout the file.  Without mimalloc, compacted objects are malloc-backed while
 // heap objects either have a reference count or have `m_cs_sz == 0`; a persistent compacted object
 // is recognizable by `m_rc == 0` and `m_cs_sz != 0`.
+extern "C" uint8_t lean_paperlean_in_pack_dense_area(lean_object * o);
+
 static inline bool is_heap_object(lean_object * o) {
 #ifdef LEAN_MIMALLOC
     return mi_is_in_heap_region(o);
@@ -387,6 +389,10 @@ static bool local_equal(lean_object * a, lean_object * b, bool strict, std::stri
 
     switch (ta) {
     case LeanArray: {
+        if (lean_array_is_marked_linear(a) != lean_array_is_marked_linear(b)) {
+            why = "array linearity mark differs";
+            return false;
+        }
         size_t sa = lean_array_size(a);
         size_t sb = lean_array_size(b);
         if (sa != sb) {
@@ -404,6 +410,10 @@ static bool local_equal(lean_object * a, lean_object * b, bool strict, std::stri
         return true;
     }
     case LeanScalarArray: {
+        if (lean_sarray_is_marked_linear(a) != lean_sarray_is_marked_linear(b)) {
+            why = "scalar-array linearity mark differs";
+            return false;
+        }
         unsigned ea = lean_sarray_elem_size(a);
         unsigned eb = lean_sarray_elem_size(b);
         if (ea != eb) {
@@ -432,6 +442,10 @@ static bool local_equal(lean_object * a, lean_object * b, bool strict, std::stri
         return true;
     }
     case LeanString: {
+        if (lean_string_is_marked_linear(a) != lean_string_is_marked_linear(b)) {
+            why = "string linearity mark differs";
+            return false;
+        }
         size_t sa = lean_string_size(a);
         size_t sb = lean_string_size(b);
         if (sa != sb) {
@@ -682,6 +696,16 @@ class GraphDiffer {
         if (!m_strict && !ha && !hb && !lean_is_scalar(a) && !lean_is_scalar(b) && lean_is_array(a) &&
             lean_is_array(b) && lean_array_size(a) == 0 && lean_array_size(b) == 0)
             return PairResult::Skip;
+        // A pack's dense area holds byte copies of region objects that import reads instead of the
+        // originals (`olean_pack.cpp`): such a copy and its original are compared by contents, as heap
+        // objects are, and their children in turn. Any other pair of distinct non-heap objects differs.
+        if (!ha && !hb && (lean_paperlean_in_pack_dense_area(a) || lean_paperlean_in_pack_dense_area(b))) {
+            if (!local_equal(a, b, m_strict, why))
+                return PairResult::Failed;
+            m_a2b.insert(a, b);
+            m_b2a.insert(b, a);
+            return PairResult::Traverse;
+        }
         if (!ha || !hb) {
             why = "non-heap object identity differs (A=" + ptr_string(a)
                 + ", B=" + ptr_string(b) + ")";

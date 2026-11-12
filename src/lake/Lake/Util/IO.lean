@@ -24,25 +24,55 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
     | .noFileOrDirectory .. => pure ()
     | e => throw e
 
+/- Publish `tmp` at `path` unless `path` already exists; `false` if the file system cannot link it. -/
+private def linkIfNew (tmp path : FilePath) : IO Bool := do
+  try IO.FS.hardLink tmp path; return true
+  catch
+    | .alreadyExists .. => return true
+    | _ => return false
+
+/-
+Write `content` to a fresh temporary file next to `path`, flush it, and then
+publish it at `path` with an atomic hard link.  The link preserves the
+"do nothing if the file already exists" behaviour while ensuring that readers
+never observe a partially written file at `path`.
+-/
+private def writeNewFileAtomically
+  (path : FilePath) (write : IO.FS.Handle → IO Unit) : IO Unit := do
+  if (← path.pathExists) then return
+  let dir := path.parent.getD "."
+  let tmpName := "." ++ path.fileName.getD "tmp" ++ "." ++ toString (← IO.Process.getPID) ++
+    "." ++ toString (← IO.monoNanosNow) ++ ".tmp"
+  let tmp := dir / tmpName
+  let mut linked := false
+  try
+    IO.FS.withFile tmp .writeNew (fun h => do
+      write h
+      h.flush)
+    linked ← linkIfNew tmp path
+  catch _ =>
+    pure ()
+  try IO.FS.removeFile tmp catch _ => pure ()
+  unless linked do
+    -- (where a temporary file next to `path` or a hard link is not possible: the former direct write)
+    let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
+      | .alreadyExists .. => return
+      | e => throw e
+    write h
+
 /--
 Write the UTF-8 encoded string {lean}`content` to {lean}`path`.
 If the file already exists, does nothing.
 -/
-public def writeFileIfNew (path : FilePath) (content : String) : IO Unit := do
-  let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
-    | .alreadyExists .. => return
-    | e => throw e
-  h.putStr content
+public def writeFileIfNew (path : FilePath) (content : String) : IO Unit :=
+  writeNewFileAtomically path fun h => h.putStr content
 
 /--
 Write the bytes of {lean}`content` to {lean}`path`.
 If the file already exists, does nothing.
 -/
-public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
-  let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
-    | .alreadyExists .. => return
-    | e => throw e
-  h.write content
+public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit :=
+  writeNewFileAtomically path fun h => h.write content
 
 /--
 Remove a directory and all its contents.

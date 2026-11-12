@@ -244,24 +244,25 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_timer_stop(b_obj_arg obj) {
     // Locking to access the state in order to avoid data-race
     event_loop_lock(&global_ev);
 
-    if (timer->m_promise != NULL) {
-        lean_dec(timer->m_promise);
-        timer->m_promise = NULL;
-    }
-
+    lean_object * dropped = NULL;
+    bool was_running = false;
     if (timer->m_state == TIMER_STATE_RUNNING) {
         uv_timer_stop(timer->m_uv_timer);
-        event_loop_unlock(&global_ev);
-
+        dropped = timer->m_promise;
+        timer->m_promise = NULL;
         timer->m_state = TIMER_STATE_FINISHED;
-
-        // The loop does not need to keep the timer alive anymore.
-        lean_dec(obj);
-
-        return lean_io_result_mk_ok(lean_box(0));
+        was_running = true;
     }
 
     event_loop_unlock(&global_ev);
+
+    /* Dropping the promise can run continuations inline, so it must happen after the
+       unlock. A finished timer keeps its already-resolved promise: `stop` is documented
+       as a no-op in that state and `next` must keep returning that promise. */
+    if (dropped != NULL) lean_dec(dropped);
+    // The loop does not need to keep the timer alive anymore.
+    if (was_running) lean_dec(obj);
+
     return lean_io_result_mk_ok(lean_box(0));
 }
 
